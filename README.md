@@ -11,9 +11,10 @@ Um launcher conveniente para o llama-server.
 
 ## Uso
 
-1. Coloque o `iniciar_llama.bat` ao lado do `llama-server.exe`.
-2. Crie a pasta `Modelos` e coloque seus `.gguf` nela.
-3. Dê dois cliques no `.bat`.
+1. Coloque o `iniciar_llama.bat` dentro da mesma pasta onde estiver `llama-server.exe`.
+2. Crie a pasta `Modelos`.
+3. Dentro de `Modelos`, crie a pasta referente ao nome do modelo (Ex.: Gemma 4) e coloque o `.gguf` dentro dela.
+3. Execute o `iniciar_llama.bat`. Ele detectará os modelos caso tenham sido organizados da forma que essa seção apresenta.
 
 ## Aviso
 
