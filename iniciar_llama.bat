@@ -1065,6 +1065,24 @@ function Get-HostLabel {
 # ---------------------------------------------------------------------------
 # Command builder
 # ---------------------------------------------------------------------------
+function Get-LoadFlagStyle {
+    if ($script:LoadFlagStyle) { return $script:LoadFlagStyle }
+    $style = 'none'
+    $prevEap = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $helpText = (& $script:ServerExe --help 2>&1 | Out-String)
+        if ($helpText -match '--load-mode') { $style = 'loadmode' }
+        elseif ($helpText -match '--no-mmap') { $style = 'legacy' }
+    } catch {
+        $style = 'none'
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
+    $script:LoadFlagStyle = $style
+    return $style
+}
+
 function Build-ServerArgs {
     param($Cfg, [string]$LogPath)
     $a = New-Object System.Collections.Generic.List[string]
@@ -1100,8 +1118,10 @@ function Build-ServerArgs {
     }
 
     $a.Add('--jinja')
-    $a.Add('--no-mmap')
-    $a.Add('--mlock')
+    switch (Get-LoadFlagStyle) {
+        'loadmode' { $a.Add('--load-mode'); $a.Add('mlock') }
+        'legacy'   { $a.Add('--no-mmap'); $a.Add('--mlock') }
+    }
     $a.Add('--parallel'); $a.Add('1')
     $a.Add('--host'); $a.Add((Get-BindHost ([string]$Cfg.Host)))
     $a.Add('--port'); $a.Add([string]$Cfg.Port)
