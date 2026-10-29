@@ -689,6 +689,22 @@ function Get-MemoryEstimate {
             $level = 'bad'
             $text = 'VRAM insuficiente para todas as camadas'
         }
+    } elseif ($Cfg.Ngl -match '^\d+$') {
+        $nTotal = Get-NglMax $m
+        $nGpu = [Math]::Min([int]$Cfg.Ngl, $nTotal)
+        $frac = $nGpu / [double]$nTotal
+        $partV = (($weights + $kv) * $frac) + $mmVram + 0.75
+        $partR = (($weights + $kv) * (1.0 - $frac)) + $mmRam + 1.0
+        if ($partV -gt ($freeV - 0.50)) {
+            $level = 'bad'
+            $text = ('VRAM insuficiente para {0} camadas (~{1:0.0} GB)' -f $nGpu, $partV)
+        } elseif ($partR -gt ($freeR - 1.5)) {
+            $level = 'bad'
+            $text = 'RAM apertada'
+        } else {
+            $level = 'warn'
+            $text = ('{0}/{1} camadas na GPU (~{2:0.0} GB VRAM) + resto na CPU/RAM' -f $nGpu, $nTotal, $partV)
+        }
     } else {
         if ($needV -le ($freeV - 0.75)) {
             $level = 'good'
@@ -832,7 +848,17 @@ function Normalize-Cfg {
     $validKv = @('f32', 'f16', 'bf16', 'q8_0', 'q4_0', 'q4_1', 'iq4_nl', 'q5_0', 'q5_1')
     if ($validKv -notcontains [string]$Cfg.Ctk) { $Cfg.Ctk = 'q8_0' }
     if ($validKv -notcontains [string]$Cfg.Ctv) { $Cfg.Ctv = 'q8_0' }
-    if (@('auto', '0', 'all') -notcontains [string]$Cfg.Ngl) { $Cfg.Ngl = 'auto' }
+    $nglStr = ([string]$Cfg.Ngl).Trim()
+    if (@('auto', '0', 'all') -contains $nglStr) {
+        $Cfg.Ngl = $nglStr
+    } elseif ($nglStr -match '^\d{1,4}$') {
+        $nglN = [int]$nglStr
+        $nglMax = Get-NglMax $Cfg.Model
+        if ($nglN -gt $nglMax) { $nglN = $nglMax }
+        $Cfg.Ngl = [string]$nglN
+    } else {
+        $Cfg.Ngl = 'auto'
+    }
     if (@('off', 'gpu', 'cpu') -notcontains [string]$Cfg.Vision) { $Cfg.Vision = 'off' }
     if (-not $Cfg.Model.Mmproj) { $Cfg.Vision = 'off' }
     if (@('auto', 'on', 'off') -notcontains [string]$Cfg.Reasoning) { $Cfg.Reasoning = 'auto' }
@@ -1018,13 +1044,22 @@ function Get-PresetCycle {
     return $list
 }
 
+function Get-NglMax {
+    param($Model)
+    if ($Model -and $Model.Meta -and [int]$Model.Meta.Layers -gt 0) { return [int]$Model.Meta.Layers }
+    return 80
+}
+
 function Get-NglLabel {
     param([string]$Ngl)
     switch ($Ngl) {
         'auto' { return 'automático (--fit)' }
         '0'    { return 'CPU (0 camadas)' }
         'all'  { return 'todas (all)' }
-        default { return $Ngl }
+        default {
+            if ($Ngl -match '^\d+$') { return ('{0} camadas na GPU (resto na CPU)' -f $Ngl) }
+            return $Ngl
+        }
     }
 }
 
@@ -1524,6 +1559,7 @@ function Write-SettingRow {
 function Show-Settings {
     param($Cfg)
     $sel = -1
+    $nglBuf = ''
 
     while ($true) {
         $rows = @(Get-SettingsRows $Cfg)
@@ -1587,6 +1623,8 @@ function Show-Settings {
         Write-Host (Cut-Text $footer ($w - 1)) -ForegroundColor DarkGray
 
         $key = Read-Key
+        $nglTyping = ($rows[$sel].Key -eq 'ngl') -and (([string]$key.KeyChar -match '^\d$') -or ($key.Key -eq 'Backspace'))
+        if (-not $nglTyping) { $nglBuf = '' }
         switch ($key.Key) {
             'UpArrow'   { if ($sel -gt 0) { $sel-- } }
             'DownArrow' { if ($sel -lt ($rows.Count - 1)) { $sel++ } }
@@ -1620,6 +1658,24 @@ function Show-Settings {
             'Escape' { return [pscustomobject]@{ Action = 'back' } }
             'Q'      { return [pscustomobject]@{ Action = 'exit' } }
             'S'      { return [pscustomobject]@{ Action = 'start' } }
+            'Backspace' {
+                if ($nglTyping) {
+                    if ($nglBuf.Length -gt 0) { $nglBuf = $nglBuf.Substring(0, $nglBuf.Length - 1) }
+                    if ($nglBuf -eq '') { $Cfg.Ngl = 'auto' } else { $Cfg.Ngl = $nglBuf }
+                    $Cfg.Preset = 'personalizado'
+                    Normalize-Cfg $Cfg
+                    if ($Cfg.Ngl -ne 'auto') { $nglBuf = [string]$Cfg.Ngl }
+                }
+            }
+            default {
+                if ($nglTyping) {
+                    if ($nglBuf.Length -lt 3) { $nglBuf += [string]$key.KeyChar }
+                    $Cfg.Ngl = $nglBuf
+                    $Cfg.Preset = 'personalizado'
+                    Normalize-Cfg $Cfg
+                    $nglBuf = [string]$Cfg.Ngl
+                }
+            }
         }
     }
 }
