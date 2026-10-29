@@ -1,3 +1,17 @@
+# Runtime / logs
 logs/
 llama_launcher.json
 llama_launcher_cache.json
+llama_presets.ini
+
+# Segredos e dados locais
+.webui_secret_key
+
+# Modelos GGUF (grandes demais para o repositório)
+/Modelos/
+*.gguf
+
+# Binários do llama.cpp / CUDA / OpenMP (baixados separadamente)
+*.exe
+*.dll
+LICENSE-LLVM-OpenMP
