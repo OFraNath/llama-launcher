@@ -1099,6 +1099,7 @@ function Build-ServerArgs {
     }
 
     $a.Add('--jinja')
+    $a.Add('--no-mmap')
     $a.Add('--parallel'); $a.Add('1')
     $a.Add('--host'); $a.Add((Get-BindHost ([string]$Cfg.Host)))
     $a.Add('--port'); $a.Add([string]$Cfg.Port)
@@ -1633,11 +1634,6 @@ function Start-BrowserJob {
         }
 
         Write-BrowserLog ('Iniciando coordenador. alvo={0} servidor={1}' -f $Target, $ServerUrl)
-        if ($Target -eq 'none') {
-            Write-BrowserLog 'Navegador desativado na configuração.'
-            return
-        }
-
         if ($Target -eq 'openwebui') {
             if (Test-WebReady $OpenWebUiUrl) {
                 Write-BrowserLog 'Open WebUI já estava em execução.'
@@ -1678,6 +1674,19 @@ function Start-BrowserJob {
             return
         }
         Write-BrowserLog 'llama-server pronto.'
+
+        try {
+            $warmBody = '{"messages":[{"role":"user","content":"hi"}],"max_tokens":1,"temperature":0,"stream":false}'
+            $warmBytes = [System.Text.Encoding]::UTF8.GetBytes($warmBody)
+            $null = Invoke-WebRequest -Uri ($ServerUrl + '/v1/chat/completions') -Method Post -ContentType 'application/json' -Body $warmBytes -UseBasicParsing -TimeoutSec 900 -ErrorAction Stop
+            Write-BrowserLog 'Modelo carregado por completo.'
+        } catch {
+            Write-BrowserLog ('Aquecimento falhou: ' + $_.Exception.Message)
+        }
+
+        if ($Target -eq 'none') {
+            return
+        }
 
         if ($Target -eq 'llamacpp') {
             $null = Open-BrowserUrl $ServerUrl
@@ -1737,7 +1746,7 @@ function Show-StartSummary {
     Write-Host '  Comando:' -ForegroundColor DarkGray
     Write-Host ('  ' + (Format-Command $script:ServerExe $ServerArgs)) -ForegroundColor DarkGray
     Write-Host ''
-    Write-Host '  Carregando o modelo... o navegador abrirá quando o servidor estiver pronto.' -ForegroundColor Cyan
+    Write-Host '  Carregando o modelo... o navegador abrirá quando o modelo estiver totalmente carregado.' -ForegroundColor Cyan
     Write-Host '  Pressione Ctrl+C nesta janela para encerrar o servidor.' -ForegroundColor DarkGray
     Write-Host ''
 }
@@ -1826,10 +1835,7 @@ function Start-LlamaServer {
         $serverUrl = ('http://127.0.0.1:{0}' -f [int]$Cfg.Port)
         $owuiUrl = 'http://localhost:8080'
         $owuiBat = Join-Path $script:Root 'iniciar_openwebui.bat'
-        $browserJob = $null
-        if ($Cfg.Browser -ne 'none') {
-            $browserJob = Start-BrowserJob $Cfg $serverUrl $owuiUrl $owuiBat $script:LogDir
-        }
+        $browserJob = Start-BrowserJob $Cfg $serverUrl $owuiUrl $owuiBat $script:LogDir
 
         try { $Host.UI.RawUI.WindowTitle = ('llama-server  |  ' + $Cfg.Model.Display) } catch { }
         try { [Console]::CursorVisible = $true } catch { }
