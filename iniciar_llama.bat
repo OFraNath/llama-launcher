@@ -746,8 +746,9 @@ $script:KvOptions = @(
 function Get-CtxOptions {
     param($Model)
     $max = Get-MaxCtx $Model
-    $base = @(1024, 2048, 4096, 8192, 16384, 32768, 65536)
+    $base = @(1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576)
     $opts = @($base | Where-Object { $_ -le $max })
+    if ($max -gt 0 -and $opts -notcontains $max) { $opts = @($opts + $max | Sort-Object) }
     if ($opts.Count -eq 0) { $opts = @([Math]::Max(512, $max)) }
     return $opts
 }
