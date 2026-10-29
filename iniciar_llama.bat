@@ -106,6 +106,22 @@ function Write-Row {
     }
 }
 
+function Write-Footer {
+    param([string]$Text)
+    $parts = (Cut-Text $Text ((Get-UIWidth) - 1)) -split '   '
+    for ($i = 0; $i -lt $parts.Count; $i++) {
+        if ($i -gt 0) { Write-Host '   ' -NoNewline -ForegroundColor DarkGray }
+        if ($parts[$i] -match '^(\s*)(\S+)(.*)$') {
+            Write-Host $Matches[1] -NoNewline -ForegroundColor DarkGray
+            Write-Host $Matches[2] -NoNewline -ForegroundColor Cyan
+            Write-Host $Matches[3] -NoNewline -ForegroundColor DarkGray
+        } else {
+            Write-Host $parts[$i] -NoNewline -ForegroundColor DarkGray
+        }
+    }
+    Write-Host ''
+}
+
 function Read-Key {
     return [Console]::ReadKey($true)
 }
@@ -156,6 +172,11 @@ function Get-MemInfo {
     }
 }
 
+function Update-Hardware {
+    $script:Gpu = Get-GpuInfo
+    $script:Mem = Get-MemInfo
+}
+
 function Read-JsonFile {
     param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { return $null }
@@ -171,6 +192,8 @@ function Read-JsonFile {
 # ---------------------------------------------------------------------------
 $script:LanIPv4Cache = $null
 $script:TailscaleIPv4Cache = $null
+$script:LanIPv4Try = [datetime]::MinValue
+$script:TailscaleIPv4Try = [datetime]::MinValue
 
 function Test-LanIPv4 {
     param([string]$Ip)
@@ -181,8 +204,9 @@ function Test-LanIPv4 {
 }
 
 function Get-LanIPv4 {
-    if ($null -ne $script:LanIPv4Cache) { return [string]$script:LanIPv4Cache }
-    $script:LanIPv4Cache = ''
+    if ($script:LanIPv4Cache) { return [string]$script:LanIPv4Cache }
+    if (((Get-Date) - $script:LanIPv4Try).TotalSeconds -lt 5) { return '' }
+    $script:LanIPv4Try = Get-Date
 
     $sock = $null
     try {
@@ -216,8 +240,9 @@ function Get-LanIPv4 {
 }
 
 function Get-TailscaleIPv4 {
-    if ($null -ne $script:TailscaleIPv4Cache) { return [string]$script:TailscaleIPv4Cache }
-    $script:TailscaleIPv4Cache = ''
+    if ($script:TailscaleIPv4Cache) { return [string]$script:TailscaleIPv4Cache }
+    if (((Get-Date) - $script:TailscaleIPv4Try).TotalSeconds -lt 5) { return '' }
+    $script:TailscaleIPv4Try = Get-Date
 
     try {
         $addr = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop | Where-Object {
@@ -697,13 +722,18 @@ function Get-MemoryEstimate {
         $partR = (($weights + $kv) * (1.0 - $frac)) + $mmRam + 1.0
         if ($partV -gt ($freeV - 0.50)) {
             $level = 'bad'
-            $text = ('VRAM insuficiente para {0} camadas (~{1:0.0} GB)' -f $nGpu, $partV)
+            $text = ('VRAM insuficiente para {0} camadas' -f $nGpu)
         } elseif ($partR -gt ($freeR - 1.5)) {
             $level = 'bad'
             $text = 'RAM apertada'
         } else {
-            $level = 'warn'
-            $text = ('{0}/{1} camadas na GPU (~{2:0.0} GB VRAM) + resto na CPU/RAM' -f $nGpu, $nTotal, $partV)
+            if ($nGpu -ge $nTotal) {
+                $level = 'good'
+                $text = 'Todas as camadas na GPU'
+            } else {
+                $level = 'warn'
+                $text = ('{0}/{1} camadas na GPU + resto na CPU/RAM' -f $nGpu, $nTotal)
+            }
         }
     } else {
         if ($needV -le ($freeV - 0.75)) {
@@ -947,7 +977,12 @@ function New-CfgForModel {
     return $cfg
 }
 
-function Save-Cfg {
+function Get-CfgSnap {
+    param($Cfg)
+    return ('{0}|{1}|{2}|{3}|{4}|{5}|{6}|{7}' -f $Cfg.Preset, $Cfg.Ctx, $Cfg.Ctk, $Cfg.Ctv, $Cfg.NPredict, $Cfg.Ngl, $Cfg.Vision, $Cfg.Reasoning)
+}
+
+function Set-StateModel {
     param($Cfg)
     $script:StateModels[$Cfg.Model.Path] = [pscustomobject]@{
         preset    = [string]$Cfg.Preset
@@ -959,13 +994,9 @@ function Save-Cfg {
         vision    = [string]$Cfg.Vision
         reasoning = [string]$Cfg.Reasoning
     }
-    $script:LastModelPath = $Cfg.Model.Path
-    $script:Global = [pscustomobject]@{
-        port    = [int]$Cfg.Port
-        host    = [string]$Cfg.Host
-        browser = [string]$Cfg.Browser
-    }
-    $script:LastCfg = $Cfg
+}
+
+function Write-State {
     $obj = [pscustomobject]@{
         lastModel = $script:LastModelPath
         global    = $script:Global
@@ -974,6 +1005,26 @@ function Save-Cfg {
     try {
         $obj | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $script:StatePath -Encoding UTF8
     } catch { }
+}
+
+function Save-Cfg {
+    param($Cfg)
+    Set-StateModel $Cfg
+    $script:LastModelPath = $Cfg.Model.Path
+    $script:Global = [pscustomobject]@{
+        port    = [int]$Cfg.Port
+        host    = [string]$Cfg.Host
+        browser = [string]$Cfg.Browser
+    }
+    $script:LastCfg = $Cfg
+    Write-State
+}
+
+function Save-ModelCfg {
+    param($Cfg, [string]$Snap)
+    if ((Get-CfgSnap $Cfg) -eq $Snap) { return }
+    Set-StateModel $Cfg
+    Write-State
 }
 
 function Refresh-Models {
@@ -1051,13 +1102,16 @@ function Get-NglMax {
 }
 
 function Get-NglLabel {
-    param([string]$Ngl)
+    param([string]$Ngl, $Model = $null)
     switch ($Ngl) {
         'auto' { return 'automático (--fit)' }
         '0'    { return 'CPU (0 camadas)' }
         'all'  { return 'todas (all)' }
         default {
-            if ($Ngl -match '^\d+$') { return ('{0} camadas na GPU (resto na CPU)' -f $Ngl) }
+            if ($Ngl -match '^\d+$') {
+                if ($Model -and [int]$Ngl -ge (Get-NglMax $Model)) { return ('{0} camadas na GPU (todas)' -f $Ngl) }
+                return ('{0} camadas na GPU (resto na CPU)' -f $Ngl)
+            }
             return $Ngl
         }
     }
@@ -1293,7 +1347,7 @@ function Show-Choice {
             Write-Row $txt ($i -eq $sel)
         }
         Write-Host ''
-        Write-Host '  ↑↓ navegar   Enter confirmar   Esc cancelar' -ForegroundColor DarkGray
+        Write-Footer '  ↑↓ navegar   Enter confirmar   Esc cancelar'
         $key = Read-Key
         switch ($key.Key) {
             'UpArrow'   { if ($sel -gt 0) { $sel-- } }
@@ -1353,10 +1407,10 @@ function Show-ModelPicker {
             Write-Host ''
             Write-Host '  Coloque os arquivos .gguf em subpastas de Modelos e pressione R.' -ForegroundColor Gray
             Write-Host ''
-            Write-Host '  R atualizar   Esc sair' -ForegroundColor DarkGray
+            Write-Footer '  R atualizar   Q sair'
             $key = Read-Key
-            if ($key.Key -eq 'Escape' -or $key.Key -eq 'Q') { return [pscustomobject]@{ Action = 'exit' } }
-            if ($key.Key -eq 'R' -or $key.Key -eq 'F5') { Refresh-Models; $rebuild = $true }
+            if ($key.Key -eq 'Q') { return [pscustomobject]@{ Action = 'exit' } }
+            if ($key.Key -eq 'R' -or $key.Key -eq 'F5') { Update-Hardware; Refresh-Models; $rebuild = $true }
             continue
         }
 
@@ -1402,8 +1456,8 @@ function Show-ModelPicker {
 
         if (-not $script:LastCfg -and $drawnModels) { }
         Write-Host ''
-        $footer = '  ↑↓ navegar   Enter abrir   L última   E editar última   R atualizar   Esc sair'
-        Write-Host (Cut-Text $footer ($w - 1)) -ForegroundColor DarkGray
+        $footer = '  ↑↓ navegar   Enter abrir   L última   E editar última   R atualizar   Q sair'
+        Write-Footer $footer
 
         $key = Read-Key
         switch ($key.Key) {
@@ -1417,11 +1471,8 @@ function Show-ModelPicker {
             'End'  { $sel = $rows.Count - 1 }
             'PageUp' { $sel = [Math]::Max(0, $sel - 5) }
             'PageDown' { $sel = [Math]::Min($rows.Count - 1, $sel + 5) }
-            'R' {
-                Refresh-Models
-                $rebuild = $true
-            }
-            'F5' {
+            { $_ -in 'R', 'F5' } {
+                Update-Hardware
                 Refresh-Models
                 $rebuild = $true
             }
@@ -1443,7 +1494,6 @@ function Show-ModelPicker {
                 }
                 return [pscustomobject]@{ Action = 'model'; Model = $row.Model }
             }
-            'Escape' { return [pscustomobject]@{ Action = 'exit' } }
             'Q'      { return [pscustomobject]@{ Action = 'exit' } }
         }
     }
@@ -1466,7 +1516,7 @@ function Get-SettingsRows {
         $np = ('{0} tokens' -f $Cfg.NPredict)
     }
     $rows += [pscustomobject]@{ Key = 'npredict'; Label = 'Máx. resposta'; Value = $np; Color = 'White' }
-    $rows += [pscustomobject]@{ Key = 'ngl'; Label = 'GPU'; Value = (Get-NglLabel $Cfg.Ngl); Color = 'White' }
+    $rows += [pscustomobject]@{ Key = 'ngl'; Label = 'GPU'; Value = (Get-NglLabel $Cfg.Ngl $Cfg.Model); Color = 'White' }
     if ($Cfg.Model.Mmproj) {
         $rows += [pscustomobject]@{ Key = 'vision'; Label = 'Visão'; Value = (Get-VisionLabel $Cfg); Color = 'White' }
     }
@@ -1560,6 +1610,7 @@ function Show-Settings {
     param($Cfg)
     $sel = -1
     $nglBuf = ''
+    $snap0 = Get-CfgSnap $Cfg
 
     while ($true) {
         $rows = @(Get-SettingsRows $Cfg)
@@ -1593,11 +1644,6 @@ function Show-Settings {
 
         $mi = Get-MemoryEstimate $Cfg
         Write-Host ''
-        $mm = ''
-        if ($mi.MmprojGB -gt 0) { $mm = (' + mmproj {0:0.0}' -f $mi.MmprojGB) }
-        $mem = ('  Pesos {0:0.0} + KV {1:0.0}{2} = {3:0.0} GB  |  VRAM livre {4:0.0} GB' -f `
-            $mi.WeightsGB, $mi.KvGB, $mm, ($mi.WeightsGB + $mi.KvGB + $mi.MmprojGB), $mi.FreeVram)
-        Write-Host (Cut-Text $mem ($w - 1)) -ForegroundColor DarkGray
 
         $tag = '!'
         $color = 'Red'
@@ -1606,7 +1652,9 @@ function Show-Settings {
         elseif ($mi.Level -eq 'dim') { $tag = 'CPU'; $color = 'DarkGray' }
         Write-Host ('  [' + $tag + '] ' + $mi.Text) -ForegroundColor $color
         if ($mi.Level -eq 'bad') {
-            Write-Host '      Reduza o contexto/KV ou deixe a GPU no automático (--fit).' -ForegroundColor DarkYellow
+            $hint = 'Reduza o contexto/KV ou deixe a GPU no automático (--fit).'
+            if ($Cfg.Ngl -eq 'auto') { $hint = 'Reduza o contexto/KV.' }
+            Write-Host ('      ' + $hint) -ForegroundColor DarkYellow
         }
         if (-not (Test-PortFree ([int]$Cfg.Port))) {
             Write-Host ('      Porta {0} em uso: o launcher vai perguntar o que fazer ao iniciar.' -f $Cfg.Port) -ForegroundColor Yellow
@@ -1617,10 +1665,13 @@ function Show-Settings {
         } elseif ($accessUrl) {
             Write-Host ('      Acesso: {0}' -f $accessUrl) -ForegroundColor DarkCyan
         }
+        if ($Cfg.Host -ne '127.0.0.1') {
+            Write-Host '      Atenção: escuta em todas as interfaces, sem senha. Use apenas em redes confiáveis.' -ForegroundColor Yellow
+        }
 
         Write-Host ''
         $footer = '  ↑↓ navegar   ←→ alterar   Enter editar/iniciar   Esc voltar   Q sair'
-        Write-Host (Cut-Text $footer ($w - 1)) -ForegroundColor DarkGray
+        Write-Footer $footer
 
         $key = Read-Key
         $nglTyping = ($rows[$sel].Key -eq 'ngl') -and (([string]$key.KeyChar -match '^\d$') -or ($key.Key -eq 'Backspace'))
@@ -1649,14 +1700,15 @@ function Show-Settings {
                     if ($pick.Action -eq 'model' -or $pick.Action -eq 'editlast') { $newModel = $pick.Model }
                     elseif ($pick.Action -eq 'last' -and $script:LastCfg) { $newModel = $script:LastCfg.Model }
                     if ($newModel) {
+                        Save-ModelCfg $Cfg $snap0
                         return [pscustomobject]@{ Action = 'switch'; Cfg = (New-CfgForModel $newModel) }
                     }
                 } else {
                     Change-CfgSetting $Cfg $k 1
                 }
             }
-            'Escape' { return [pscustomobject]@{ Action = 'back' } }
-            'Q'      { return [pscustomobject]@{ Action = 'exit' } }
+            'Escape' { Save-ModelCfg $Cfg $snap0; return [pscustomobject]@{ Action = 'back' } }
+            'Q'      { Save-ModelCfg $Cfg $snap0; return [pscustomobject]@{ Action = 'exit' } }
             'S'      { return [pscustomobject]@{ Action = 'start' } }
             'Backspace' {
                 if ($nglTyping) {
@@ -1796,6 +1848,7 @@ function Start-BrowserJob {
         }
         Write-BrowserLog 'llama-server pronto.'
 
+        $modelOk = $false
         $modelDeadline = (Get-Date).AddSeconds(1800)
         while ((Get-Date) -lt $modelDeadline) {
             $state = ''
@@ -1811,12 +1864,16 @@ function Start-BrowserJob {
                     }
                 }
             } catch { }
-            if ($state -eq 'loaded') { break }
+            if ($state -eq 'loaded') { $modelOk = $true; break }
             if ($state -eq 'failed') {
                 Write-BrowserLog 'Falha ao carregar o modelo selecionado.'
                 break
             }
             Start-Sleep -Milliseconds 700
+        }
+        if (-not $modelOk) {
+            Write-BrowserLog 'Modelo não ficou pronto; navegador não será aberto.'
+            return
         }
         Write-BrowserLog ('Modelo ' + $ModelName + ' pronto.')
 
@@ -1852,6 +1909,14 @@ function Start-BrowserJob {
     }
 }
 
+function Remove-OldLogs {
+    try {
+        @(Get-ChildItem -LiteralPath $script:LogDir -File -Filter '*.log' -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -Skip 28) |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+    } catch { }
+}
+
 function Show-StartSummary {
     param($Cfg, [string]$LogPath, [string[]]$ServerArgs)
     $w = Get-UIWidth
@@ -1860,7 +1925,7 @@ function Show-StartSummary {
     Write-Host ''
     Write-Host ('  Modelo:     ' + $Cfg.Model.Display) -ForegroundColor White
     Write-Host ('  Contexto:   {0} tokens   |   KV: {1} / {2}' -f $Cfg.Ctx, $Cfg.Ctk, $Cfg.Ctv) -ForegroundColor Gray
-    Write-Host ('  GPU:        {0}   |   Visão: {1}   |   Raciocínio: {2}' -f (Get-NglLabel $Cfg.Ngl), (Get-VisionLabel $Cfg), $Cfg.Reasoning) -ForegroundColor Gray
+    Write-Host ('  GPU:        {0}   |   Visão: {1}   |   Raciocínio: {2}' -f (Get-NglLabel $Cfg.Ngl $Cfg.Model), (Get-VisionLabel $Cfg), $Cfg.Reasoning) -ForegroundColor Gray
     Write-Host ('  Porta:      {0}   |   Navegador: {1}' -f $Cfg.Port, (Get-BrowserLabel $Cfg.Browser)) -ForegroundColor Gray
     Write-Host ('  Rede:       ' + (Get-HostLabel $Cfg.Host)) -ForegroundColor Gray
     $accessUrl = Get-ServerAccessUrl $Cfg.Host ([int]$Cfg.Port)
@@ -1870,17 +1935,62 @@ function Show-StartSummary {
         Write-Host '  Acesso:     Tailscale não detectado' -ForegroundColor Yellow
     }
 
-    $mi = Get-MemoryEstimate $Cfg
-    Write-Host ('  Memória:    pesos {0:0.0} + KV {1:0.0} + mmproj {2:0.0} = {3:0.0} GB  |  VRAM livre {4:0.0} GB' -f `
-        $mi.WeightsGB, $mi.KvGB, $mi.MmprojGB, ($mi.WeightsGB + $mi.KvGB + $mi.MmprojGB), $mi.FreeVram) -ForegroundColor DarkGray
     if ($LogPath) { Write-Host ('  Log:        ' + $LogPath) -ForegroundColor DarkGray }
     Write-Host ''
     Write-Host '  Comando:' -ForegroundColor DarkGray
     Write-Host ('  ' + (Format-Command $script:ServerExe $ServerArgs)) -ForegroundColor DarkGray
     Write-Host ''
-    Write-Host '  Carregando o modelo... o navegador abrirá quando o servidor estiver pronto.' -ForegroundColor Cyan
+    if ($Cfg.Browser -eq 'none') {
+        Write-Host '  Carregando o modelo...' -ForegroundColor Cyan
+    } else {
+        Write-Host '  Carregando o modelo... o navegador abrirá quando o servidor estiver pronto.' -ForegroundColor Cyan
+    }
     Write-Host '  Pressione Ctrl+C nesta janela para encerrar o servidor.' -ForegroundColor DarkGray
+    Write-Host '  Pressione Esc duas vezes para encerrar o servidor e voltar ao menu.' -ForegroundColor DarkGray
     Write-Host ''
+}
+
+function Start-EscWatcher {
+    $state = [hashtable]::Synchronized(@{ Stop = $false; Quit = $false })
+    $ps = $null
+    $handle = $null
+    try {
+        $ps = [powershell]::Create()
+        [void]$ps.AddScript({
+            param($State, $ServerPid)
+            $last = [datetime]::MinValue
+            while (-not $State.Stop) {
+                if ([Console]::KeyAvailable) {
+                    $k = [Console]::ReadKey($true)
+                    if ($k.Key -eq 'Escape') {
+                        if (((Get-Date) - $last).TotalSeconds -le 3) {
+                            $State.Quit = $true
+                            foreach ($p in @(Get-CimInstance Win32_Process -Filter ("Name='llama-server.exe' AND ParentProcessId={0}" -f $ServerPid))) {
+                                & taskkill.exe /PID $p.ProcessId /T /F | Out-Null
+                            }
+                            return
+                        }
+                        $last = Get-Date
+                        [Console]::ForegroundColor = 'Yellow'
+                        [Console]::WriteLine('  Pressione Esc novamente para encerrar o servidor e voltar ao menu.')
+                        [Console]::ResetColor()
+                    } else {
+                        $last = [datetime]::MinValue
+                    }
+                }
+                Start-Sleep -Milliseconds 100
+            }
+        }).AddArgument($state).AddArgument($PID)
+        $handle = $ps.BeginInvoke()
+    } catch { }
+    return [pscustomobject]@{ Ps = $ps; Handle = $handle; State = $state }
+}
+
+function Stop-EscWatcher {
+    param($Watcher)
+    $Watcher.State.Stop = $true
+    try { if ($Watcher.Handle) { [void]$Watcher.Handle.AsyncWaitHandle.WaitOne(1000) } } catch { }
+    try { if ($Watcher.Ps) { $Watcher.Ps.Dispose() } } catch { }
 }
 
 function Start-LlamaServer {
@@ -1903,7 +2013,13 @@ function Start-LlamaServer {
                     -Message ("Já existe um llama-server em http://127.0.0.1:{0}.`n`nO que deseja fazer?" -f $port) `
                     -Options @('Abrir o servidor existente', 'Encerrar e iniciar novo', 'Voltar') -Default 0
                 if ($choice -eq 0) {
-                    try { Start-Process ("http://127.0.0.1:{0}" -f $port) | Out-Null } catch { }
+                    $openUrl = ''
+                    if ($Cfg.Browser -eq 'llamacpp') {
+                        $openUrl = ('http://127.0.0.1:{0}' -f $port)
+                    } elseif ($Cfg.Browser -eq 'openwebui') {
+                        try { $null = Invoke-WebRequest -Uri 'http://localhost:8080' -UseBasicParsing -TimeoutSec 2; $openUrl = 'http://localhost:8080' } catch { $openUrl = ('http://127.0.0.1:{0}' -f $port) }
+                    }
+                    if ($openUrl) { try { Start-Process $openUrl | Out-Null } catch { } }
                     return 'menu'
                 }
                 if ($choice -lt 0 -or $choice -eq 2) { return 'settings' }
@@ -1930,15 +2046,16 @@ function Start-LlamaServer {
             }
         }
 
+        Update-Hardware
         $mi = Get-MemoryEstimate $Cfg
         if ($mi.Level -eq 'bad' -and $mi.NeedRam -gt ($mi.FreeRam - 1.0)) {
             $choice = Show-Choice -Title 'Aviso de RAM' `
-                -Message ("A estimativa indica que o modelo pode não caber na RAM disponível.`n`nRAM necessária: {0:0.0} GB | livre: {1:0.0} GB`n`nFeche outros programas ou reduza o contexto/KV." -f $mi.NeedRam, $mi.FreeRam) `
+                -Message "A estimativa indica que o modelo pode não caber na RAM disponível.`n`nFeche outros programas ou reduza o contexto/KV." `
                 -Options @('Voltar e ajustar', 'Iniciar mesmo assim') -Default 0
             if ($choice -ne 1) { return 'settings' }
         } elseif ($Cfg.Ngl -eq 'all' -and $mi.Level -eq 'bad') {
             $choice = Show-Choice -Title 'Aviso de VRAM' `
-                -Message ("Todas as camadas foram forçadas para a GPU, mas a estimativa indica VRAM insuficiente.`n`nVRAM necessária: {0:0.0} GB | livre: {1:0.0} GB" -f $mi.NeedVram, $mi.FreeVram) `
+                -Message "Todas as camadas foram forçadas para a GPU, mas a estimativa indica VRAM insuficiente." `
                 -Options @('Usar modo automático e iniciar', 'Iniciar mesmo assim', 'Voltar') -Default 0
             if ($choice -eq 0) {
                 $Cfg.Ngl = 'auto'
@@ -1955,6 +2072,7 @@ function Start-LlamaServer {
             if (-not (Test-Path -LiteralPath $script:LogDir)) {
                 New-Item -ItemType Directory -Path $script:LogDir -Force | Out-Null
             }
+            Remove-OldLogs
             $safe = ($Cfg.Model.Display -replace '[^\w\-\. ]', '_')
             if ([string]::IsNullOrWhiteSpace($safe)) { $safe = 'modelo' }
             $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
@@ -1975,6 +2093,7 @@ function Start-LlamaServer {
         try { $Host.UI.RawUI.WindowTitle = ('llama-server  |  ' + $Cfg.Model.Display) } catch { }
         try { [Console]::CursorVisible = $true } catch { }
 
+        $esc = Start-EscWatcher
         $code = 0
         try {
             Push-Location $script:Root
@@ -1986,6 +2105,7 @@ function Start-LlamaServer {
             $code = 1
         } finally {
             Pop-Location
+            Stop-EscWatcher $esc
         }
 
         if ($browserJob) {
@@ -1995,6 +2115,8 @@ function Start-LlamaServer {
         try { $Host.UI.RawUI.WindowTitle = 'Llama Launcher' } catch { }
         try { [Console]::CursorVisible = $false } catch { }
 
+        Update-Hardware
+        if ($esc.State.Quit) { return 'menu' }
         $msg = ('Servidor encerrado (código {0}).' -f $code)
         if ($logPath) { $msg += ("`n`nLog: " + $logPath) }
         $choice = Show-Choice -Title 'Servidor encerrado' -Message $msg `
