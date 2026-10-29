@@ -1083,40 +1083,78 @@ function Get-LoadFlagStyle {
     return $style
 }
 
-function Build-ServerArgs {
-    param($Cfg, [string]$LogPath)
-    $a = New-Object System.Collections.Generic.List[string]
-    $a.Add('--model'); $a.Add($Cfg.Model.Path)
-    $a.Add('--alias'); $a.Add($Cfg.Model.Display)
-    $a.Add('--ctx-size'); $a.Add([string]$Cfg.Ctx)
-    if ([int]$Cfg.NPredict -ge 0) {
-        $a.Add('--n-predict'); $a.Add([string]$Cfg.NPredict)
-    }
-    $a.Add('--cache-type-k'); $a.Add([string]$Cfg.Ctk)
-    $a.Add('--cache-type-v'); $a.Add([string]$Cfg.Ctv)
+function Get-PresetName {
+    param($Model)
+    $n = ([string]$Model.Display -replace '[\[\]\r\n]', '').Trim()
+    if ([string]::IsNullOrWhiteSpace($n)) { $n = [System.IO.Path]::GetFileNameWithoutExtension([string]$Model.Path) }
+    return $n
+}
+
+function ConvertTo-PresetPath {
+    param([string]$Path)
+    return ($Path -replace '\\', '/')
+}
+
+function Get-PresetLines {
+    param($Cfg, [bool]$LoadOnStartup)
+    $m = $Cfg.Model
+    $l = New-Object System.Collections.Generic.List[string]
+    $l.Add('[' + (Get-PresetName $m) + ']')
+    $l.Add('model = ' + (ConvertTo-PresetPath ([string]$m.Path)))
+    $l.Add('ctx-size = ' + [string]$Cfg.Ctx)
+    if ([int]$Cfg.NPredict -ge 0) { $l.Add('n-predict = ' + [string]$Cfg.NPredict) }
+    $l.Add('cache-type-k = ' + [string]$Cfg.Ctk)
+    $l.Add('cache-type-v = ' + [string]$Cfg.Ctv)
 
     $quantK = ($Cfg.Ctk -notin @('f16', 'f32', 'bf16'))
     $quantV = ($Cfg.Ctv -notin @('f16', 'f32', 'bf16'))
-    if ($quantK -or $quantV) {
-        $a.Add('--flash-attn'); $a.Add('on')
-    } else {
-        $a.Add('--flash-attn'); $a.Add('auto')
+    if ($quantK -or $quantV) { $l.Add('flash-attn = on') } else { $l.Add('flash-attn = auto') }
+
+    $l.Add('fit = on')
+    if ($Cfg.Ngl -ne 'auto') { $l.Add('n-gpu-layers = ' + [string]$Cfg.Ngl) }
+
+    if ($Cfg.Vision -ne 'off' -and $m.Mmproj) {
+        $l.Add('mmproj = ' + (ConvertTo-PresetPath ([string]$m.Mmproj.FullName)))
+        if ($Cfg.Vision -eq 'cpu') { $l.Add('no-mmproj-offload = true') }
     }
 
-    $a.Add('--fit'); $a.Add('on')
-    if ($Cfg.Ngl -ne 'auto') {
-        $a.Add('--n-gpu-layers'); $a.Add([string]$Cfg.Ngl)
+    if ($Cfg.Reasoning -ne 'auto' -and $m.Meta.HasThinking) {
+        $l.Add('reasoning = ' + [string]$Cfg.Reasoning)
     }
 
-    if ($Cfg.Vision -ne 'off' -and $Cfg.Model.Mmproj) {
-        $a.Add('--mmproj'); $a.Add($Cfg.Model.Mmproj.FullName)
-        if ($Cfg.Vision -eq 'cpu') { $a.Add('--no-mmproj-offload') }
-    }
+    if ($LoadOnStartup) { $l.Add('load-on-startup = true') } else { $l.Add('load-on-startup = false') }
+    $l.Add('')
+    return $l.ToArray()
+}
 
-    if ($Cfg.Reasoning -ne 'auto' -and $Cfg.Model.Meta.HasThinking) {
-        $a.Add('--reasoning'); $a.Add([string]$Cfg.Reasoning)
+function Write-ModelPresets {
+    param($Cfg)
+    $path = Join-Path $script:Root 'llama_presets.ini'
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add('version = 1')
+    $lines.Add('')
+    $selName = Get-PresetName $Cfg.Model
+    $seen = @{}
+    $seen[$selName] = $true
+    foreach ($line in (Get-PresetLines $Cfg $true)) { $lines.Add($line) }
+    foreach ($m in $script:Models) {
+        $n = Get-PresetName $m
+        if ($seen.ContainsKey($n)) { continue }
+        $seen[$n] = $true
+        $other = New-CfgForModel $m $false
+        foreach ($line in (Get-PresetLines $other $false)) { $lines.Add($line) }
     }
+    $enc = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($path, (($lines.ToArray()) -join "`n"), $enc)
+    return $path
+}
 
+function Build-ServerArgs {
+    param($Cfg, [string]$LogPath)
+    $a = New-Object System.Collections.Generic.List[string]
+    $presetPath = Write-ModelPresets $Cfg
+    $a.Add('--models-preset'); $a.Add($presetPath)
+    $a.Add('--models-max'); $a.Add('1')
     $a.Add('--jinja')
     switch (Get-LoadFlagStyle) {
         'loadmode' { $a.Add('--load-mode'); $a.Add('mlock') }
@@ -1593,7 +1631,7 @@ function Start-BrowserJob {
     param($Cfg, [string]$ServerUrl, [string]$OpenWebUiUrl, [string]$OpenWebUiBat, [string]$LogDir)
 
     $scriptBlock = {
-        param($ServerUrl, $Target, $OpenWebUiUrl, $OpenWebUiBat, $LogDir)
+        param($ServerUrl, $Target, $OpenWebUiUrl, $OpenWebUiBat, $LogDir, $ModelName)
 
         $logPath = ''
         try {
@@ -1702,6 +1740,30 @@ function Start-BrowserJob {
         }
         Write-BrowserLog 'llama-server pronto.'
 
+        $modelDeadline = (Get-Date).AddSeconds(1800)
+        while ((Get-Date) -lt $modelDeadline) {
+            $state = ''
+            try {
+                $resp = Invoke-WebRequest -Uri ($ServerUrl + '/models') -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+                $json = $resp.Content | ConvertFrom-Json
+                $items = @()
+                if ($json.data) { $items = @($json.data) } elseif ($json.models) { $items = @($json.models) }
+                foreach ($it in $items) {
+                    if ([string]$it.id -eq $ModelName) {
+                        if ($it.status -and $it.status.value) { $state = [string]$it.status.value }
+                        break
+                    }
+                }
+            } catch { }
+            if ($state -eq 'loaded') { break }
+            if ($state -eq 'failed') {
+                Write-BrowserLog 'Falha ao carregar o modelo selecionado.'
+                break
+            }
+            Start-Sleep -Milliseconds 700
+        }
+        Write-BrowserLog ('Modelo ' + $ModelName + ' pronto.')
+
         if ($Target -eq 'llamacpp') {
             $null = Open-BrowserUrl $ServerUrl
             return
@@ -1728,7 +1790,7 @@ function Start-BrowserJob {
     }
 
     try {
-        return Start-Job -ScriptBlock $scriptBlock -ArgumentList $ServerUrl, $Cfg.Browser, $OpenWebUiUrl, $OpenWebUiBat, $LogDir
+        return Start-Job -ScriptBlock $scriptBlock -ArgumentList $ServerUrl, $Cfg.Browser, $OpenWebUiUrl, $OpenWebUiBat, $LogDir, (Get-PresetName $Cfg.Model)
     } catch {
         return $null
     }
