@@ -982,7 +982,6 @@ function Get-RecommendedCfg {
         Ngl        = 'auto'
         Vision     = 'off'
         Reasoning  = 'auto'
-        Load       = 'auto'
         Port       = [int]$script:Global.Port
         Host       = [string]$script:Global.Host
         Browser    = [string]$script:Global.Browser
@@ -1052,7 +1051,6 @@ function Normalize-Cfg {
     if (-not $Cfg.Model.Mmproj) { $Cfg.Vision = 'off' }
     if (@('auto', 'on', 'off') -notcontains [string]$Cfg.Reasoning) { $Cfg.Reasoning = 'auto' }
     if (-not $Cfg.Model.Meta.HasThinking) { $Cfg.Reasoning = 'auto' }
-    if (@('auto', 'mmap+mlock') -notcontains [string]$Cfg.Load) { $Cfg.Load = 'auto' }
     if (@('recomendado', 'qualidade', 'longo', 'cpu', 'personalizado') -notcontains [string]$Cfg.Preset) { $Cfg.Preset = 'personalizado' }
     if ([int]$Cfg.Port -lt 1 -or [int]$Cfg.Port -gt 65535) { $Cfg.Port = 5001 }
     if (@('127.0.0.1', '0.0.0.0', 'tailscale') -notcontains [string]$Cfg.Host) { $Cfg.Host = '127.0.0.1' }
@@ -1127,8 +1125,6 @@ function New-CfgForModel {
         if ($v) { $cfg.Vision = [string]$v }
         $v = Get-PropValue $saved 'reasoning' $null
         if ($v) { $cfg.Reasoning = [string]$v }
-        $v = Get-PropValue $saved 'load' $null
-        if ($v) { $cfg.Load = [string]$v }
     }
 
     $cfg.Port = [int]$script:Global.Port
@@ -1141,7 +1137,7 @@ function New-CfgForModel {
 
 function Get-CfgSnap {
     param($Cfg)
-    return ('{0}|{1}|{2}|{3}|{4}|{5}|{6}|{7}|{8}' -f $Cfg.Preset, $Cfg.Ctx, $Cfg.Ctk, $Cfg.Ctv, $Cfg.NPredict, $Cfg.Ngl, $Cfg.Vision, $Cfg.Reasoning, $Cfg.Load)
+    return ('{0}|{1}|{2}|{3}|{4}|{5}|{6}|{7}' -f $Cfg.Preset, $Cfg.Ctx, $Cfg.Ctk, $Cfg.Ctv, $Cfg.NPredict, $Cfg.Ngl, $Cfg.Vision, $Cfg.Reasoning)
 }
 
 function Set-StateModel {
@@ -1155,7 +1151,6 @@ function Set-StateModel {
         ngl       = [string]$Cfg.Ngl
         vision    = [string]$Cfg.Vision
         reasoning = [string]$Cfg.Reasoning
-        load      = [string]$Cfg.Load
     }
 }
 
@@ -1277,14 +1272,6 @@ function Get-NglLabel {
             }
             return $Ngl
         }
-    }
-}
-
-function Get-LoadLabel {
-    param([string]$Load)
-    switch ($Load) {
-        'mmap+mlock' { return 'fixa na RAM (mmap+mlock)' }
-        default      { return 'rápida (mmap, padrão)' }
     }
 }
 
@@ -1416,11 +1403,9 @@ function Build-ServerArgs {
     $a.Add('--models-preset'); $a.Add($presetPath)
     $a.Add('--models-max'); $a.Add('1')
     $a.Add('--jinja')
-    if ($Cfg.Load -eq 'mmap+mlock') {
-        switch (Get-LoadFlagStyle) {
-            'loadmode' { $a.Add('--load-mode'); $a.Add('mmap+mlock') }
-            'legacy'   { $a.Add('--mlock') }
-        }
+    switch (Get-LoadFlagStyle) {
+        'loadmode' { $a.Add('--load-mode'); $a.Add('mmap+mlock') }
+        'legacy'   { $a.Add('--mlock') }
     }
     $a.Add('--parallel'); $a.Add('1')
     $a.Add('--host'); $a.Add((Get-BindHost ([string]$Cfg.Host)))
@@ -1701,7 +1686,6 @@ function Get-SettingsRows {
     }
     $rows += [pscustomobject]@{ Key = 'npredict'; Label = 'Máx. resposta'; Value = $np; Color = 'White' }
     $rows += [pscustomobject]@{ Key = 'ngl'; Label = 'GPU'; Value = (Get-NglLabel $Cfg.Ngl $Cfg.Model); Color = 'White' }
-    $rows += [pscustomobject]@{ Key = 'load'; Label = 'Carga do modelo'; Value = (Get-LoadLabel $Cfg.Load); Color = 'White' }
     if ($Cfg.Model.Mmproj) {
         $rows += [pscustomobject]@{ Key = 'vision'; Label = 'Visão'; Value = (Get-VisionLabel $Cfg); Color = 'White' }
     }
@@ -1745,10 +1729,6 @@ function Change-CfgSetting {
             $opts = @('auto', '0', 'all')
             $Cfg.Ngl = [string](Cycle-List $opts $Cfg.Ngl $Direction)
         }
-        'load' {
-            $opts = @('auto', 'mmap+mlock')
-            $Cfg.Load = [string](Cycle-List $opts $Cfg.Load $Direction)
-        }
         'vision' {
             $opts = @('off', 'gpu', 'cpu')
             $Cfg.Vision = [string](Cycle-List $opts $Cfg.Vision $Direction)
@@ -1771,7 +1751,7 @@ function Change-CfgSetting {
         }
         default { return }
     }
-    if (@('preset', 'load', 'port', 'host', 'browser') -notcontains $Key) {
+    if (@('preset', 'port', 'host', 'browser') -notcontains $Key) {
         $Cfg.Preset = 'personalizado'
     }
     Normalize-Cfg $Cfg
@@ -1846,13 +1826,11 @@ function Show-Settings {
             if ($Cfg.Ngl -eq 'auto') { $hint = 'Reduza o contexto/KV.' }
             Write-Host ('      ' + $hint) -ForegroundColor DarkYellow
         }
-        if ($Cfg.Load -eq 'mmap+mlock') {
-            $wGB = $Cfg.Model.Size / 1GB
-            if ($wGB -gt ($mi.FreeRam - 2.0)) {
-                Write-Host '      Fixar na RAM pode travar o Windows.' -ForegroundColor Yellow
-            } else {
-                Write-Host '      Fixa o modelo na RAM: carga mais lenta, mas sem quedas de velocidade por paginação.' -ForegroundColor DarkGray
-            }
+        $wGB = $Cfg.Model.Size / 1GB
+        if ($wGB -gt ($mi.FreeRam - 2.0)) {
+            Write-Host '      Fixar na RAM pode travar o Windows.' -ForegroundColor Yellow
+        } else {
+            Write-Host '      Fixa o modelo na RAM: carga mais lenta, mas sem quedas de velocidade por paginação.' -ForegroundColor DarkGray
         }
         if (-not (Test-PortFree ([int]$Cfg.Port))) {
             Write-Host ('      Porta {0} em uso: o launcher vai perguntar o que fazer ao iniciar.' -f $Cfg.Port) -ForegroundColor Yellow
@@ -2130,7 +2108,6 @@ function Show-StartSummary {
     Write-Host ('  Modelo:     ' + $Cfg.Model.Display) -ForegroundColor White
     Write-Host ('  Contexto:   {0} tokens   |   KV: {1} / {2}' -f $Cfg.Ctx, $Cfg.Ctk, $Cfg.Ctv) -ForegroundColor Gray
     Write-Host ('  GPU:        {0}   |   Visão: {1}   |   Raciocínio: {2}' -f (Get-NglLabel $Cfg.Ngl $Cfg.Model), (Get-VisionLabel $Cfg), $Cfg.Reasoning) -ForegroundColor Gray
-    Write-Host ('  Carga:      ' + (Get-LoadLabel $Cfg.Load)) -ForegroundColor Gray
     Write-Host ('  Porta:      {0}   |   Navegador: {1}' -f $Cfg.Port, (Get-BrowserLabel $Cfg.Browser)) -ForegroundColor Gray
     Write-Host ('  Rede:       ' + (Get-HostLabel $Cfg.Host)) -ForegroundColor Gray
     $accessUrl = Get-ServerAccessUrl $Cfg.Host ([int]$Cfg.Port)
