@@ -1719,6 +1719,9 @@ function Get-SettingsRows {
     if ($Cfg.Model.Mmproj) {
         $rows += [pscustomobject]@{ Key = 'vision'; Label = 'Visão'; Value = (Get-VisionLabel $Cfg); Color = 'White' }
     }
+    $agentColor = 'White'
+    if ($Cfg.Agent -eq 'on') { $agentColor = 'Yellow' }
+    $rows += [pscustomobject]@{ Key = 'agent'; Label = 'Agente'; Value = (Get-AgentLabel $Cfg.Agent); Color = $agentColor }
     if ($Cfg.Model.Meta.HasThinking) {
         $reason = $Cfg.Reasoning
         if ($reason -eq 'on') { $reason = 'ligado' }
@@ -1730,9 +1733,6 @@ function Get-SettingsRows {
     $rows += [pscustomobject]@{ Key = 'port'; Label = 'Porta'; Value = ([string]$Cfg.Port); Color = $portColor }
     $rows += [pscustomobject]@{ Key = 'host'; Label = 'Rede'; Value = (Get-HostLabel $Cfg.Host); Color = 'White' }
     $rows += [pscustomobject]@{ Key = 'browser'; Label = 'Navegador'; Value = (Get-BrowserLabel $Cfg.Browser); Color = 'White' }
-    $agentColor = 'White'
-    if ($Cfg.Agent -eq 'on') { $agentColor = 'Yellow' }
-    $rows += [pscustomobject]@{ Key = 'agent'; Label = 'Agente'; Value = (Get-AgentLabel $Cfg.Agent); Color = $agentColor }
     $rows += [pscustomobject]@{ Key = 'start'; Label = 'INICIAR SERVIDOR'; Value = ''; Color = 'Green' }
     return $rows
 }
