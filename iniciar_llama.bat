@@ -46,6 +46,10 @@ $script:ModelsDir = Join-Path $script:Root 'Modelos'
 $script:StatePath = Join-Path $script:Root 'llama_launcher.json'
 $script:CachePath = Join-Path $script:Root 'llama_launcher_cache.json'
 $script:LogDir = Join-Path $script:Root 'logs'
+$script:Hit = @{}
+$script:FootHit = @()
+$script:MouseOk = $false
+$script:LastClick = [datetime]::MinValue
 
 # ---------------------------------------------------------------------------
 # Console helpers
@@ -75,7 +79,15 @@ function Fit-Text {
 }
 
 function Clear-Screen {
+    $script:Hit = @{}
+    $script:FootHit = @()
     try { [Console]::Clear() } catch { Clear-Host }
+}
+
+# Registra a linha atual da tela como clicável (Id = índice do item)
+function Register-Hit {
+    param([int]$Id)
+    try { $script:Hit[[int][Console]::CursorTop] = $Id } catch { }
 }
 
 function Show-Header {
@@ -109,21 +121,167 @@ function Write-Row {
 function Write-Footer {
     param([string]$Text)
     $parts = (Cut-Text $Text ((Get-UIWidth) - 1)) -split '   '
+    $map = @{ 'Enter' = 'Enter'; 'Esc' = 'Escape'; '←→' = 'RightArrow'; 'L' = 'L'; 'E' = 'E'; 'R' = 'R'; 'Q' = 'Q' }
+    $y = [int][Console]::CursorTop
+    $x = 0
+    $hits = @()
     for ($i = 0; $i -lt $parts.Count; $i++) {
-        if ($i -gt 0) { Write-Host '   ' -NoNewline -ForegroundColor DarkGray }
+        if ($i -gt 0) { Write-Host '   ' -NoNewline -ForegroundColor DarkGray; $x += 3 }
         if ($parts[$i] -match '^(\s*)(\S+)(.*)$') {
-            Write-Host $Matches[1] -NoNewline -ForegroundColor DarkGray
-            Write-Host $Matches[2] -NoNewline -ForegroundColor Cyan
-            Write-Host $Matches[3] -NoNewline -ForegroundColor DarkGray
+            $lead = $Matches[1]; $tok = $Matches[2]; $rest = $Matches[3]
+            Write-Host $lead -NoNewline -ForegroundColor DarkGray
+            $x += $lead.Length
+            if ($map.ContainsKey($tok)) {
+                $btn = ' ' + $tok + ' '
+                $x1 = $x
+                Write-Host $btn -NoNewline -ForegroundColor Black -BackgroundColor Cyan
+                $x += $btn.Length
+                Write-Host $rest -NoNewline -ForegroundColor Gray
+                $x += $rest.Length
+                $hits += [pscustomobject]@{ Y = $y; X1 = $x1; X2 = ($x - 1); Key = [string]$map[$tok] }
+            } else {
+                Write-Host $tok -NoNewline -ForegroundColor Cyan
+                Write-Host $rest -NoNewline -ForegroundColor DarkGray
+                $x += $tok.Length + $rest.Length
+            }
         } else {
             Write-Host $parts[$i] -NoNewline -ForegroundColor DarkGray
+            $x += $parts[$i].Length
         }
     }
     Write-Host ''
+    $script:FootHit = $hits
+}
+
+# ---------------------------------------------------------------------------
+# Mouse (Win32 console input). Clique esquerdo = Enter, direito = voltar/<-,
+# roda = cima/baixo. Se falhar, o launcher continua só com teclado.
+# ---------------------------------------------------------------------------
+function Initialize-Mouse {
+    $src = @'
+using System;
+using System.Runtime.InteropServices;
+public class LlamaEvt { public int Kind; public string Key; public char Ch; public int X; public int Y; }
+public static class LlamaConsole {
+    [StructLayout(LayoutKind.Explicit)]
+    struct INPUT_RECORD {
+        [FieldOffset(0)]  public ushort EventType;
+        [FieldOffset(4)]  public int    bKeyDown;
+        [FieldOffset(8)]  public ushort wRepeatCount;
+        [FieldOffset(10)] public ushort wVirtualKeyCode;
+        [FieldOffset(12)] public ushort wVirtualScanCode;
+        [FieldOffset(14)] public ushort UnicodeChar;
+        [FieldOffset(16)] public uint   dwControlKeyState;
+        [FieldOffset(4)]  public short  MouseX;
+        [FieldOffset(6)]  public short  MouseY;
+        [FieldOffset(8)]  public uint   ButtonState;
+        [FieldOffset(12)] public uint   MouseCtrlState;
+        [FieldOffset(16)] public uint   EventFlags;
+    }
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr GetStdHandle(int n);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetConsoleMode(IntPtr h, out uint m);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetConsoleMode(IntPtr h, uint m);
+    [DllImport("kernel32.dll", EntryPoint = "ReadConsoleInputW", SetLastError = true)]
+    static extern bool ReadConsoleInput(IntPtr h, out INPUT_RECORD r, uint len, out uint read);
+
+    static IntPtr hIn = GetStdHandle(-10);
+    static uint origMode;
+    static bool haveOrig = false;
+    static uint prevButtons = 0;
+
+    public static bool Enable() {
+        uint m;
+        if (!GetConsoleMode(hIn, out m)) return false;
+        if (!haveOrig) { origMode = m; haveOrig = true; }
+        // ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS, sem QUICK_EDIT
+        uint n = (m | 0x0010u | 0x0080u) & ~0x0040u;
+        return SetConsoleMode(hIn, n);
+    }
+    public static void Disable() {
+        if (haveOrig) SetConsoleMode(hIn, origMode);
+    }
+    public static LlamaEvt Read() {
+        while (true) {
+            INPUT_RECORD r; uint n;
+            if (!ReadConsoleInput(hIn, out r, 1, out n) || n == 0) return null;
+            if (r.EventType == 1) {
+                if (r.bKeyDown == 0) continue;
+                ushort vk = r.wVirtualKeyCode;
+                if (vk == 0x10 || vk == 0x11 || vk == 0x12 || vk == 0x14 || vk == 0x90 || vk == 0x91) continue;
+                LlamaEvt e = new LlamaEvt();
+                e.Kind = 1; e.Key = ((ConsoleKey)vk).ToString(); e.Ch = (char)r.UnicodeChar;
+                return e;
+            }
+            if (r.EventType == 2) {
+                uint flags = r.EventFlags; uint b = r.ButtonState;
+                if ((flags & 4) != 0) {
+                    short delta = unchecked((short)(b >> 16));
+                    LlamaEvt w = new LlamaEvt();
+                    w.Kind = (delta > 0) ? 4 : 5;
+                    return w;
+                }
+                uint pressed = b & ~prevButtons;
+                prevButtons = b;
+                if ((flags & (1u | 2u | 8u)) != 0) continue; // mover / duplo clique / roda horizontal
+                LlamaEvt c = null;
+                if ((pressed & 1u) != 0) { c = new LlamaEvt(); c.Kind = 2; }
+                else if ((pressed & 2u) != 0) { c = new LlamaEvt(); c.Kind = 3; }
+                if (c != null) { c.X = r.MouseX; c.Y = r.MouseY; return c; }
+            }
+        }
+    }
+}
+'@
+    try {
+        if (-not ('LlamaConsole' -as [type])) {
+            Add-Type -TypeDefinition $src -Language CSharp -ErrorAction Stop
+        }
+        $script:MouseOk = [bool][LlamaConsole]::Enable()
+    } catch { $script:MouseOk = $false }
+}
+
+function Enable-Mouse  { if ($script:MouseOk) { try { [void][LlamaConsole]::Enable() } catch { } } }
+function Disable-Mouse { if ($script:MouseOk) { try { [LlamaConsole]::Disable() } catch { } } }
+
+function New-KeyObj {
+    param([string]$Key, [char]$Ch = [char]0, [int]$Index = -1)
+    return [pscustomobject]@{ Key = $Key; KeyChar = $Ch; Index = $Index }
 }
 
 function Read-Key {
-    return [Console]::ReadKey($true)
+    if (-not $script:MouseOk) {
+        $k = [Console]::ReadKey($true)
+        return (New-KeyObj ([string]$k.Key) $k.KeyChar)
+    }
+    while ($true) {
+        $e = $null
+        try { $e = [LlamaConsole]::Read() } catch { $e = $null }
+        if ($null -eq $e) {
+            Disable-Mouse
+            $script:MouseOk = $false
+            $k = [Console]::ReadKey($true)
+            return (New-KeyObj ([string]$k.Key) $k.KeyChar)
+        }
+        if ($e.Kind -eq 1) { return (New-KeyObj $e.Key $e.Ch) }
+        if ($e.Kind -eq 4) { return (New-KeyObj 'UpArrow') }
+        if ($e.Kind -eq 5) { return (New-KeyObj 'DownArrow') }
+        if ($e.Kind -eq 2 -or $e.Kind -eq 3) {
+            $now = [datetime]::UtcNow
+            if (($now - $script:LastClick).TotalMilliseconds -lt 300) { continue }
+            $script:LastClick = $now
+            if ($e.Kind -eq 2) {
+                foreach ($b in @($script:FootHit)) {
+                    if ([int]$e.Y -eq $b.Y -and [int]$e.X -ge $b.X1 -and [int]$e.X -le $b.X2) {
+                        return (New-KeyObj $b.Key)
+                    }
+                }
+            }
+            $idx = -1
+            if ($script:Hit.ContainsKey([int]$e.Y)) { $idx = [int]$script:Hit[[int]$e.Y] }
+            if ($e.Kind -eq 2) { return (New-KeyObj 'MouseLeft' ([char]0) $idx) }
+            return (New-KeyObj 'MouseRight' ([char]0) $idx)
+        }
+    }
 }
 
 function Initialize-Console {
@@ -824,6 +982,7 @@ function Get-RecommendedCfg {
         Ngl        = 'auto'
         Vision     = 'off'
         Reasoning  = 'auto'
+        Load       = 'auto'
         Port       = [int]$script:Global.Port
         Host       = [string]$script:Global.Host
         Browser    = [string]$script:Global.Browser
@@ -893,6 +1052,7 @@ function Normalize-Cfg {
     if (-not $Cfg.Model.Mmproj) { $Cfg.Vision = 'off' }
     if (@('auto', 'on', 'off') -notcontains [string]$Cfg.Reasoning) { $Cfg.Reasoning = 'auto' }
     if (-not $Cfg.Model.Meta.HasThinking) { $Cfg.Reasoning = 'auto' }
+    if (@('auto', 'mmap+mlock') -notcontains [string]$Cfg.Load) { $Cfg.Load = 'auto' }
     if (@('recomendado', 'qualidade', 'longo', 'cpu', 'personalizado') -notcontains [string]$Cfg.Preset) { $Cfg.Preset = 'personalizado' }
     if ([int]$Cfg.Port -lt 1 -or [int]$Cfg.Port -gt 65535) { $Cfg.Port = 5001 }
     if (@('127.0.0.1', '0.0.0.0', 'tailscale') -notcontains [string]$Cfg.Host) { $Cfg.Host = '127.0.0.1' }
@@ -967,6 +1127,8 @@ function New-CfgForModel {
         if ($v) { $cfg.Vision = [string]$v }
         $v = Get-PropValue $saved 'reasoning' $null
         if ($v) { $cfg.Reasoning = [string]$v }
+        $v = Get-PropValue $saved 'load' $null
+        if ($v) { $cfg.Load = [string]$v }
     }
 
     $cfg.Port = [int]$script:Global.Port
@@ -979,7 +1141,7 @@ function New-CfgForModel {
 
 function Get-CfgSnap {
     param($Cfg)
-    return ('{0}|{1}|{2}|{3}|{4}|{5}|{6}|{7}' -f $Cfg.Preset, $Cfg.Ctx, $Cfg.Ctk, $Cfg.Ctv, $Cfg.NPredict, $Cfg.Ngl, $Cfg.Vision, $Cfg.Reasoning)
+    return ('{0}|{1}|{2}|{3}|{4}|{5}|{6}|{7}|{8}' -f $Cfg.Preset, $Cfg.Ctx, $Cfg.Ctk, $Cfg.Ctv, $Cfg.NPredict, $Cfg.Ngl, $Cfg.Vision, $Cfg.Reasoning, $Cfg.Load)
 }
 
 function Set-StateModel {
@@ -993,6 +1155,7 @@ function Set-StateModel {
         ngl       = [string]$Cfg.Ngl
         vision    = [string]$Cfg.Vision
         reasoning = [string]$Cfg.Reasoning
+        load      = [string]$Cfg.Load
     }
 }
 
@@ -1114,6 +1277,14 @@ function Get-NglLabel {
             }
             return $Ngl
         }
+    }
+}
+
+function Get-LoadLabel {
+    param([string]$Load)
+    switch ($Load) {
+        'mmap+mlock' { return 'fixa na RAM (mmap+mlock)' }
+        default      { return 'rápida (mmap, padrão)' }
     }
 }
 
@@ -1245,9 +1416,11 @@ function Build-ServerArgs {
     $a.Add('--models-preset'); $a.Add($presetPath)
     $a.Add('--models-max'); $a.Add('1')
     $a.Add('--jinja')
-    switch (Get-LoadFlagStyle) {
-        'loadmode' { $a.Add('--load-mode'); $a.Add('mlock') }
-        'legacy'   { $a.Add('--no-mmap'); $a.Add('--mlock') }
+    if ($Cfg.Load -eq 'mmap+mlock') {
+        switch (Get-LoadFlagStyle) {
+            'loadmode' { $a.Add('--load-mode'); $a.Add('mmap+mlock') }
+            'legacy'   { $a.Add('--mlock') }
+        }
     }
     $a.Add('--parallel'); $a.Add('1')
     $a.Add('--host'); $a.Add((Get-BindHost ([string]$Cfg.Host)))
@@ -1344,11 +1517,17 @@ function Show-Choice {
         for ($i = 0; $i -lt $Options.Count; $i++) {
             $txt = '   ' + $Options[$i]
             if ($i -eq $sel) { $txt = ' > ' + $Options[$i] }
+            Register-Hit $i
             Write-Row $txt ($i -eq $sel)
         }
         Write-Host ''
         Write-Footer '  ↑↓ navegar   Enter confirmar   Esc cancelar'
         $key = Read-Key
+        if ($key.Key -eq 'MouseLeft') {
+            if ($key.Index -ge 0 -and $key.Index -lt $Options.Count) { return $key.Index }
+            continue
+        }
+        if ($key.Key -eq 'MouseRight') { return -1 }
         switch ($key.Key) {
             'UpArrow'   { if ($sel -gt 0) { $sel-- } }
             'DownArrow' { if ($sel -lt ($Options.Count - 1)) { $sel++ } }
@@ -1425,6 +1604,7 @@ function Show-ModelPicker {
             $isSel = ($i -eq $sel)
             $prefix = '   '
             if ($isSel) { $prefix = ' > ' }
+            Register-Hit $i
 
             if ($row.Kind -eq 'last') {
                 $lc = $script:LastCfg
@@ -1460,7 +1640,11 @@ function Show-ModelPicker {
         Write-Footer $footer
 
         $key = Read-Key
-        switch ($key.Key) {
+        $kn = [string]$key.Key
+        if ($kn -eq 'MouseLeft') {
+            if ($key.Index -ge 0 -and $key.Index -lt $rows.Count) { $sel = $key.Index; $kn = 'Enter' } else { continue }
+        } elseif ($kn -eq 'MouseRight') { continue }
+        switch ($kn) {
             'UpArrow' {
                 if ($sel -gt 0) { $sel-- }
             }
@@ -1517,6 +1701,7 @@ function Get-SettingsRows {
     }
     $rows += [pscustomobject]@{ Key = 'npredict'; Label = 'Máx. resposta'; Value = $np; Color = 'White' }
     $rows += [pscustomobject]@{ Key = 'ngl'; Label = 'GPU'; Value = (Get-NglLabel $Cfg.Ngl $Cfg.Model); Color = 'White' }
+    $rows += [pscustomobject]@{ Key = 'load'; Label = 'Carga do modelo'; Value = (Get-LoadLabel $Cfg.Load); Color = 'White' }
     if ($Cfg.Model.Mmproj) {
         $rows += [pscustomobject]@{ Key = 'vision'; Label = 'Visão'; Value = (Get-VisionLabel $Cfg); Color = 'White' }
     }
@@ -1560,6 +1745,10 @@ function Change-CfgSetting {
             $opts = @('auto', '0', 'all')
             $Cfg.Ngl = [string](Cycle-List $opts $Cfg.Ngl $Direction)
         }
+        'load' {
+            $opts = @('auto', 'mmap+mlock')
+            $Cfg.Load = [string](Cycle-List $opts $Cfg.Load $Direction)
+        }
         'vision' {
             $opts = @('off', 'gpu', 'cpu')
             $Cfg.Vision = [string](Cycle-List $opts $Cfg.Vision $Direction)
@@ -1582,7 +1771,7 @@ function Change-CfgSetting {
         }
         default { return }
     }
-    if (@('preset', 'port', 'host', 'browser') -notcontains $Key) {
+    if (@('preset', 'load', 'port', 'host', 'browser') -notcontains $Key) {
         $Cfg.Preset = 'personalizado'
     }
     Normalize-Cfg $Cfg
@@ -1639,6 +1828,7 @@ function Show-Settings {
             if ($rows[$i].Key -eq 'start') {
                 Write-Host ('  ' + ('-' * [Math]::Max(10, $w - 4))) -ForegroundColor DarkGray
             }
+            Register-Hit $i
             Write-SettingRow $rows[$i] ($i -eq $sel)
         }
 
@@ -1655,6 +1845,14 @@ function Show-Settings {
             $hint = 'Reduza o contexto/KV ou deixe a GPU no automático (--fit).'
             if ($Cfg.Ngl -eq 'auto') { $hint = 'Reduza o contexto/KV.' }
             Write-Host ('      ' + $hint) -ForegroundColor DarkYellow
+        }
+        if ($Cfg.Load -eq 'mmap+mlock') {
+            $wGB = $Cfg.Model.Size / 1GB
+            if ($wGB -gt ($mi.FreeRam - 2.0)) {
+                Write-Host '      Fixar na RAM pode travar o Windows.' -ForegroundColor Yellow
+            } else {
+                Write-Host '      Fixa o modelo na RAM: carga mais lenta, mas sem quedas de velocidade por paginação.' -ForegroundColor DarkGray
+            }
         }
         if (-not (Test-PortFree ([int]$Cfg.Port))) {
             Write-Host ('      Porta {0} em uso: o launcher vai perguntar o que fazer ao iniciar.' -f $Cfg.Port) -ForegroundColor Yellow
@@ -1674,9 +1872,15 @@ function Show-Settings {
         Write-Footer $footer
 
         $key = Read-Key
+        $kn = [string]$key.Key
+        if ($kn -eq 'MouseLeft') {
+            if ($key.Index -ge 0 -and $key.Index -lt $rows.Count) { $sel = $key.Index; $kn = 'Enter' } else { continue }
+        } elseif ($kn -eq 'MouseRight') {
+            if ($key.Index -ge 0 -and $key.Index -lt $rows.Count) { $sel = $key.Index; $kn = 'LeftArrow' } else { $kn = 'Escape' }
+        }
         $nglTyping = ($rows[$sel].Key -eq 'ngl') -and (([string]$key.KeyChar -match '^\d$') -or ($key.Key -eq 'Backspace'))
         if (-not $nglTyping) { $nglBuf = '' }
-        switch ($key.Key) {
+        switch ($kn) {
             'UpArrow'   { if ($sel -gt 0) { $sel-- } }
             'DownArrow' { if ($sel -lt ($rows.Count - 1)) { $sel++ } }
             'Home'      { $sel = 0 }
@@ -1926,6 +2130,7 @@ function Show-StartSummary {
     Write-Host ('  Modelo:     ' + $Cfg.Model.Display) -ForegroundColor White
     Write-Host ('  Contexto:   {0} tokens   |   KV: {1} / {2}' -f $Cfg.Ctx, $Cfg.Ctk, $Cfg.Ctv) -ForegroundColor Gray
     Write-Host ('  GPU:        {0}   |   Visão: {1}   |   Raciocínio: {2}' -f (Get-NglLabel $Cfg.Ngl $Cfg.Model), (Get-VisionLabel $Cfg), $Cfg.Reasoning) -ForegroundColor Gray
+    Write-Host ('  Carga:      ' + (Get-LoadLabel $Cfg.Load)) -ForegroundColor Gray
     Write-Host ('  Porta:      {0}   |   Navegador: {1}' -f $Cfg.Port, (Get-BrowserLabel $Cfg.Browser)) -ForegroundColor Gray
     Write-Host ('  Rede:       ' + (Get-HostLabel $Cfg.Host)) -ForegroundColor Gray
     $accessUrl = Get-ServerAccessUrl $Cfg.Host ([int]$Cfg.Port)
@@ -2093,6 +2298,7 @@ function Start-LlamaServer {
         try { $Host.UI.RawUI.WindowTitle = ('llama-server  |  ' + $Cfg.Model.Display) } catch { }
         try { [Console]::CursorVisible = $true } catch { }
 
+        Disable-Mouse
         $esc = Start-EscWatcher
         $code = 0
         try {
@@ -2106,6 +2312,7 @@ function Start-LlamaServer {
         } finally {
             Pop-Location
             Stop-EscWatcher $esc
+            Enable-Mouse
         }
 
         if ($browserJob) {
@@ -2205,6 +2412,7 @@ $script:Mem = Get-MemInfo
 Initialize-State
 Refresh-Models
 Initialize-Console
+Initialize-Mouse
 
 $exitAll = $false
 try {
@@ -2262,6 +2470,7 @@ try {
         }
     }
 } finally {
+    Disable-Mouse
     try { [Console]::CursorVisible = $true } catch { }
     try { $Host.UI.RawUI.WindowTitle = 'Llama Launcher' } catch { }
 }
