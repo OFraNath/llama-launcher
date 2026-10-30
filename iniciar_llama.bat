@@ -985,6 +985,7 @@ function Get-RecommendedCfg {
         Port       = [int]$script:Global.Port
         Host       = [string]$script:Global.Host
         Browser    = [string]$script:Global.Browser
+        Agent      = [string]$script:Global.Agent
     }
 }
 
@@ -1055,6 +1056,7 @@ function Normalize-Cfg {
     if ([int]$Cfg.Port -lt 1 -or [int]$Cfg.Port -gt 65535) { $Cfg.Port = 5001 }
     if (@('127.0.0.1', '0.0.0.0', 'tailscale') -notcontains [string]$Cfg.Host) { $Cfg.Host = '127.0.0.1' }
     if (@('llamacpp', 'openwebui', 'none') -notcontains [string]$Cfg.Browser) { $Cfg.Browser = 'llamacpp' }
+    if (@('off', 'on') -notcontains [string]$Cfg.Agent) { $Cfg.Agent = 'off' }
     if ([int]$Cfg.NPredict -lt -1) { $Cfg.NPredict = -1 }
     if ([int]$Cfg.NPredict -gt 32768) { $Cfg.NPredict = 32768 }
 }
@@ -1062,7 +1064,7 @@ function Normalize-Cfg {
 # ---------------------------------------------------------------------------
 # Persistent state
 # ---------------------------------------------------------------------------
-$script:Global = [pscustomobject]@{ port = 5001; host = '127.0.0.1'; browser = 'llamacpp' }
+$script:Global = [pscustomobject]@{ port = 5001; host = '127.0.0.1'; browser = 'llamacpp'; agent = 'off' }
 $script:StateModels = @{}
 $script:LastModelPath = ''
 $script:LastCfg = $null
@@ -1088,6 +1090,8 @@ function Initialize-State {
             if (@('127.0.0.1', '0.0.0.0', 'tailscale') -contains $hostValue) { $script:Global.Host = $hostValue }
             $browser = [string](Get-PropValue $g 'browser' 'llamacpp')
             if (@('llamacpp', 'openwebui', 'none') -contains $browser) { $script:Global.Browser = $browser }
+            $agent = [string](Get-PropValue $g 'agent' 'off')
+            if (@('off', 'on') -contains $agent) { $script:Global.Agent = $agent }
         }
         $models = Get-PropValue $raw 'models' $null
         if ($models) {
@@ -1130,6 +1134,7 @@ function New-CfgForModel {
     $cfg.Port = [int]$script:Global.Port
     $cfg.Host = [string]$script:Global.Host
     $cfg.Browser = [string]$script:Global.Browser
+    $cfg.Agent = [string]$script:Global.Agent
     Normalize-Cfg $cfg
     if ($UseSession) { $script:SessionCfg[$Model.Path] = $cfg }
     return $cfg
@@ -1173,6 +1178,7 @@ function Save-Cfg {
         port    = [int]$Cfg.Port
         host    = [string]$Cfg.Host
         browser = [string]$Cfg.Browser
+        agent   = [string]$Cfg.Agent
     }
     $script:LastCfg = $Cfg
     Write-State
@@ -1294,6 +1300,12 @@ function Get-BrowserLabel {
     }
 }
 
+function Get-AgentLabel {
+    param([string]$Agent)
+    if ($Agent -eq 'on') { return 'ligado (arquivos + comandos)' }
+    return 'desligado'
+}
+
 function Get-HostLabel {
     param([string]$HostValue)
     if ($HostValue -eq 'tailscale') {
@@ -1396,6 +1408,23 @@ function Write-ModelPresets {
     return $path
 }
 
+function Test-AgentSupported {
+    if ($null -ne $script:AgentSupported) { return [bool]$script:AgentSupported }
+    $ok = $false
+    $prevEap = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $helpText = (& $script:ServerExe --help 2>&1 | Out-String)
+        if ($helpText -match '--agent\b') { $ok = $true }
+    } catch {
+        $ok = $false
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
+    $script:AgentSupported = $ok
+    return $ok
+}
+
 function Build-ServerArgs {
     param($Cfg, [string]$LogPath)
     $a = New-Object System.Collections.Generic.List[string]
@@ -1408,6 +1437,7 @@ function Build-ServerArgs {
         'legacy'   { $a.Add('--mlock') }
     }
     $a.Add('--parallel'); $a.Add('1')
+    if ([string]$Cfg.Agent -eq 'on' -and (Test-AgentSupported)) { $a.Add('--agent') }
     $a.Add('--host'); $a.Add((Get-BindHost ([string]$Cfg.Host)))
     $a.Add('--port'); $a.Add([string]$Cfg.Port)
     if ($LogPath) {
@@ -1700,6 +1730,9 @@ function Get-SettingsRows {
     $rows += [pscustomobject]@{ Key = 'port'; Label = 'Porta'; Value = ([string]$Cfg.Port); Color = $portColor }
     $rows += [pscustomobject]@{ Key = 'host'; Label = 'Rede'; Value = (Get-HostLabel $Cfg.Host); Color = 'White' }
     $rows += [pscustomobject]@{ Key = 'browser'; Label = 'Navegador'; Value = (Get-BrowserLabel $Cfg.Browser); Color = 'White' }
+    $agentColor = 'White'
+    if ($Cfg.Agent -eq 'on') { $agentColor = 'Yellow' }
+    $rows += [pscustomobject]@{ Key = 'agent'; Label = 'Agente'; Value = (Get-AgentLabel $Cfg.Agent); Color = $agentColor }
     $rows += [pscustomobject]@{ Key = 'start'; Label = 'INICIAR SERVIDOR'; Value = ''; Color = 'Green' }
     return $rows
 }
@@ -1749,9 +1782,13 @@ function Change-CfgSetting {
             $opts = @('llamacpp', 'openwebui', 'none')
             $Cfg.Browser = [string](Cycle-List $opts $Cfg.Browser $Direction)
         }
+        'agent' {
+            $opts = @('off', 'on')
+            $Cfg.Agent = [string](Cycle-List $opts $Cfg.Agent $Direction)
+        }
         default { return }
     }
-    if (@('preset', 'port', 'host', 'browser') -notcontains $Key) {
+    if (@('preset', 'port', 'host', 'browser', 'agent') -notcontains $Key) {
         $Cfg.Preset = 'personalizado'
     }
     Normalize-Cfg $Cfg
@@ -1843,6 +1880,16 @@ function Show-Settings {
         }
         if ($Cfg.Host -ne '127.0.0.1') {
             Write-Host '      Atenção: escuta em todas as interfaces, sem senha. Use apenas em redes confiáveis.' -ForegroundColor Yellow
+        }
+        if ($Cfg.Agent -eq 'on') {
+            if (Test-AgentSupported) {
+                Write-Host '      Agente: o modelo poderá ler/gravar arquivos e executar comandos neste PC (sem limite de pasta).' -ForegroundColor Yellow
+                if ($Cfg.Host -ne '127.0.0.1') {
+                    Write-Host '      PERIGO: com a rede aberta, qualquer aparelho que alcance a porta poderá fazer isso. Prefira Rede = local.' -ForegroundColor Red
+                }
+            } else {
+                Write-Host '      Agente: este llama-server.exe é antigo e não tem --agent. A opção será ignorada; atualize o llama.cpp.' -ForegroundColor Red
+            }
         }
 
         Write-Host ''
@@ -2110,6 +2157,17 @@ function Show-StartSummary {
     Write-Host ('  GPU:        {0}   |   Visão: {1}   |   Raciocínio: {2}' -f (Get-NglLabel $Cfg.Ngl $Cfg.Model), (Get-VisionLabel $Cfg), $Cfg.Reasoning) -ForegroundColor Gray
     Write-Host ('  Porta:      {0}   |   Navegador: {1}' -f $Cfg.Port, (Get-BrowserLabel $Cfg.Browser)) -ForegroundColor Gray
     Write-Host ('  Rede:       ' + (Get-HostLabel $Cfg.Host)) -ForegroundColor Gray
+    if ([string]$Cfg.Agent -eq 'on') {
+        if (Test-AgentSupported) {
+            Write-Host '  Agente:     ligado (ler/gravar arquivos e executar comandos)' -ForegroundColor Yellow
+            Write-Host ('  Pasta base: ' + $script:Root) -ForegroundColor Yellow
+            if ($Cfg.Host -ne '127.0.0.1') {
+                Write-Host '  PERIGO:     rede aberta + agente = qualquer aparelho na rede pode executar comandos aqui.' -ForegroundColor Red
+            }
+        } else {
+            Write-Host '  Agente:     indisponível (llama-server.exe antigo, --agent ignorado)' -ForegroundColor Red
+        }
+    }
     $accessUrl = Get-ServerAccessUrl $Cfg.Host ([int]$Cfg.Port)
     if ($accessUrl) {
         Write-Host ('  Acesso:     ' + $accessUrl) -ForegroundColor Cyan
