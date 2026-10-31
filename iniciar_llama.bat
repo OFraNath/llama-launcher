@@ -1002,7 +1002,7 @@ function Get-RecommendedCfg {
         Ngl        = 'auto'
         Vision     = 'off'
         Reasoning  = 'auto'
-        Template   = 'chatml'
+        Template   = 'auto'
         Threads    = 'auto'
         CacheRam   = 'auto'
         Batch      = (Get-AutoBatch $Model $ctx 'q8_0' 'q8_0' 'auto' 3.0)
@@ -1090,7 +1090,7 @@ function Normalize-Cfg {
     if (-not $Cfg.Model.Mmproj) { $Cfg.Vision = 'off' }
     if (@('auto', 'on', 'off') -notcontains [string]$Cfg.Reasoning) { $Cfg.Reasoning = 'auto' }
     if (-not $Cfg.Model.Meta.HasThinking) { $Cfg.Reasoning = 'auto' }
-    if (@('auto', 'chatml') -notcontains [string]$Cfg.Template) { $Cfg.Template = 'chatml' }
+    if (@('auto', 'chatml') -notcontains [string]$Cfg.Template) { $Cfg.Template = 'auto' }
     $thrStr = ([string]$Cfg.Threads).Trim()
     if ($thrStr -match '^\d{1,3}$' -and [int]$thrStr -ge 1) {
         $thrN = [int]$thrStr
