@@ -9,6 +9,10 @@ Um launcher conveniente para o llama-server: um único `.bat`, sem instalar nada
 - Modelos `.gguf` dentro da pasta `Modelos`
 - Opcional: GPU NVIDIA (`nvidia-smi`), Tailscale e [uv](https://docs.astral.sh/uv/) (para o Open WebUI)
 
+## Compatibilidade
+
+Testado com o llama.cpp **b11954**. Versões posteriores podem alterar flags do `llama-server` e quebrar o launcher; se isso acontecer, use a versão testada. Para ver a sua: `llama-server.exe --version`.
+
 ## Uso
 
 1. Coloque o `iniciar_llama.bat` na mesma pasta do `llama-server.exe`.
