@@ -957,6 +957,26 @@ function Get-CtxOptions {
     return $opts
 }
 
+function Get-AutoBatch {
+    param($Model, [int]$Ctx, [string]$Ctk, [string]$Ctv, [string]$Ngl, [double]$MinHeadroom)
+    if (-not $script:Gpu -or -not $script:Gpu.Ok -or $Ngl -eq '0') { return 'auto' }
+    $freeV = $script:Gpu.FreeMB / 1024.0
+    $need = ($Model.Size / 1GB) + (Get-KvGB $Model.Meta $Ctx $Ctk $Ctv) + 0.75
+    if (($freeV - $need) -ge $MinHeadroom) { return '1024' }
+    return 'auto'
+}
+
+function Get-PhysicalCores {
+    if ($null -ne $script:PhysCores) { return [int]$script:PhysCores }
+    $n = 0
+    try {
+        $sum = (@(Get-CimInstance Win32_Processor -ErrorAction Stop) | Measure-Object -Property NumberOfCores -Sum).Sum
+        if ($sum) { $n = [int]$sum }
+    } catch { }
+    $script:PhysCores = $n
+    return $n
+}
+
 function Get-RecommendedCfg {
     param($Model)
     $maxCtx = Get-MaxCtx $Model
@@ -982,6 +1002,10 @@ function Get-RecommendedCfg {
         Ngl        = 'auto'
         Vision     = 'off'
         Reasoning  = 'auto'
+        Template   = 'chatml'
+        Threads    = 'auto'
+        CacheRam   = 'auto'
+        Batch      = (Get-AutoBatch $Model $ctx 'q8_0' 'q8_0' 'auto' 3.0)
         Port       = [int]$script:Global.Port
         Host       = [string]$script:Global.Host
         Browser    = [string]$script:Global.Browser
@@ -1000,6 +1024,9 @@ function Apply-Preset {
             $Cfg.Ctv = $r.Ctv
             $Cfg.Ngl = $r.Ngl
             $Cfg.NPredict = $r.NPredict
+            $Cfg.Threads = 'auto'
+            $Cfg.CacheRam = 'auto'
+            $Cfg.Batch = $r.Batch
         }
         'qualidade' {
             $Cfg.Ctx = [Math]::Min(8192, $maxCtx)
@@ -1007,6 +1034,9 @@ function Apply-Preset {
             $Cfg.Ctv = 'f16'
             $Cfg.Ngl = 'auto'
             $Cfg.NPredict = -1
+            $Cfg.Threads = 'auto'
+            $Cfg.CacheRam = 'auto'
+            $Cfg.Batch = 'auto'
         }
         'longo' {
             $Cfg.Ctx = [Math]::Min(32768, $maxCtx)
@@ -1014,6 +1044,9 @@ function Apply-Preset {
             $Cfg.Ctv = 'q4_0'
             $Cfg.Ngl = 'auto'
             $Cfg.NPredict = -1
+            $Cfg.Threads = 'auto'
+            $Cfg.CacheRam = 'auto'
+            $Cfg.Batch = (Get-AutoBatch $Cfg.Model $Cfg.Ctx $Cfg.Ctk $Cfg.Ctv $Cfg.Ngl 1.5)
         }
         'cpu' {
             $Cfg.Ctx = [Math]::Min(8192, $maxCtx)
@@ -1021,6 +1054,11 @@ function Apply-Preset {
             $Cfg.Ctv = 'q8_0'
             $Cfg.Ngl = '0'
             $Cfg.NPredict = -1
+            $Cfg.Threads = 'auto'
+            $phys = Get-PhysicalCores
+            if ($phys -ge 1) { $Cfg.Threads = [string]$phys }
+            $Cfg.CacheRam = 'auto'
+            $Cfg.Batch = 'auto'
         }
     }
     $Cfg.Preset = $Name
@@ -1052,6 +1090,25 @@ function Normalize-Cfg {
     if (-not $Cfg.Model.Mmproj) { $Cfg.Vision = 'off' }
     if (@('auto', 'on', 'off') -notcontains [string]$Cfg.Reasoning) { $Cfg.Reasoning = 'auto' }
     if (-not $Cfg.Model.Meta.HasThinking) { $Cfg.Reasoning = 'auto' }
+    if (@('auto', 'chatml') -notcontains [string]$Cfg.Template) { $Cfg.Template = 'chatml' }
+    $thrStr = ([string]$Cfg.Threads).Trim()
+    if ($thrStr -match '^\d{1,3}$' -and [int]$thrStr -ge 1) {
+        $thrN = [int]$thrStr
+        $thrMax = Get-ThreadsMax
+        if ($thrN -gt $thrMax) { $thrN = $thrMax }
+        $Cfg.Threads = [string]$thrN
+    } else {
+        $Cfg.Threads = 'auto'
+    }
+    if (@('auto', 'off') -notcontains [string]$Cfg.CacheRam) { $Cfg.CacheRam = 'auto' }
+    $batStr = ([string]$Cfg.Batch).Trim()
+    if ($batStr -match '^\d{1,4}$' -and [int]$batStr -ge 1) {
+        $batN = [int]$batStr
+        if ($batN -gt 8192) { $batN = 8192 }
+        $Cfg.Batch = [string]$batN
+    } else {
+        $Cfg.Batch = 'auto'
+    }
     if (@('recomendado', 'qualidade', 'longo', 'cpu', 'personalizado') -notcontains [string]$Cfg.Preset) { $Cfg.Preset = 'personalizado' }
     if ([int]$Cfg.Port -lt 1 -or [int]$Cfg.Port -gt 65535) { $Cfg.Port = 5001 }
     if (@('127.0.0.1', '0.0.0.0', 'tailscale') -notcontains [string]$Cfg.Host) { $Cfg.Host = '127.0.0.1' }
@@ -1129,6 +1186,14 @@ function New-CfgForModel {
         if ($v) { $cfg.Vision = [string]$v }
         $v = Get-PropValue $saved 'reasoning' $null
         if ($v) { $cfg.Reasoning = [string]$v }
+        $v = Get-PropValue $saved 'template' $null
+        if ($v) { $cfg.Template = [string]$v }
+        $v = Get-PropValue $saved 'threads' $null
+        if ($v) { $cfg.Threads = [string]$v }
+        $v = Get-PropValue $saved 'cacheram' $null
+        if ($v) { $cfg.CacheRam = [string]$v }
+        $v = Get-PropValue $saved 'batch' $null
+        if ($v) { $cfg.Batch = [string]$v }
     }
 
     $cfg.Port = [int]$script:Global.Port
@@ -1142,7 +1207,7 @@ function New-CfgForModel {
 
 function Get-CfgSnap {
     param($Cfg)
-    return ('{0}|{1}|{2}|{3}|{4}|{5}|{6}|{7}' -f $Cfg.Preset, $Cfg.Ctx, $Cfg.Ctk, $Cfg.Ctv, $Cfg.NPredict, $Cfg.Ngl, $Cfg.Vision, $Cfg.Reasoning)
+    return ('{0}|{1}|{2}|{3}|{4}|{5}|{6}|{7}|{8}|{9}|{10}|{11}' -f $Cfg.Preset, $Cfg.Ctx, $Cfg.Ctk, $Cfg.Ctv, $Cfg.NPredict, $Cfg.Ngl, $Cfg.Vision, $Cfg.Reasoning, $Cfg.Template, $Cfg.Threads, $Cfg.CacheRam, $Cfg.Batch)
 }
 
 function Set-StateModel {
@@ -1156,6 +1221,10 @@ function Set-StateModel {
         ngl       = [string]$Cfg.Ngl
         vision    = [string]$Cfg.Vision
         reasoning = [string]$Cfg.Reasoning
+        template  = [string]$Cfg.Template
+        threads   = [string]$Cfg.Threads
+        cacheram  = [string]$Cfg.CacheRam
+        batch     = [string]$Cfg.Batch
     }
 }
 
@@ -1281,6 +1350,67 @@ function Get-NglLabel {
     }
 }
 
+function Get-BatchLabel {
+    param([string]$Batch)
+    if ($Batch -match '^\d+$') { return ('{0} tokens' -f $Batch) }
+    return 'automático'
+}
+
+function Get-ThreadsMax {
+    $n = 0
+    try { $n = [int][Environment]::ProcessorCount } catch { }
+    if ($n -lt 1) { $n = 4 }
+    return $n
+}
+
+function Get-ThreadsLabel {
+    param([string]$Threads)
+    if ($Threads -match '^\d+$') { return ('{0} de {1}' -f $Threads, (Get-ThreadsMax)) }
+    return 'automático'
+}
+
+function Get-AutoCacheRamMiB {
+    param($Cfg)
+    if (-not $script:Mem -or [int]$script:Mem.FreeMB -le 0) { return -1 }
+    $m = $Cfg.Model
+    $weights = $m.Size / 1GB
+    $kv = Get-KvGB $m.Meta $Cfg.Ctx $Cfg.Ctk $Cfg.Ctv
+    $freeR = $script:Mem.FreeMB / 1024.0
+    $freeV = 0.0
+    $gpuOk = ($script:Gpu -and $script:Gpu.Ok)
+    if ($gpuOk) { $freeV = $script:Gpu.FreeMB / 1024.0 }
+    $total = $weights + $kv
+    if ($Cfg.Ngl -eq '0' -or -not $gpuOk) {
+        $inRam = $total + 1.0
+    } elseif ($Cfg.Ngl -match '^\d+$') {
+        $nTotal = Get-NglMax $m
+        $frac = [Math]::Min([int]$Cfg.Ngl, $nTotal) / [double]$nTotal
+        $inRam = ($total * (1.0 - $frac)) + 1.0
+    } else {
+        $inRam = [Math]::Max(1.0, ($total + 1.0) - [Math]::Max(0.0, $freeV - 0.75))
+    }
+    if ($Cfg.Vision -eq 'cpu' -and $m.Mmproj) { $inRam += ($m.Mmproj.Length / 1GB) }
+    $budget = $freeR - $inRam - 2.5
+    $gb = [Math]::Min([Math]::Max(1.0, $kv * 4.0), [Math]::Min($budget * 0.5, 8.0))
+    if ($gb -lt 0.5) { return 0 }
+    return ([int][Math]::Floor($gb * 4.0) * 256)
+}
+
+function Get-CacheRamLabel {
+    param($Cfg)
+    if ($Cfg.CacheRam -eq 'off') { return 'desligado' }
+    $mib = Get-AutoCacheRamMiB $Cfg
+    if ($mib -lt 0) { return 'automático' }
+    if ($mib -eq 0) { return 'automático · desligado' }
+    return ('automático · {0:0.##} GB' -f ($mib / 1024.0))
+}
+
+function Get-TemplateLabel {
+    param([string]$Template)
+    if ($Template -eq 'chatml') { return 'ChatML' }
+    return 'Padrão'
+}
+
 function Get-VisionLabel {
     param($Cfg)
     switch ($Cfg.Vision) {
@@ -1368,6 +1498,19 @@ function Get-PresetLines {
     $quantK = ($Cfg.Ctk -notin @('f16', 'f32', 'bf16'))
     $quantV = ($Cfg.Ctv -notin @('f16', 'f32', 'bf16'))
     if ($quantK -or $quantV) { $l.Add('flash-attn = on') } else { $l.Add('flash-attn = auto') }
+
+    if ([string]$Cfg.Template -eq 'chatml') { $l.Add('chat-template = chatml') }
+    if ($Cfg.Threads -match '^\d+$') { $l.Add('threads = ' + [string]$Cfg.Threads) }
+    if ($Cfg.Batch -match '^\d+$') {
+        $l.Add('ubatch-size = ' + [string]$Cfg.Batch)
+        if ([int]$Cfg.Batch -gt 2048) { $l.Add('batch-size = ' + [string]$Cfg.Batch) }
+    }
+    if ($Cfg.CacheRam -eq 'off') {
+        $l.Add('cache-ram = 0')
+    } else {
+        $cr = Get-AutoCacheRamMiB $Cfg
+        if ($cr -ge 0) { $l.Add('cache-ram = ' + [string]$cr) }
+    }
 
     $l.Add('fit = on')
     if ($Cfg.Ngl -ne 'auto') { $l.Add('n-gpu-layers = ' + [string]$Cfg.Ngl) }
@@ -1708,7 +1851,9 @@ function Get-SettingsRows {
     $rows += [pscustomobject]@{ Key = 'model'; Label = 'Modelo'; Value = $Cfg.Model.Display; Color = 'White' }
     $rows += [pscustomobject]@{ Key = 'preset'; Label = 'Preset'; Value = (Get-PresetLabel $Cfg.Preset); Color = 'Cyan' }
     $rows += [pscustomobject]@{ Key = 'ctx'; Label = 'Contexto'; Value = ('{0} tokens  (máx. {1})' -f (Format-Tokens $Cfg.Ctx), (Format-Tokens (Get-MaxCtx $Cfg.Model))); Color = 'White' }
+    $rows += [pscustomobject]@{ Key = 'batch'; Label = 'Batch'; Value = (Get-BatchLabel $Cfg.Batch); Color = 'White' }
     $rows += [pscustomobject]@{ Key = 'kv'; Label = 'KV cache'; Value = ('{0}  ~{1:0.0} GB' -f (Find-KvOption $Cfg).Label, $mi.KvGB); Color = 'White' }
+    $rows += [pscustomobject]@{ Key = 'cacheram'; Label = 'Cache de prompt'; Value = (Get-CacheRamLabel $Cfg); Color = 'White' }
     if ([int]$Cfg.NPredict -lt 0) {
         $np = '-1 (ilimitado)'
     } else {
@@ -1716,6 +1861,7 @@ function Get-SettingsRows {
     }
     $rows += [pscustomobject]@{ Key = 'npredict'; Label = 'Máx. resposta'; Value = $np; Color = 'White' }
     $rows += [pscustomobject]@{ Key = 'ngl'; Label = 'GPU'; Value = (Get-NglLabel $Cfg.Ngl $Cfg.Model); Color = 'White' }
+    $rows += [pscustomobject]@{ Key = 'threads'; Label = 'Threads'; Value = (Get-ThreadsLabel $Cfg.Threads); Color = 'White' }
     if ($Cfg.Model.Mmproj) {
         $rows += [pscustomobject]@{ Key = 'vision'; Label = 'Visão'; Value = (Get-VisionLabel $Cfg); Color = 'White' }
     }
@@ -1728,6 +1874,7 @@ function Get-SettingsRows {
         elseif ($reason -eq 'off') { $reason = 'desligado' }
         $rows += [pscustomobject]@{ Key = 'reasoning'; Label = 'Raciocínio'; Value = $reason; Color = 'White' }
     }
+    $rows += [pscustomobject]@{ Key = 'template'; Label = 'Template'; Value = (Get-TemplateLabel $Cfg.Template); Color = 'White' }
     $portColor = 'White'
     if (-not (Test-PortFree ([int]$Cfg.Port))) { $portColor = 'Red' }
     $rows += [pscustomobject]@{ Key = 'port'; Label = 'Porta'; Value = ([string]$Cfg.Port); Color = $portColor }
@@ -1770,6 +1917,21 @@ function Change-CfgSetting {
             $opts = @('auto', 'on', 'off')
             $Cfg.Reasoning = [string](Cycle-List $opts $Cfg.Reasoning $Direction)
         }
+        'threads' {
+            $Cfg.Threads = 'auto'
+        }
+        'batch' {
+            $opts = @('auto', '256', '512', '1024', '2048', '4096')
+            $Cfg.Batch = [string](Cycle-List $opts $Cfg.Batch $Direction)
+        }
+        'cacheram' {
+            $opts = @('auto', 'off')
+            $Cfg.CacheRam = [string](Cycle-List $opts $Cfg.CacheRam $Direction)
+        }
+        'template' {
+            $opts = @('auto', 'chatml')
+            $Cfg.Template = [string](Cycle-List $opts $Cfg.Template $Direction)
+        }
         'port' {
             $opts = @(5001, 5002, 8081, 8082)
             $Cfg.Port = [int](Cycle-List $opts $Cfg.Port $Direction)
@@ -1788,7 +1950,7 @@ function Change-CfgSetting {
         }
         default { return }
     }
-    if (@('preset', 'port', 'host', 'browser', 'agent') -notcontains $Key) {
+    if (@('preset', 'port', 'host', 'browser', 'agent', 'template', 'threads', 'cacheram', 'batch') -notcontains $Key) {
         $Cfg.Preset = 'personalizado'
     }
     Normalize-Cfg $Cfg
@@ -1903,7 +2065,8 @@ function Show-Settings {
         } elseif ($kn -eq 'MouseRight') {
             if ($key.Index -ge 0 -and $key.Index -lt $rows.Count) { $sel = $key.Index; $kn = 'LeftArrow' } else { $kn = 'Escape' }
         }
-        $nglTyping = ($rows[$sel].Key -eq 'ngl') -and (([string]$key.KeyChar -match '^\d$') -or ($key.Key -eq 'Backspace'))
+        $typKey = [string]$rows[$sel].Key
+        $nglTyping = (@('ngl', 'threads', 'batch') -contains $typKey) -and (([string]$key.KeyChar -match '^\d$') -or ($key.Key -eq 'Backspace'))
         if (-not $nglTyping) { $nglBuf = '' }
         switch ($kn) {
             'UpArrow'   { if ($sel -gt 0) { $sel-- } }
@@ -1941,20 +2104,26 @@ function Show-Settings {
             'S'      { return [pscustomobject]@{ Action = 'start' } }
             'Backspace' {
                 if ($nglTyping) {
+                    $prop = 'Ngl'
+                    if ($typKey -eq 'threads') { $prop = 'Threads' } elseif ($typKey -eq 'batch') { $prop = 'Batch' }
                     if ($nglBuf.Length -gt 0) { $nglBuf = $nglBuf.Substring(0, $nglBuf.Length - 1) }
-                    if ($nglBuf -eq '') { $Cfg.Ngl = 'auto' } else { $Cfg.Ngl = $nglBuf }
-                    $Cfg.Preset = 'personalizado'
+                    if ($nglBuf -eq '') { $Cfg.$prop = 'auto' } else { $Cfg.$prop = $nglBuf }
+                    if ($prop -eq 'Ngl') { $Cfg.Preset = 'personalizado' }
                     Normalize-Cfg $Cfg
-                    if ($Cfg.Ngl -ne 'auto') { $nglBuf = [string]$Cfg.Ngl }
+                    if ($Cfg.$prop -ne 'auto') { $nglBuf = [string]$Cfg.$prop } else { $nglBuf = '' }
                 }
             }
             default {
                 if ($nglTyping) {
-                    if ($nglBuf.Length -lt 3) { $nglBuf += [string]$key.KeyChar }
-                    $Cfg.Ngl = $nglBuf
-                    $Cfg.Preset = 'personalizado'
+                    $prop = 'Ngl'
+                    if ($typKey -eq 'threads') { $prop = 'Threads' } elseif ($typKey -eq 'batch') { $prop = 'Batch' }
+                    $maxLen = 3
+                    if ($typKey -eq 'batch') { $maxLen = 4 }
+                    if ($nglBuf.Length -lt $maxLen) { $nglBuf += [string]$key.KeyChar }
+                    $Cfg.$prop = $nglBuf
+                    if ($prop -eq 'Ngl') { $Cfg.Preset = 'personalizado' }
                     Normalize-Cfg $Cfg
-                    $nglBuf = [string]$Cfg.Ngl
+                    if ($Cfg.$prop -ne 'auto') { $nglBuf = [string]$Cfg.$prop } else { $nglBuf = '' }
                 }
             }
         }
@@ -2153,9 +2322,11 @@ function Show-StartSummary {
     Show-Header 'Iniciando servidor'
     Write-Host ''
     Write-Host ('  Modelo:     ' + $Cfg.Model.Display) -ForegroundColor White
-    Write-Host ('  Contexto:   {0} tokens   |   KV: {1} / {2}' -f $Cfg.Ctx, $Cfg.Ctk, $Cfg.Ctv) -ForegroundColor Gray
+    Write-Host ('  Contexto:   {0} tokens   |   KV: {1} / {2}   |   Batch: {3}' -f $Cfg.Ctx, $Cfg.Ctk, $Cfg.Ctv, (Get-BatchLabel $Cfg.Batch)) -ForegroundColor Gray
     Write-Host ('  GPU:        {0}   |   Visão: {1}   |   Raciocínio: {2}' -f (Get-NglLabel $Cfg.Ngl $Cfg.Model), (Get-VisionLabel $Cfg), $Cfg.Reasoning) -ForegroundColor Gray
     Write-Host ('  Porta:      {0}   |   Navegador: {1}' -f $Cfg.Port, (Get-BrowserLabel $Cfg.Browser)) -ForegroundColor Gray
+    Write-Host ('  Template:   ' + (Get-TemplateLabel $Cfg.Template)) -ForegroundColor Gray
+    Write-Host ('  CPU:        Threads {0}   |   Cache de prompt: {1}' -f (Get-ThreadsLabel $Cfg.Threads), (Get-CacheRamLabel $Cfg)) -ForegroundColor Gray
     Write-Host ('  Rede:       ' + (Get-HostLabel $Cfg.Host)) -ForegroundColor Gray
     if ([string]$Cfg.Agent -eq 'on') {
         if (Test-AgentSupported) {
