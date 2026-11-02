@@ -6,6 +6,7 @@ llama_presets.ini
 
 # Segredos e dados locais
 .webui_secret_key
+PLANO.md
 
 # Modelos GGUF (grandes demais para o repositório)
 /Modelos/

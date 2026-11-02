@@ -1576,7 +1576,7 @@ function Build-ServerArgs {
     $a.Add('--models-max'); $a.Add('1')
     $a.Add('--jinja')
     switch (Get-LoadFlagStyle) {
-        'loadmode' { $a.Add('--load-mode'); $a.Add('mmap+mlock') }
+        'loadmode' { $a.Add('--load-mode'); $a.Add('none') }
         'legacy'   { $a.Add('--mlock') }
     }
     $a.Add('--parallel'); $a.Add('1')
@@ -2404,6 +2404,74 @@ function Stop-EscWatcher {
     try { if ($Watcher.Ps) { $Watcher.Ps.Dispose() } } catch { }
 }
 
+function Start-LoadProgress {
+    param([int]$Port, [string]$ModelName, [double]$TotalBytes)
+    $state = [hashtable]::Synchronized(@{ Stop = $false })
+    $ps = $null
+    $handle = $null
+    try {
+        $ps = [powershell]::Create()
+        [void]$ps.AddScript({
+            param($State, $ServerPid, $Port, $ModelName, $Total)
+            if ($Total -le 0) { $Total = 1 }
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            $childPid = 0
+            $row = -1
+            while (-not $State.Stop) {
+                $loaded = $false
+                try {
+                    $resp = Invoke-WebRequest -Uri ('http://127.0.0.1:{0}/models' -f $Port) -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
+                    $json = $resp.Content | ConvertFrom-Json
+                    $items = @()
+                    if ($json.data) { $items = @($json.data) } elseif ($json.models) { $items = @($json.models) }
+                    foreach ($it in $items) {
+                        if ([string]$it.id -eq $ModelName -and $it.status -and [string]$it.status.value -eq 'loaded') { $loaded = $true }
+                    }
+                } catch { }
+                if ($childPid -eq 0) {
+                    foreach ($r in @(Get-CimInstance Win32_Process -Filter ("Name='llama-server.exe' AND ParentProcessId={0}" -f $ServerPid))) {
+                        foreach ($c in @(Get-CimInstance Win32_Process -Filter ("Name='llama-server.exe' AND ParentProcessId={0}" -f $r.ProcessId))) { $childPid = [int]$c.ProcessId }
+                    }
+                }
+                $read = 0.0
+                if ($childPid -ne 0) {
+                    $p = Get-CimInstance Win32_Process -Filter ("ProcessId={0}" -f $childPid)
+                    if ($p) { $read = [double]$p.ReadTransferCount } else { $childPid = 0 }
+                }
+                $pct = [int][Math]::Min(99, [Math]::Floor(100.0 * $read / $Total))
+                if ($loaded) {
+                    $text = ('  Modelo carregado em {0:0}s.' -f $sw.Elapsed.TotalSeconds)
+                } else {
+                    $text = ('  Carregando modelo... {0}%  ({1:0}s)' -f $pct, $sw.Elapsed.TotalSeconds)
+                }
+                if ($row -lt 0) {
+                    if ($loaded -or $read -gt ($Total * 0.03)) {
+                        $row = [Console]::CursorTop
+                        [Console]::WriteLine($text)
+                    }
+                } else {
+                    $l = [Console]::CursorLeft
+                    $t = [Console]::CursorTop
+                    [Console]::SetCursorPosition(0, $row)
+                    [Console]::Write($text.PadRight(48))
+                    [Console]::SetCursorPosition($l, $t)
+                }
+                if ($loaded) { break }
+                Start-Sleep -Milliseconds 500
+            }
+        }).AddArgument($state).AddArgument($PID).AddArgument($Port).AddArgument($ModelName).AddArgument($TotalBytes)
+        $handle = $ps.BeginInvoke()
+    } catch { }
+    return [pscustomobject]@{ Ps = $ps; Handle = $handle; State = $state }
+}
+
+function Stop-LoadProgress {
+    param($Watcher)
+    $Watcher.State.Stop = $true
+    try { if ($Watcher.Handle) { [void]$Watcher.Handle.AsyncWaitHandle.WaitOne(2000) } } catch { }
+    try { if ($Watcher.Ps) { $Watcher.Ps.Dispose() } } catch { }
+}
+
 function Start-LlamaServer {
     param($Cfg)
 
@@ -2506,6 +2574,7 @@ function Start-LlamaServer {
 
         Disable-Mouse
         $esc = Start-EscWatcher
+        $progress = Start-LoadProgress ([int]$Cfg.Port) (Get-PresetName $Cfg.Model) ([double]$Cfg.Model.Size)
         $code = 0
         try {
             Push-Location $script:Root
@@ -2518,6 +2587,7 @@ function Start-LlamaServer {
         } finally {
             Pop-Location
             Stop-EscWatcher $esc
+            Stop-LoadProgress $progress
             Enable-Mouse
         }
 
