@@ -2088,6 +2088,60 @@ def split_chunks(text, size=900, limit=60):
     return chunks[:limit]
 
 
+QUOTE_PAIRS = {"\u201c": "\u201d", "\u2018": "\u2019"}
+
+
+def clean_str(value):
+    if not isinstance(value, str):
+        return value
+    s = value.strip()
+    for _ in range(5):
+        prev = s
+        if len(s) >= 4 and s.startswith('\\"') and s.endswith('\\"'):
+            s = s[2:-2].strip()
+        elif len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+            try:
+                dec = json.loads(s)
+            except ValueError:
+                dec = None
+            if isinstance(dec, str):
+                s = dec.strip()
+            elif '"' not in s[1:-1].replace('\\"', ''):
+                s = s[1:-1].replace('\\"', '"').strip()
+        elif len(s) >= 2 and s[0] in "'`" and s[-1] == s[0] and s[0] not in s[1:-1]:
+            s = s[1:-1].strip()
+        elif len(s) >= 2 and QUOTE_PAIRS.get(s[0]) == s[-1]:
+            s = s[1:-1].strip()
+        s = re.sub(r'^\\+(?![()\[\]{}])', '', s)
+        s = re.sub(r'\\+$', '', s).strip()
+        if s == prev:
+            break
+    return s
+
+
+def _walk(obj):
+    if isinstance(obj, dict):
+        return {clean_str(k) if isinstance(k, str) else k: _walk(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_walk(v) for v in obj]
+    if isinstance(obj, str):
+        return clean_str(obj)
+    return obj
+
+
+def sanitize_args(obj):
+    if obj is None:
+        return {}
+    if isinstance(obj, str):
+        try:
+            obj = json.loads(clean_str(obj))
+        except ValueError:
+            return {}
+    if not isinstance(obj, dict):
+        return {}
+    return _walk(obj)
+
+
 def tool_search_links(args):
     query = str(args.get("query", "")).strip()
     if not query:
@@ -2558,7 +2612,7 @@ def handle_rpc(msg):
         if fn is None:
             return rpc_error(rid, -32602, "unknown tool: %s" % params.get("name"))
         try:
-            text = fn(params.get("arguments") or {})
+            text = fn(sanitize_args(params.get("arguments")))
             err = False
         except Exception as e:
             text = "Error: %s" % e
@@ -2784,6 +2838,8 @@ def tool_list_params(args):
         PARAMS_CACHE["data"] = data
         PARAMS_CACHE["at"] = time.time()
     ids = args.get("ids")
+    if isinstance(ids, str):
+        ids = [x for x in re.split(r"[,\s\[\]\"']+", ids) if x]
     if ids:
         wanted = set(str(x).strip().lower() for x in ids if str(x).strip())
         data = [p for p in data if str(p.get("id") or "").lower() in wanted]
@@ -2791,6 +2847,99 @@ def tool_list_params(args):
     if group:
         data = [p for p in data if str(p.get("group") or "").lower() == group]
     return json.dumps({"count": len(data), "parameters": data}, ensure_ascii=False, separators=(",", ":"))
+
+
+QUOTE_PAIRS = {"\u201c": "\u201d", "\u2018": "\u2019"}
+
+
+def clean_str(value):
+    if not isinstance(value, str):
+        return value
+    s = value.strip()
+    for _ in range(5):
+        prev = s
+        if len(s) >= 4 and s.startswith('\\"') and s.endswith('\\"'):
+            s = s[2:-2].strip()
+        elif len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+            try:
+                dec = json.loads(s)
+            except ValueError:
+                dec = None
+            if isinstance(dec, str):
+                s = dec.strip()
+            elif '"' not in s[1:-1].replace('\\"', ''):
+                s = s[1:-1].replace('\\"', '"').strip()
+        elif len(s) >= 2 and s[0] in "'`" and s[-1] == s[0] and s[0] not in s[1:-1]:
+            s = s[1:-1].strip()
+        elif len(s) >= 2 and QUOTE_PAIRS.get(s[0]) == s[-1]:
+            s = s[1:-1].strip()
+        s = re.sub(r'^\\+(?![()\[\]{}])', '', s)
+        s = re.sub(r'\\+$', '', s).strip()
+        if s == prev:
+            break
+    return s
+
+
+def _walk(obj):
+    if isinstance(obj, dict):
+        return {clean_str(k) if isinstance(k, str) else k: _walk(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_walk(v) for v in obj]
+    if isinstance(obj, str):
+        return clean_str(obj)
+    return obj
+
+
+def sanitize_args(obj):
+    if obj is None:
+        return {}
+    if isinstance(obj, str):
+        try:
+            obj = json.loads(clean_str(obj))
+        except ValueError:
+            return {}
+    if not isinstance(obj, dict):
+        return {}
+    return _walk(obj)
+
+
+def fetch_model_names():
+    sid = new_session()
+    obj = swarm_call("/API/ListModels", {
+        "session_id": sid, "path": "", "depth": 20, "subtype": "Stable-Diffusion",
+        "sortBy": "Name", "allowRemote": False, "dataImages": False,
+    }, timeout=180)
+    return [str(i.get("name")).strip() for i in (obj.get("files") or []) if i.get("name")]
+
+
+def _norm_model(s):
+    s = clean_str(str(s)).replace("\\", "/").lower()
+    s = re.sub(r"\.(safetensors|ckpt|pt|pth|gguf|sft)$", "", s)
+    return re.sub(r"[\s_\-]+", "", s)
+
+
+def resolve_model(name):
+    import difflib
+    try:
+        names = fetch_model_names()
+    except Exception:
+        return name
+    if not names or name in names:
+        return name
+    target = _norm_model(name)
+    norm = {}
+    for n in names:
+        norm.setdefault(_norm_model(n), n)
+        norm.setdefault(_norm_model(n.rsplit("/", 1)[-1]), n)
+    if target in norm:
+        return norm[target]
+    subs = sorted(set(v for k, v in norm.items() if len(target) >= 4 and (target in k or k in target)))
+    if len(subs) == 1:
+        return subs[0]
+    close = difflib.get_close_matches(target, list(norm.keys()), n=2, cutoff=0.8)
+    if len(close) == 1 or (len(close) == 2 and norm[close[0]] == norm[close[1]]):
+        return norm[close[0]]
+    raise ValueError("Model not found: %s. Available checkpoints: %s. Ask the user which one to use, then call generate_image again with the exact name." % (name, "; ".join(names[:40])))
 
 
 def _number(args, key, default, low, high, integer=False, warnings=None):
@@ -2914,6 +3063,7 @@ def tool_generate_image(args):
         raise ValueError("prompt is required")
     if not model:
         raise ValueError("model is required. Call list_models and ask the user which checkpoint to use")
+    model = resolve_model(model)
     prompt, translate_err = translate_prompt(prompt)
     warnings = []
     width = _number(args, "width", DEFAULTS["width"], 64, 2048, True, warnings)
@@ -3063,7 +3213,7 @@ def handle_rpc(msg):
         if fn is None:
             return rpc_error(rid, -32602, "unknown tool: %s" % name)
         try:
-            value = fn(params.get("arguments") or {})
+            value = fn(sanitize_args(params.get("arguments")))
             content = value if isinstance(value, list) else [{"type": "text", "text": str(value)}]
             err = False
         except Exception as e:
