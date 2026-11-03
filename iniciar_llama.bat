@@ -1654,7 +1654,7 @@ import html as htmllib
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit, urljoin, urlencode, quote, parse_qs
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
 import trafilatura
 
@@ -2088,17 +2088,110 @@ def multi_search(queries, per):
     return [items[k] for k in sorted(items, key=lambda k: -scores[k])]
 
 
+QUICK_CHARS = 4000
+BATCH = 3
+CONF = 0.6
+GRACE = 2.0
+STAGE_TIMEOUT = 20.0
+REL_CUT = 0.4
+STOP = set("a o as os um uma uns umas de do da dos das em no na nos nas por para pra com sem e ou que qual quais como onde esta estao ta sao eh foi ser ter tem tinha quanto quanta quantos quantas the an of in on at to for and or is are was were be what which how much many does do did me my you your it its this that".split())
+NUM_WORDS = set("quanto quanta quantos quantas cotacao preco valor price cost rate much many when quando".split())
+
+
+def core_tokens(queries):
+    toks = [w for w in norm_tokens(" ".join(queries)) if w not in NOISE_TOKENS]
+    core = [w for w in toks if w not in STOP and (len(w) > 1 or w.isdigit())]
+    wants = any(w in NUM_WORDS for w in toks)
+    return (core or toks), wants
+
+
+def rank_candidates(results, core):
+    if len(results) < 2 or not core:
+        return results
+    sc = bm25(core, [norm_tokens((r.get("title") or "") + " " + (r.get("snippet") or "")) for r in results])
+    mx = max(sc) if sc else 0.0
+
+    def key(i):
+        rel = (sc[i] / mx) if mx > 0 else 0.0
+        return (-(0.5 / (1 + i) + 0.5 * rel), i)
+    return [results[i] for i in sorted(range(len(results)), key=key)]
+
+
+def doc_confident(d, core, wants):
+    if not core or not d["text"]:
+        return False
+    cs = set(core)
+    for c, t in zip(d["chunks"], d["ctoks"]):
+        if len(cs & set(t)) / float(len(cs)) >= CONF and (not wants or re.search(r"\d", c)):
+            return True
+    return False
+
+
+def meta_hit(d, core):
+    # page is about the query if its domain holds a query term, or its title/description cover half of them
+    if not core or not d["text"]:
+        return False
+    host = set(norm_tokens(bare_host(urlsplit(d["url"]).hostname)))
+    cs = set(core)
+    if any(len(w) >= 3 and w in host for w in cs):
+        return True
+    return len(cs & set(norm_tokens(d.get("meta", "")))) * 2 >= len(cs)
+
+
+def load_doc(r):
+    base = {"url": r["url"], "title": r.get("title") or r["url"], "text": "", "date": "", "thin": False, "links": [], "error": "", "snippet": r.get("snippet", ""), "linked": r.get("linked", False), "seed": r.get("seed", False), "chunks": [], "ctoks": [], "meta": ""}
+    try:
+        p = load_page(r["url"])
+        base.update({"url": p["url"], "title": r.get("title") or p["title"] or p["url"], "text": p["text"], "date": p["date"], "thin": p["thin"], "links": p["links"]})
+        base["meta"] = " ".join([base["title"], p.get("desc") or ""])
+        base["chunks"] = split_chunks(p["text"], 900, 200)
+        base["ctoks"] = [norm_tokens(c) for c in base["chunks"]]
+    except Exception as e:
+        base["error"] = str(e)
+    return base
+
+
+def load_batch(batch, core, wants, early):
+    pool = ThreadPoolExecutor(max_workers=max(1, len(batch)))
+    pending = set()
+    for i, r in enumerate(batch):
+        f = pool.submit(load_doc, r)
+        f.ord = i
+        pending.add(f)
+    got = []
+    start = time.time()
+    grace = None
+    while pending:
+        done, pending = wait(pending, timeout=0.25, return_when=FIRST_COMPLETED)
+        for f in done:
+            d = f.result()
+            d["ord"] = f.ord
+            got.append(d)
+            if early and grace is None and doc_confident(d, core, wants):
+                grace = time.time() + GRACE
+        now = time.time()
+        if (grace is not None and now >= grace) or now - start > STAGE_TIMEOUT:
+            break
+    try:
+        pool.shutdown(wait=False, cancel_futures=True)
+    except TypeError:
+        pool.shutdown(wait=False)
+    got.sort(key=lambda d: d["ord"])
+    return got
+
+
 def tool_web_search(args):
     query = str(args.get("query", "")).strip()
     if not query:
         raise ValueError("query is required")
     deep = str(args.get("depth", "")).lower() == "deep"
-    n = clamp(args.get("sources"), 1, 10, 10 if deep else 5)
+    n = clamp(args.get("sources"), 1, 10, 10 if deep else 6)
     budget = clamp(args.get("max_chars"), 1500, hard_budget(), default_budget())
-    extra = args.get("queries")
+    quick_cap = budget if args.get("max_chars") is not None else min(budget, QUICK_CHARS)
+    extra_q = args.get("queries")
     queries = [query]
-    if isinstance(extra, list):
-        for x in extra:
+    if isinstance(extra_q, list):
+        for x in extra_q:
             x = str(x).strip()
             if x and x not in queries and len(queries) < 4:
                 queries.append(x)
@@ -2128,7 +2221,10 @@ def tool_web_search(args):
             raise
         results = []
 
-    picked = []
+    core, wants = core_tokens(queries)
+    results = rank_candidates(results, core)
+
+    cands = []
     seen_keys = set()
     per_host = {}
 
@@ -2139,24 +2235,24 @@ def tool_web_search(args):
             return
         seen_keys.add(key)
         per_host[host] = per_host.get(host, 0) + 1
-        picked.append(r)
+        cands.append(r)
 
     for d in seeds:
         add({"url": d, "title": "", "snippet": "", "seed": True})
     for r in results:
-        if len(picked) >= n:
+        if len(cands) >= n:
             break
         add(r)
 
-    def load(r):
-        try:
-            p = load_page(r["url"])
-            return {"url": p["url"], "title": r.get("title") or p["title"] or p["url"], "text": p["text"], "date": p["date"], "thin": p["thin"], "links": p["links"], "error": "", "snippet": r.get("snippet", ""), "linked": r.get("linked", False), "seed": r.get("seed", False)}
-        except Exception as e:
-            return {"url": r["url"], "title": r.get("title") or r["url"], "text": "", "date": "", "thin": False, "links": [], "error": str(e), "snippet": r.get("snippet", ""), "linked": r.get("linked", False), "seed": r.get("seed", False)}
-
-    with ThreadPoolExecutor(max_workers=max(1, len(picked))) as pool:
-        docs = list(pool.map(load, picked))
+    docs = []
+    start = 0
+    while start < len(cands):
+        size = len(cands) if deep else BATCH
+        batch = cands[start:start + size]
+        start += len(batch)
+        docs += load_batch(batch, core, wants, not deep)
+        if deep or any(doc_confident(d, core, wants) for d in docs):
+            break
 
     more = []
     for d in docs:
@@ -2170,15 +2266,18 @@ def tool_web_search(args):
                 if len(more) >= 3:
                     break
     if more:
-        with ThreadPoolExecutor(max_workers=len(more)) as pool:
-            docs += list(pool.map(load, more))
+        docs += load_batch(more, core, wants, False)
 
     chunks = []
+    ctoks = []
+    first_idx = {}
     for di, d in enumerate(docs):
-        for pos, c in enumerate(split_chunks(d["text"], 900, 200)):
-            chunks.append((di, pos, c))
-    qt = [w for w in norm_tokens(" ".join(queries)) if w not in NOISE_TOKENS]
-    scores = bm25(qt, [norm_tokens(c[2]) for c in chunks])
+        for p, c in enumerate(d["chunks"]):
+            if p == 0:
+                first_idx[di] = len(chunks)
+            chunks.append((di, p, c))
+            ctoks.append(d["ctoks"][p])
+    scores = bm25(core, ctoks)
     by_doc = {}
     for i, c in enumerate(chunks):
         by_doc.setdefault(c[0], []).append(scores[i])
@@ -2189,37 +2288,66 @@ def tool_web_search(args):
         return 1 if docs[di]["linked"] else 2
 
     def relevance(di):
-        return sum(sorted(by_doc.get(di, [0.0]), reverse=True)[:3])
+        rel = sum(sorted(by_doc.get(di, [0.0]), reverse=True)[:3])
+        if rel <= 0 and meta_hit(docs[di], core):
+            return 0.001
+        return rel
 
-    ranked = sorted([di for di in range(len(docs)) if docs[di]["text"]], key=lambda di: (tier(di), -relevance(di), di))
-    keep = [di for di in ranked if tier(di) < 2 or relevance(di) > 0]
-    ranked = keep or ranked[:2]
-    remaining = budget
-    cap = max(3000, int(budget * 0.6))
     shown = {}
-    for di in ranked:
-        if remaining < 1200:
-            break
-        text = docs[di]["text"]
-        room = min(remaining, cap)
-        part = text
-        if len(text) > room:
-            part = text[:room]
-            cut = part.rfind("\n")
-            if cut > room * 0.6:
-                part = part[:cut]
-        shown[di] = part
-        remaining -= len(part)
-
     extra = []
     per_doc = {}
-    for i in sorted([i for i in range(len(chunks)) if chunks[i][0] not in shown and scores[i] > 0], key=lambda i: -scores[i]):
-        di = chunks[i][0]
-        if per_doc.get(di, 0) >= 2 or len(chunks[i][2]) > remaining:
-            continue
-        extra.append(i)
-        per_doc[di] = per_doc.get(di, 0) + 1
-        remaining -= len(chunks[i][2])
+    if deep:
+        ranked = sorted([di for di in range(len(docs)) if docs[di]["text"]], key=lambda di: (tier(di), -relevance(di), di))
+        keep = [di for di in ranked if tier(di) < 2 or relevance(di) > 0]
+        ranked = keep or ranked[:2]
+        remaining = budget
+        cap = max(3000, int(budget * 0.6))
+        for di in ranked:
+            if remaining < 1200:
+                break
+            text = docs[di]["text"]
+            room = min(remaining, cap)
+            part = text
+            if len(text) > room:
+                part = text[:room]
+                cut = part.rfind("\n")
+                if cut > room * 0.6:
+                    part = part[:cut]
+            shown[di] = part
+            remaining -= len(part)
+        for i in sorted([i for i in range(len(chunks)) if chunks[i][0] not in shown and scores[i] > 0], key=lambda i: -scores[i]):
+            di = chunks[i][0]
+            if per_doc.get(di, 0) >= 2 or len(chunks[i][2]) > remaining:
+                continue
+            extra.append(i)
+            per_doc[di] = per_doc.get(di, 0) + 1
+            remaining -= len(chunks[i][2])
+    else:
+        order = sorted([i for i in range(len(chunks)) if scores[i] > 0], key=lambda i: -scores[i])
+        best = scores[order[0]] if order else 0.0
+        used = 0
+        for i in order:
+            di = chunks[i][0]
+            if len(extra) >= 3 and scores[i] < best * REL_CUT:
+                break
+            if per_doc.get(di, 0) >= 3:
+                continue
+            if extra and used + len(chunks[i][2]) > quick_cap:
+                break
+            extra.append(i)
+            per_doc[di] = per_doc.get(di, 0) + 1
+            used += len(chunks[i][2])
+        nothing = not extra
+        metas = 0
+        for di, d in enumerate(docs):
+            if per_doc.get(di) or di not in first_idx:
+                continue
+            on_topic = metas < 2 and meta_hit(d, core)
+            if d["seed"] or on_topic or (nothing and len(per_doc) < 2):
+                extra.append(first_idx[di])
+                per_doc[di] = 1
+                if on_topic and not d["seed"]:
+                    metas += 1
     extra.sort(key=lambda i: (chunks[i][0], chunks[i][1]))
 
     readable = sum(1 for d in docs if d["text"])
@@ -2243,7 +2371,13 @@ def tool_web_search(args):
         elif per_doc.get(di):
             line += " - excerpts only; call fetch_url to read it fully"
         elif d["text"]:
-            line += " - not included (%s); call fetch_url to read it" % ("no match with the query" if tier(di) == 2 and relevance(di) <= 0 else "no room left")
+            if tier(di) == 2 and relevance(di) <= 0:
+                why = "no match with the query"
+            elif deep:
+                why = "no room left"
+            else:
+                why = "less relevant than the excerpts shown"
+            line += " - not included (%s); call fetch_url to read it" % why
         out.append(line)
     for di in sorted(shown):
         out.append("")
@@ -2251,7 +2385,7 @@ def tool_web_search(args):
         out.append(shown[di])
     if extra:
         out.append("")
-        out.append("=== Other relevant excerpts ===")
+        out.append("=== Relevant excerpts ===" if not deep else "=== Other relevant excerpts ===")
         for i in extra:
             out.append("")
             out.append("[%d] %s" % (chunks[i][0] + 1, chunks[i][2]))
@@ -2261,7 +2395,10 @@ def tool_web_search(args):
     out.append("")
     if thin:
         out.append("Note: %d page(s) have little text (probably JavaScript-rendered); only their title and description could be read." % thin)
-    out.append("Instructions: answer only from these sources and cite them as [n] with the URL. If they do not cover the question, say so, then call web_search again with different queries or fetch_url on a promising URL. Never tell the user to search by themselves.")
+    if deep:
+        out.append("Instructions: answer only from these sources. At the end of your answer, add a line Sources: (translated to the language of the user) followed by a bullet list with only the URLs you actually used, like: - https://example.com. Never list a source you did not use. If they do not cover the question, say so, then call web_search again with different queries or fetch_url on a promising URL. Never tell the user to search by themselves.")
+    else:
+        out.append("Instructions: answer only from these excerpts. At the end of your answer, add a line Sources: (translated to the language of the user) followed by a bullet list with only the URLs you actually used, like: - https://example.com. Never list a source you did not use. If they do not cover the question, say so, then call web_search again with depth=deep, or fetch_url on a promising URL to read the full page. Never tell the user to search by themselves.")
     return "\n".join(out)
 
 
@@ -2293,15 +2430,15 @@ TOOLS = [
     },
     {
         "name": "web_search",
-        "description": "Search the web, download the most promising pages and return their full text (sized to fit the context window), plus excerpts from the rest, all with numbered sources. Default tool for any question about current events, specific sites, people or products, or facts you are unsure about. If the query contains a domain or URL, that site (and a few of its internal pages) is read directly. For broad topics ('everything about X') pass several different angles in queries, or set depth to deep.",
+        "description": "Search the web, read the most promising pages and return the most relevant excerpts, all with numbered sources. The default (quick) is short and cheap; use depth=deep to get the full text of up to 10 pages. Default tool for any question about current events, specific sites, people or products, or facts you are unsure about. If the query contains a domain or URL, that site (and a few of its internal pages) is read directly. For broad topics ('everything about X') pass several different angles in queries, or set depth to deep.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Main thing to find out"},
                 "queries": {"type": "array", "items": {"type": "string"}, "description": "Up to 3 extra, different search angles (optional)"},
-                "depth": {"type": "string", "enum": ["quick", "deep"], "description": "quick reads up to 5 pages, deep reads up to 10 to choose the best ones (default quick)"},
-                "sources": {"type": "integer", "description": "Number of pages to read, 1 to 10"},
-                "max_chars": {"type": "integer", "description": "Maximum characters of page text to return (default is sized to the context window)"},
+                "depth": {"type": "string", "enum": ["quick", "deep"], "description": "quick (default): short answer from the best excerpts of the most promising pages, reading more only if needed; deep: full text of up to 10 pages"},
+                "sources": {"type": "integer", "description": "Maximum number of pages to read, 1 to 10"},
+                "max_chars": {"type": "integer", "description": "Maximum characters of page text to return (quick is capped at about 4000 unless you set this; deep is sized to the context window)"},
             },
             "required": ["query"],
         },
@@ -2429,7 +2566,7 @@ if __name__ == "__main__":
 function Write-UiConfig {
     param([int]$McpPort)
     $date = (Get-Date).ToString('yyyy-MM-dd (dddd)', [System.Globalization.CultureInfo]::InvariantCulture)
-    $sys = ('Current date: {0}. Your training data is older than this date, so your memory is outdated and may be wrong. If the user asks you to search something, always do it. Unless the answer is extremely obvious (greetings, simple math, code you can write directly, creative writing), call web_search before answering and never answer factual questions from memory. If the user gives a domain or URL, use web_search or fetch_url with it. For broad requests, give web_search several different angles in queries, or use depth=deep. Answer only from the results and cite them as [n] with their URLs. If the results do not answer the question, do not give up yet: try depth=deep, and use fetch_url on a page the results mention but did not include in full. After two or three failed tries, say plainly what you found and what you could not find. Never tell the user to search by themselves. Reply in the user language.' -f $date)
+    $sys = ('Current date: {0}. Your training data is older than this date, so your memory is outdated and may be wrong. If the user asks you to search something, always do it. Unless the answer is extremely obvious (greetings, simple math, code you can write directly, creative writing), call web_search before answering and never answer factual questions from memory. If the user gives a domain or URL, use web_search or fetch_url with it. For broad requests, give web_search several different angles in queries, or use depth=deep. Answer only from the results. At the end of your answer, add a line Sources: (translated to the language of the user) followed by a bullet list with only the URLs you actually used, like: - https://example.com. Never list a source you did not use. If the results do not answer the question, do not give up yet: try depth=deep, and use fetch_url on a page the results mention but did not include in full. After two or three failed tries, say plainly what you found and what you could not find. Never tell the user to search by themselves. Reply in the user language.' -f $date)
     $server = [ordered]@{ enabled = $true; id = 'c0a8e5d2-3f1b-4c7a-9b6e-2d4f8a1e7c30'; url = ('http://127.0.0.1:{0}/mcp' -f $McpPort); useProxy = $true }
     $servers = ConvertTo-Json -InputObject @($server) -Compress
     $obj = [ordered]@{ mcpServers = $servers; systemMessage = $sys }
