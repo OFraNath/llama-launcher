@@ -16,3 +16,6 @@ PLANO.md
 *.exe
 *.dll
 LICENSE-LLVM-OpenMP
+
+# SwarmUI
+launch-windows.bat
