@@ -1011,6 +1011,8 @@ function Get-RecommendedCfg {
         Browser    = [string]$script:Global.Browser
         Agent      = [string]$script:Global.Agent
         Research   = [string]$script:Global.Research
+        Image      = [string]$script:Global.Image
+        ImagePath  = [string]$script:Global.ImagePath
     }
 }
 
@@ -1116,6 +1118,12 @@ function Normalize-Cfg {
     if (@('llamacpp', 'openwebui', 'none') -notcontains [string]$Cfg.Browser) { $Cfg.Browser = 'llamacpp' }
     if (@('off', 'on') -notcontains [string]$Cfg.Agent) { $Cfg.Agent = 'off' }
     if (@('off', 'on') -notcontains [string]$Cfg.Research) { $Cfg.Research = 'off' }
+    $Cfg.ImagePath = ConvertTo-ImagePath ([string]$Cfg.ImagePath)
+    if (@('off', 'on') -notcontains [string]$Cfg.Image) { $Cfg.Image = 'off' }
+    if ([string]::IsNullOrWhiteSpace([string]$Cfg.ImagePath)) {
+        $Cfg.ImagePath = ''
+        $Cfg.Image = 'off'
+    }
     if ([int]$Cfg.NPredict -lt -1) { $Cfg.NPredict = -1 }
     if ([int]$Cfg.NPredict -gt 32768) { $Cfg.NPredict = 32768 }
 }
@@ -1123,13 +1131,14 @@ function Normalize-Cfg {
 # ---------------------------------------------------------------------------
 # Persistent state
 # ---------------------------------------------------------------------------
-$script:Global = [pscustomobject]@{ port = 5001; host = '127.0.0.1'; browser = 'llamacpp'; agent = 'off'; research = 'off' }
+$script:Global = [pscustomobject]@{ port = 5001; host = '127.0.0.1'; browser = 'llamacpp'; agent = 'off'; research = 'off'; image = 'off'; imagePath = '' }
 $script:StateModels = @{}
 $script:LastModelPath = ''
 $script:LastCfg = $null
 $script:SessionCfg = @{}
 $script:Models = @()
 $script:Research = $null
+$script:Image = $null
 
 function Get-PropValue {
     param($Obj, [string]$Name, $Default = $null)
@@ -1154,6 +1163,10 @@ function Initialize-State {
             if (@('off', 'on') -contains $agent) { $script:Global.Agent = $agent }
             $research = [string](Get-PropValue $g 'research' 'off')
             if (@('off', 'on') -contains $research) { $script:Global.Research = $research }
+            $image = [string](Get-PropValue $g 'image' 'off')
+            if (@('off', 'on') -contains $image) { $script:Global.Image = $image }
+            $imagePath = [string](Get-PropValue $g 'imagePath' '')
+            if (-not [string]::IsNullOrWhiteSpace($imagePath)) { $script:Global.ImagePath = $imagePath }
         }
         $models = Get-PropValue $raw 'models' $null
         if ($models) {
@@ -1206,6 +1219,8 @@ function New-CfgForModel {
     $cfg.Browser = [string]$script:Global.Browser
     $cfg.Agent = [string]$script:Global.Agent
     $cfg.Research = [string]$script:Global.Research
+    $cfg.Image = [string]$script:Global.Image
+    $cfg.ImagePath = [string]$script:Global.ImagePath
     Normalize-Cfg $cfg
     if ($UseSession) { $script:SessionCfg[$Model.Path] = $cfg }
     return $cfg
@@ -1245,25 +1260,32 @@ function Write-State {
     } catch { }
 }
 
+function Sync-GlobalFromCfg {
+    param($Cfg)
+    $script:Global = [pscustomobject]@{
+        port      = [int]$Cfg.Port
+        host      = [string]$Cfg.Host
+        browser   = [string]$Cfg.Browser
+        agent     = [string]$Cfg.Agent
+        research  = [string]$Cfg.Research
+        image     = [string]$Cfg.Image
+        imagePath = [string]$Cfg.ImagePath
+    }
+}
+
 function Save-Cfg {
     param($Cfg)
     Set-StateModel $Cfg
     $script:LastModelPath = $Cfg.Model.Path
-    $script:Global = [pscustomobject]@{
-        port    = [int]$Cfg.Port
-        host    = [string]$Cfg.Host
-        browser = [string]$Cfg.Browser
-        agent   = [string]$Cfg.Agent
-        research = [string]$Cfg.Research
-    }
+    Sync-GlobalFromCfg $Cfg
     $script:LastCfg = $Cfg
     Write-State
 }
 
 function Save-ModelCfg {
     param($Cfg, [string]$Snap)
-    if ((Get-CfgSnap $Cfg) -eq $Snap) { return }
-    Set-StateModel $Cfg
+    if ((Get-CfgSnap $Cfg) -ne $Snap) { Set-StateModel $Cfg }
+    Sync-GlobalFromCfg $Cfg
     Write-State
 }
 
@@ -1447,6 +1469,25 @@ function Get-ResearchLabel {
     param([string]$Research)
     if ($Research -eq 'on') { return 'ligada (buscar e ler páginas da web)' }
     return 'desligada'
+}
+
+function ConvertTo-ImagePath {
+    param([string]$Path)
+    $p = ([string]$Path).Trim()
+    if ($p.Length -ge 2) {
+        if (($p.StartsWith('"') -and $p.EndsWith('"')) -or ($p.StartsWith("'") -and $p.EndsWith("'"))) {
+            $p = $p.Substring(1, $p.Length - 2).Trim()
+        }
+    }
+    return ($p -replace '/', '\')
+}
+
+function Get-ImageLabel {
+    param($Cfg)
+    $path = [string]$Cfg.ImagePath
+    if ([string]::IsNullOrWhiteSpace($path)) { return 'desligada · digite o caminho do launch-windows.bat' }
+    if ([string]$Cfg.Image -eq 'on') { return ('ligada · ' + $path) }
+    return ('desligada · ' + $path)
 }
 
 function Get-HostLabel {
@@ -1635,6 +1676,25 @@ function Test-ResearchWanted {
     if ([string]$Cfg.Research -ne 'on') { return $false }
     if ([string]$Cfg.Agent -eq 'on' -and (Test-AgentSupported)) { return $false }
     return (Test-ResearchSupported)
+}
+
+function Test-ImageSupported {
+    return (Test-ResearchSupported)
+}
+
+function Get-ImageIssue {
+    param($Cfg)
+    if ([string]::IsNullOrWhiteSpace([string]$Cfg.ImagePath)) { return 'sem caminho definido' }
+    if (-not (Test-Path -LiteralPath ([string]$Cfg.ImagePath) -PathType Leaf)) { return ('arquivo não encontrado: ' + [string]$Cfg.ImagePath) }
+    if (-not (Test-ImageSupported)) { return 'llama-server.exe antigo, sem --ui-mcp-proxy' }
+    if (-not (Get-UvPath)) { return 'uv não encontrado no PATH' }
+    return ''
+}
+
+function Test-ImageWanted {
+    param($Cfg)
+    if ([string]$Cfg.Image -ne 'on') { return $false }
+    return ((Get-ImageIssue $Cfg) -eq '')
 }
 
 function Get-ResearchServerSource {
@@ -2585,13 +2645,542 @@ if __name__ == "__main__":
 '@
 }
 
+function Get-ImageServerSource {
+    return @'
+import sys
+import os
+import re
+import json
+import time
+import base64
+import socket
+import threading
+import subprocess
+import urllib.request
+import urllib.error
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 6000
+PARENT_PID = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+SWARM = (sys.argv[3] if len(sys.argv) > 3 else "http://127.0.0.1:7801").rstrip("/")
+SWARM_PID = int(sys.argv[4]) if len(sys.argv) > 4 else 0
+LLAMA_PORT = int(sys.argv[5]) if len(sys.argv) > 5 else 0
+
+DEFAULTS = {
+    "steps": 18,
+    "cfgscale": 3.5,
+    "width": 800,
+    "height": 800,
+    "sampler": "euler_ancestral",
+    "scheduler": "normal",
+}
+PARAMS_CACHE = {"data": None, "at": 0.0}
+PARAMS_TTL = 600
+
+
+def swarm_call(path, payload, timeout=900):
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(SWARM + path, data=data, headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        msg = ""
+        try:
+            obj = json.loads(raw.decode("utf-8", "replace"))
+            if isinstance(obj, dict):
+                msg = obj.get("error") or obj.get("error_id") or ""
+        except Exception:
+            msg = ""
+        raise RuntimeError("SwarmUI error: %s" % (msg or ("HTTP %s" % e.code)))
+    except (urllib.error.URLError, TimeoutError, socket.timeout) as e:
+        raise RuntimeError("SwarmUI is not reachable at %s: %s" % (SWARM, getattr(e, "reason", e)))
+    try:
+        obj = json.loads(raw.decode("utf-8"))
+    except Exception:
+        raise RuntimeError("SwarmUI returned invalid JSON")
+    if isinstance(obj, dict) and obj.get("error"):
+        raise RuntimeError("SwarmUI error: %s" % obj["error"])
+    return obj
+
+
+def new_session():
+    obj = swarm_call("/API/GetNewSession", {}, timeout=120)
+    sid = obj.get("session_id")
+    if not sid:
+        raise RuntimeError("SwarmUI did not create a session (is authorization required?)")
+    return sid
+
+
+def tool_list_models(args):
+    sid = new_session()
+    obj = swarm_call("/API/ListModels", {
+        "session_id": sid,
+        "path": "",
+        "depth": 20,
+        "subtype": "Stable-Diffusion",
+        "sortBy": "Name",
+        "allowRemote": False,
+        "dataImages": False,
+    }, timeout=180)
+    files = obj.get("files") or []
+    lines = ["Stable-Diffusion checkpoints available in SwarmUI. Show these names to the user and ask which one to use. Do not call generate_image until the user answers:"]
+    count = 0
+    for item in files:
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        count += 1
+        bits = []
+        title = str(item.get("title") or "").strip()
+        if title and title != name:
+            bits.append(title)
+        arch = str(item.get("architecture") or "").strip()
+        if arch:
+            bits.append("arch=" + arch)
+        res = str(item.get("resolution") or "").strip()
+        if res:
+            bits.append(res)
+        if item.get("loaded"):
+            bits.append("loaded")
+        suffix = ("  (" + ", ".join(bits) + ")") if bits else ""
+        lines.append("- " + name + suffix)
+    if count == 0:
+        return "No Stable-Diffusion checkpoints were found in SwarmUI. Add one in the SwarmUI Models tab first."
+    return "\n".join(lines)
+
+
+def tool_list_params(args):
+    data = PARAMS_CACHE["data"]
+    if data is None or (time.time() - PARAMS_CACHE["at"]) > PARAMS_TTL:
+        sid = new_session()
+        obj = swarm_call("/API/ListT2IParams", {"session_id": sid}, timeout=180)
+        groups = {}
+        for g in obj.get("groups") or []:
+            gid = g.get("id")
+            if gid:
+                groups[gid] = g.get("name") or gid
+        params = []
+        for p in obj.get("list") or []:
+            gid = p.get("group")
+            params.append({
+                "id": p.get("id"),
+                "name": p.get("name"),
+                "group": groups.get(gid, gid),
+                "type": p.get("type"),
+                "description": p.get("description"),
+                "default": p.get("default"),
+                "min": p.get("min"),
+                "max": p.get("max"),
+                "step": p.get("step"),
+                "values": p.get("values"),
+                "value_names": p.get("value_names"),
+                "visible": p.get("visible"),
+                "advanced": p.get("advanced"),
+            })
+        data = params
+        PARAMS_CACHE["data"] = data
+        PARAMS_CACHE["at"] = time.time()
+    ids = args.get("ids")
+    if ids:
+        wanted = set(str(x).strip().lower() for x in ids if str(x).strip())
+        data = [p for p in data if str(p.get("id") or "").lower() in wanted]
+    group = str(args.get("group") or "").strip().lower()
+    if group:
+        data = [p for p in data if str(p.get("group") or "").lower() == group]
+    return json.dumps({"count": len(data), "parameters": data}, ensure_ascii=False, separators=(",", ":"))
+
+
+def _number(args, key, default, low, high, integer=False, warnings=None):
+    if key not in args or args[key] is None or args[key] == "":
+        return default
+    try:
+        val = float(args[key])
+    except (TypeError, ValueError):
+        raise ValueError("%s must be a number" % key)
+    if integer:
+        val = int(round(val))
+    if val < low:
+        val = low
+        if warnings is not None:
+            warnings.append("%s adjusted to the minimum %s" % (key, low))
+    if val > high:
+        val = high
+        if warnings is not None:
+            warnings.append("%s adjusted to the maximum %s" % (key, high))
+    return int(val) if integer else float(val)
+
+
+def sniff_type(data):
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8"):
+        return "image/jpeg"
+    if data.startswith(b"GIF8"):
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/png"
+
+
+def load_image(url):
+    s = str(url)
+    if s.startswith("data:"):
+        head, _, payload = s.partition(",")
+        if ";base64" in head.lower():
+            data = base64.b64decode(payload)
+        else:
+            data = urllib.parse.unquote_to_bytes(payload)
+        mime = head[5:].split(";")[0].strip() or sniff_type(data)
+        return data, mime
+    full = s if s.lower().startswith(("http://", "https://")) else SWARM + "/" + s.lstrip("/")
+    req = urllib.request.Request(full, headers={"User-Agent": "llama-image"})
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            data = resp.read()
+            ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
+    except Exception as e:
+        raise RuntimeError("could not download the generated image: %s" % e)
+    if not ctype.lower().startswith("image/"):
+        ctype = sniff_type(data)
+    return data, ctype
+
+
+TRANSLATE_SYSTEM = (
+    "You are a literal translator. Translate the user's text into English. "
+    "Keep exactly the same meaning and level of detail: do not add, remove, interpret or embellish anything. "
+    "Write short descriptive English phrases separated by commas. "
+    "If the text is already in English, return it unchanged. "
+    "Output only the translation, with no quotes, notes or explanations."
+)
+
+
+def llama_loaded_model():
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:%d/v1/models" % LLAMA_PORT, timeout=5) as resp:
+            obj = json.loads(resp.read().decode("utf-8"))
+        for item in obj.get("data") or []:
+            st = item.get("status")
+            val = st.get("value") if isinstance(st, dict) else st
+            if str(val).lower() == "loaded" and item.get("id"):
+                return str(item["id"])
+    except Exception:
+        pass
+    return ""
+
+
+def translate_prompt(text):
+    if LLAMA_PORT <= 0:
+        return text, "llama-server port not provided"
+    body = {
+        "messages": [
+            {"role": "user", "content": TRANSLATE_SYSTEM + "\n\nText to translate:\n" + text},
+        ],
+        "temperature": 0,
+        "max_tokens": 300,
+        "stream": False,
+    }
+    loaded = llama_loaded_model()
+    if loaded:
+        body["model"] = loaded
+    try:
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request("http://127.0.0.1:%d/v1/chat/completions" % LLAMA_PORT, data=data,
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            obj = json.loads(resp.read().decode("utf-8"))
+        out = str(obj["choices"][0]["message"]["content"] or "")
+        out = re.sub(r"<think>.*?</think>", "", out, flags=re.S)
+        out = " ".join(out.split()).strip("\"'`").strip()
+        if out:
+            return out, ""
+        return text, "empty reply from llama-server"
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode("utf-8", "replace")
+        except Exception:
+            detail = ""
+        return text, (("HTTP %s " % e.code) + " ".join(detail.split()))[:200]
+    except Exception as e:
+        return text, str(e)[:120]
+
+
+def tool_generate_image(args):
+    prompt = str(args.get("prompt") or "").strip()
+    model = str(args.get("model") or "").strip()
+    if not prompt:
+        raise ValueError("prompt is required")
+    if not model:
+        raise ValueError("model is required. Call list_models and ask the user which checkpoint to use")
+    prompt, translate_err = translate_prompt(prompt)
+    warnings = []
+    width = _number(args, "width", DEFAULTS["width"], 64, 2048, True, warnings)
+    height = _number(args, "height", DEFAULTS["height"], 64, 2048, True, warnings)
+    width = max(64, min(2048, int(round(width / 8.0)) * 8))
+    height = max(64, min(2048, int(round(height / 8.0)) * 8))
+    req = dict(DEFAULTS)
+    req.update({
+        "prompt": prompt,
+        "model": model,
+        "images": 1,
+        "steps": _number(args, "steps", DEFAULTS["steps"], 1, 150, True, warnings),
+        "cfgscale": _number(args, "cfgscale", DEFAULTS["cfgscale"], 0, 30, False, warnings),
+        "width": width,
+        "height": height,
+        "sampler": str(args.get("sampler") or DEFAULTS["sampler"]).strip(),
+        "scheduler": str(args.get("scheduler") or DEFAULTS["scheduler"]).strip(),
+        "donotsave": True,
+        "donotsaveintermediates": True,
+    })
+    negative = args.get("negativeprompt")
+    if negative is None:
+        negative = args.get("negative_prompt")
+    if negative is not None and str(negative).strip():
+        req["negativeprompt"] = str(negative).strip()
+    seed = args.get("seed")
+    if seed is not None and str(seed).strip() != "":
+        try:
+            seedv = int(float(seed))
+        except (TypeError, ValueError):
+            raise ValueError("seed must be an integer")
+        req["seed"] = max(-1, seedv)
+    refine = args.get("refine")
+    if isinstance(refine, str):
+        refine = refine.strip().lower() in ("1", "true", "yes", "on")
+    else:
+        refine = bool(refine)
+    if refine:
+        req["refinercontrolpercentage"] = _number(args, "refinercontrolpercentage", 0.2, 0, 1, False, warnings)
+        req["refinermethod"] = "PostApply"
+        if args.get("refinerupscale") is not None and args.get("refinerupscale") != "":
+            req["refinerupscale"] = _number(args, "refinerupscale", 1.0, 0.25, 8, False, warnings)
+        method = str(args.get("refinerupscalemethod") or "").strip()
+        if method:
+            req["refinerupscalemethod"] = method
+        tiling = args.get("refinerdotiling")
+        if tiling is not None:
+            if isinstance(tiling, str):
+                req["refinerdotiling"] = tiling.strip().lower() in ("1", "true", "yes", "on")
+            else:
+                req["refinerdotiling"] = bool(tiling)
+    sid = new_session()
+    req["session_id"] = sid
+    obj = swarm_call("/API/GenerateText2Image", req, timeout=900)
+    urls = obj.get("images") or []
+    if not urls:
+        raise RuntimeError("SwarmUI returned no image")
+    info = "Generated image with model %s (%sx%s, steps=%s, CFG=%s, sampler=%s, scheduler=%s)." % (
+        model, width, height, req["steps"], req["cfgscale"], req["sampler"], req["scheduler"])
+    if warnings:
+        info += " Adjustments: " + "; ".join(warnings) + "."
+    info += " Prompt sent to the image model: %s." % prompt
+    if translate_err:
+        info += " Translation failed (%s), so the original prompt was used." % translate_err
+    info += " The image is ALREADY displayed to the user inside this tool result. Do not write attachment names, file names, paths, URLs, markdown image syntax or the words Attachment saved, and do not say where the image is. Reply with one short sentence, in the user language, saying which model was used."
+    contents = [{"type": "text", "text": info}]
+    for url in urls:
+        raw, mime = load_image(url)
+        contents.append({"type": "image", "data": base64.b64encode(raw).decode("ascii"), "mimeType": mime})
+    return contents
+
+
+TOOLS = [
+    {
+        "name": "list_models",
+        "description": "List the Stable-Diffusion checkpoint models available in SwarmUI. Call this before generating whenever the user has not already chosen a model, then ask the user which one to use and show the full names.",
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "list_params",
+        "description": "Return SwarmUI's full list of text-to-image parameters (name, id, description, type, range, allowed values and default). Use it to explain parameters to the user and to validate requested values. By default returns every parameter; use ids or group to narrow the result.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "ids": {"type": "array", "items": {"type": "string"}, "description": "Optional parameter ids to return, for example [\"steps\", \"cfgscale\", \"width\"]."},
+                "group": {"type": "string", "description": "Optional group name filter, for example \"Refine / Upscale\"."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "generate_image",
+        "description": "Generate one image with SwarmUI from a text prompt. The prompt must be in english. Call this tool directly; never announce it in text first. The model is required. Defaults: steps 18, CFG 3.5, 800x800, sampler euler_ancestral, scheduler normal, refine off. Only change a default when the user explicitly asks.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string", "description": "Positive prompt in English: what the user described, without inventing elements, style, quality tags or negative prompt."},
+                "model": {"type": "string", "description": "Full checkpoint name exactly as the user chose it. Never choose it yourself."},
+                "negative_prompt": {"type": "string", "description": "Negative prompt. Omit unless the user asks for one."},
+                "steps": {"type": "integer", "description": "Sampling steps (default 18, 1 to 150)."},
+                "cfgscale": {"type": "number", "description": "CFG scale (default 3.5, 0 to 30)."},
+                "width": {"type": "integer", "description": "Image width in pixels (default 800, 64 to 2048, multiple of 8)."},
+                "height": {"type": "integer", "description": "Image height in pixels (default 800, 64 to 2048, multiple of 8)."},
+                "sampler": {"type": "string", "description": "Sampler id (default euler_ancestral). Use values from list_params."},
+                "scheduler": {"type": "string", "description": "Scheduler id (default normal). Use values from list_params."},
+                "seed": {"type": "integer", "description": "Seed; -1 for random (default)."},
+                "refine": {"type": "boolean", "description": "Enable the refiner stage (required for the refiner* controls). Off by default; only enable when the user asks."},
+                "refinercontrolpercentage": {"type": "number", "description": "Refiner control percentage (default 0.2, 0 to 1)."},
+                "refinerupscale": {"type": "number", "description": "Refiner upscale factor (0.25 to 8; 1 means no upscale). Omit unless asked."},
+                "refinerupscalemethod": {"type": "string", "description": "Refiner upscale method id (default pixel-lanczos). Omit unless asked; values come from list_params."},
+                "refinerdotiling": {"type": "boolean", "description": "Whether the refiner should use tiling. Omit unless asked."},
+            },
+            "required": ["prompt", "model"],
+        },
+    },
+]
+
+HANDLERS = {"list_models": tool_list_models, "list_params": tool_list_params, "generate_image": tool_generate_image}
+
+
+def rpc_error(rid, code, message):
+    return {"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": message}}
+
+
+def handle_rpc(msg):
+    if not isinstance(msg, dict):
+        return rpc_error(None, -32600, "invalid request")
+    if "id" not in msg:
+        return None
+    rid = msg["id"]
+    method = msg.get("method")
+    params = msg.get("params") or {}
+    if method == "initialize":
+        ver = params.get("protocolVersion") or "2025-03-26"
+        return {"jsonrpc": "2.0", "id": rid, "result": {
+            "protocolVersion": ver,
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": "llama-image", "version": "1.0"},
+        }}
+    if method == "ping":
+        return {"jsonrpc": "2.0", "id": rid, "result": {}}
+    if method == "tools/list":
+        return {"jsonrpc": "2.0", "id": rid, "result": {"tools": TOOLS}}
+    if method == "tools/call":
+        name = params.get("name")
+        fn = HANDLERS.get(name)
+        if fn is None:
+            return rpc_error(rid, -32602, "unknown tool: %s" % name)
+        try:
+            value = fn(params.get("arguments") or {})
+            content = value if isinstance(value, list) else [{"type": "text", "text": str(value)}]
+            err = False
+        except Exception as e:
+            sys.stderr.write("tool %s error: %s\n" % (name, e))
+            sys.stderr.flush()
+            content = [{"type": "text", "text": "Error: %s" % e}]
+            err = True
+        return {"jsonrpc": "2.0", "id": rid, "result": {"content": content, "isError": err}}
+    return rpc_error(rid, -32601, "method not found: %s" % method)
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):
+        pass
+
+    def host_ok(self):
+        host = (self.headers.get("Host") or "").lower()
+        name = host.rsplit(":", 1)[0] if not host.startswith("[") else host.split("]")[0] + "]"
+        return name in ("127.0.0.1", "localhost", "[::1]")
+
+    def send_body(self, status, body=b"", ctype="application/json"):
+        self.send_response(status)
+        if body:
+            self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def do_GET(self):
+        if not self.host_ok():
+            return self.send_body(403)
+        if self.path == "/health":
+            return self.send_body(200, b"ok", "text/plain")
+        self.send_response(405)
+        self.send_header("Allow", "POST")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_DELETE(self):
+        self.send_body(200 if self.host_ok() else 403)
+
+    def do_POST(self):
+        if not self.host_ok():
+            return self.send_body(403)
+        if self.path.split("?")[0] != "/mcp":
+            return self.send_body(404)
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        except Exception:
+            return self.send_body(400, json.dumps(rpc_error(None, -32700, "parse error")).encode("utf-8"))
+        if isinstance(payload, list):
+            replies = [r for r in (handle_rpc(m) for m in payload) if r is not None]
+            reply = replies or None
+        else:
+            reply = handle_rpc(payload)
+        if reply is None:
+            return self.send_body(202)
+        self.send_body(200, json.dumps(reply, ensure_ascii=False).encode("utf-8"))
+
+
+def watch_parent(pid):
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        handle = k32.OpenProcess(0x00100000, False, pid)
+        if handle:
+            k32.WaitForSingleObject(handle, 0xFFFFFFFF)
+            if SWARM_PID:
+                try:
+                    subprocess.run(["taskkill", "/PID", str(SWARM_PID), "/T", "/F"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+                except Exception:
+                    pass
+            os._exit(0)
+    except Exception:
+        pass
+
+
+def main():
+    if PARENT_PID:
+        threading.Thread(target=watch_parent, args=(PARENT_PID,), daemon=True).start()
+    srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    srv.daemon_threads = True
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
+'@
+}
 function Write-UiConfig {
-    param([int]$McpPort)
+    param([int]$ResearchPort = 0, [int]$ImagePort = 0)
     $date = (Get-Date).ToString('yyyy-MM-dd (dddd)', [System.Globalization.CultureInfo]::InvariantCulture)
-    $sys = ('Current date: {0}. Your training data is older than this date, so your memory is outdated and may be wrong. If the user asks you to search something, always do it. Unless the answer is extremely obvious (greetings, simple math, code you can write directly, creative writing), call web_search before answering and never answer factual questions from memory. If the user gives a domain or URL, use web_search or fetch_url with it. For broad requests, give web_search several different angles in queries, or use depth=deep. Answer only from the results. At the end of your answer, add a line Sources: (translated to the language of the user) followed by a bullet list with only the URLs you actually used, like: - https://example.com. Never list a source you did not use. If the results do not answer the question, do not give up yet: try depth=deep, and use fetch_url on a page the results mention but did not include in full. After two or three failed tries, say plainly what you found and what you could not find. Never tell the user to search by themselves. Reply in the user language.' -f $date)
-    $server = [ordered]@{ enabled = $true; id = 'c0a8e5d2-3f1b-4c7a-9b6e-2d4f8a1e7c30'; url = ('http://127.0.0.1:{0}/mcp' -f $McpPort); useProxy = $true }
-    $servers = ConvertTo-Json -InputObject @($server) -Compress
-    $obj = [ordered]@{ mcpServers = $servers; systemMessage = $sys }
+    $servers = @()
+    if ($ResearchPort -gt 0) {
+        $servers += [ordered]@{ enabled = $true; id = 'c0a8e5d2-3f1b-4c7a-9b6e-2d4f8a1e7c30'; url = ('http://127.0.0.1:{0}/mcp' -f $ResearchPort); useProxy = $true }
+    }
+    if ($ImagePort -gt 0) {
+        $servers += [ordered]@{ enabled = $true; id = '6f2d7a91-4c3e-4b85-8a10-9e5c2d7b4f61'; url = ('http://127.0.0.1:{0}/mcp' -f $ImagePort); useProxy = $true }
+    }
+    if ($servers.Count -eq 0) { return '' }
+
+    $parts = @()
+    if ($ResearchPort -gt 0) {
+        $parts += ('Current date: {0}. Your training data is older than this date, so your memory is outdated and may be wrong. If the user asks you to search something, always do it. Unless the answer is extremely obvious (greetings, simple math, code you can write directly, creative writing), call web_search before answering and never answer factual questions from memory. If the user gives a domain or URL, use web_search or fetch_url with it. For broad requests, give web_search several different angles in queries, or use depth=deep. Answer only from the results. At the end of your answer, add a line Sources: (translated to the language of the user) followed by a bullet list with only the URLs you actually used, like: - https://example.com. Never list a source you did not use. If the results do not answer the question, do not give up yet: try depth=deep, and use fetch_url on a page the results mention but did not include in full. After two or three failed tries, say plainly what you found and what you could not find. Never tell the user to search by themselves. Reply in the user language.' -f $date)
+    } else {
+        $parts += ('Current date: {0}. Your training data is older than this date, so your memory is outdated and may be wrong.' -f $date)
+    }
+    if ($ImagePort -gt 0) {
+        $parts += ('Image generation (MCP tools list_models, list_params and generate_image). Call generate_image only when the user clearly wants to obtain an image, never for a casual mention, and when you call it never announce it first: call it right away with no text before it. The model is required and only the user chooses it, so never pick one yourself: if the user has not chosen a model in this conversation (or asked you not to ask again), call list_models, show the full names, ask which one to use and end that turn without calling generate_image; when the user answers, your very next action is the generate_image call with the chosen full model name and the original request. Defaults are steps 18, CFG 3.5, 800x800, sampler euler_ancestral, scheduler normal and refine off; change only what the user explicitly asks for, and enable refine only when the user asks to refine or upscale, since the refiner controls only work with it. If the user asks what can be adjusted, call list_params and present only the relevant parameters (steps, CFG, resolution, sampler, scheduler, refine and its controls) with a short explanation and the current default, without dumping the whole list unless the user asks for it. If the user asks for a value outside the valid range, adjust it to the nearest valid limit and tell the user. Never offer to change donotsave, donotsaveintermediates, refinermethod or the refiner model, because the server fixes them (if asked, explain them briefly). Reply in the user language.')
+    }
+
+    $serversJson = ConvertTo-Json -InputObject @($servers) -Compress
+    $obj = [ordered]@{ mcpServers = $serversJson; systemMessage = ($parts -join "`n`n") }
     $json = ConvertTo-Json -InputObject $obj -Compress
     $path = Join-Path $env:TEMP ('llama_webui_{0}.json' -f ([guid]::NewGuid().ToString('N')))
     $enc = New-Object System.Text.UTF8Encoding($false)
@@ -2664,11 +3253,6 @@ function Start-ResearchServer {
         if (-not $result.Ok -and -not $result.Error) {
             $result.Error = ('tempo esgotado (120s); último log: {0} | arquivo: {1}' -f (Get-LogTail $errPath 2), $errPath)
         }
-        if ($result.Ok) {
-            $cfgPath = Write-UiConfig $port
-            $files.Add($cfgPath)
-            $result.UiConfig = $cfgPath
-        }
     } catch {
         $result.Error = $_.Exception.Message
     }
@@ -2693,6 +3277,171 @@ function Stop-ResearchServer {
     $Research.Files = @()
     if ($Research.Ok -and $Research.ErrLog) {
         try { Remove-Item -LiteralPath $Research.ErrLog -Force -ErrorAction SilentlyContinue } catch { }
+    }
+}
+
+function Stop-ProcessTree {
+    param($Proc)
+    if (-not $Proc) { return }
+    try {
+        if (-not $Proc.HasExited) {
+            Start-Process -FilePath 'taskkill.exe' -ArgumentList @('/PID', [string]$Proc.Id, '/T', '/F') -WindowStyle Hidden -Wait | Out-Null
+        }
+    } catch { }
+}
+
+function Start-SwarmUI {
+    param([string]$BatPath, [string]$LogPath)
+    $port = Get-NextFreePort 7801
+    $result = [pscustomobject]@{ Ok = $false; Error = ''; Port = $port; Url = ('http://127.0.0.1:{0}' -f $port); Proc = $null; Files = @(); ErrLog = '' }
+    if (-not (Test-Path -LiteralPath $BatPath -PathType Leaf)) {
+        $result.Error = ('arquivo não encontrado: ' + $BatPath)
+        return $result
+    }
+    $files = New-Object System.Collections.Generic.List[string]
+    $outPath = Join-Path $env:TEMP ('llama_swarm_{0}.out' -f ([guid]::NewGuid().ToString('N')))
+    $files.Add($outPath)
+    if ($LogPath) {
+        $errPath = ($LogPath -replace '\.log$', '') + '_swarmui.log'
+    } else {
+        $errPath = Join-Path $env:TEMP ('llama_swarm_{0}.err' -f ([guid]::NewGuid().ToString('N')))
+        $files.Add($errPath)
+    }
+    $result.Files = $files
+    $result.ErrLog = $errPath
+    try {
+        $wd = Split-Path -Parent $BatPath
+        $cmdArgs = ('"' + $BatPath + '" --launch_mode none --host 127.0.0.1 --port ' + [string]$port)
+        $proc = Start-Process -FilePath 'cmd.exe' -ArgumentList @('/c', $cmdArgs) -WorkingDirectory $wd -WindowStyle Hidden -PassThru -RedirectStandardOutput $outPath -RedirectStandardError $errPath
+        $result.Proc = $proc
+        $started = Get-Date
+        $deadline = $started.AddSeconds(600)
+        $shown = $false
+        while ((Get-Date) -lt $deadline) {
+            if ($proc.HasExited) {
+                $tail = Get-LogTail $errPath 3
+                if (-not $tail) { $tail = Get-LogTail $outPath 3 }
+                $result.Error = ('o SwarmUI encerrou (código {0}): {1}' -f $proc.ExitCode, $tail)
+                break
+            }
+            try {
+                $resp = Invoke-RestMethod -Uri ($result.Url + '/API/GetNewSession') -Method Post -ContentType 'application/json' -Body '{}' -TimeoutSec 3
+                if ($resp.session_id) { $result.Ok = $true; break }
+            } catch { }
+            $elapsed = [int]((Get-Date) - $started).TotalSeconds
+            $room = (Get-UIWidth) - 30
+            $tail = Get-LogTail $errPath 1
+            if (-not $tail) { $tail = Get-LogTail $outPath 1 }
+            if ($tail.Length -gt $room) { $tail = $tail.Substring(0, [Math]::Max(0, $room)) }
+            $line = ('  Aguardando o SwarmUI... {0}s  {1}' -f $elapsed, $tail)
+            Write-Host ("`r" + $line.PadRight((Get-UIWidth))) -NoNewline -ForegroundColor DarkGray
+            $shown = $true
+            Start-Sleep -Milliseconds 500
+        }
+        if ($shown) { Write-Host '' }
+        if (-not $result.Ok -and -not $result.Error) {
+            $result.Error = ('tempo esgotado (600s); último log: {0} | arquivo: {1}' -f (Get-LogTail $errPath 2), $errPath)
+        }
+    } catch {
+        $result.Error = $_.Exception.Message
+    }
+    return $result
+}
+
+function Start-ImageServer {
+    param([string]$LogPath, [string]$BatPath, [int]$LlamaPort = 0)
+    $port = Get-NextFreePort 6000
+    $result = [pscustomobject]@{ Ok = $false; Error = ''; Port = $port; Proc = $null; Files = @(); ErrLog = ''; Swarm = $null; Url = '' }
+    $uv = Get-UvPath
+    if (-not $uv) {
+        $result.Error = 'uv não encontrado no PATH'
+        return $result
+    }
+
+    $swarm = Start-SwarmUI $BatPath $LogPath
+    $result.Swarm = $swarm
+    if (-not $swarm.Ok) {
+        $result.Error = ('SwarmUI: ' + [string]$swarm.Error)
+        Stop-ImageServer $result
+        return $result
+    }
+
+    $files = New-Object System.Collections.Generic.List[string]
+    $pyPath = Join-Path $env:TEMP ('llama_image_{0}.py' -f ([guid]::NewGuid().ToString('N')))
+    $outPath = Join-Path $env:TEMP ('llama_image_{0}.out' -f ([guid]::NewGuid().ToString('N')))
+    $files.Add($pyPath); $files.Add($outPath)
+    if ($LogPath) {
+        $errPath = ($LogPath -replace '\.log$', '') + '_imagem.log'
+    } else {
+        $errPath = Join-Path $env:TEMP ('llama_image_{0}.err' -f ([guid]::NewGuid().ToString('N')))
+        $files.Add($errPath)
+    }
+    $result.Files = $files
+    $result.ErrLog = $errPath
+    $result.Url = $swarm.Url
+    try {
+        $enc = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText($pyPath, ((Get-ImageServerSource) -replace "`r`n", "`n"), $enc)
+        $swarmPid = 0
+        if ($swarm.Proc) { $swarmPid = [int]$swarm.Proc.Id }
+        $uvArgs = @('run', '--no-project', 'python', ('"' + $pyPath + '"'), [string]$port, [string]$PID, [string]$swarm.Url, [string]$swarmPid, [string]$LlamaPort)
+        $proc = Start-Process -FilePath $uv -ArgumentList $uvArgs -WorkingDirectory $env:TEMP -WindowStyle Hidden -PassThru -RedirectStandardOutput $outPath -RedirectStandardError $errPath
+        $result.Proc = $proc
+        $started = Get-Date
+        $deadline = $started.AddSeconds(120)
+        $shown = $false
+        while ((Get-Date) -lt $deadline) {
+            if ($proc.HasExited) {
+                $result.Error = ('o servidor de imagem encerrou (código {0}): {1}' -f $proc.ExitCode, (Get-LogTail $errPath 3))
+                break
+            }
+            try {
+                $r = Invoke-WebRequest -Uri ('http://127.0.0.1:{0}/health' -f $port) -UseBasicParsing -TimeoutSec 1
+                if ([int]$r.StatusCode -eq 200) { $result.Ok = $true; break }
+            } catch { }
+            $elapsed = [int]((Get-Date) - $started).TotalSeconds
+            $room = (Get-UIWidth) - 30
+            $tail = Get-LogTail $errPath 1
+            if ($tail.Length -gt $room) { $tail = $tail.Substring(0, [Math]::Max(0, $room)) }
+            $line = ('  Aguardando a geração de imagem... {0}s  {1}' -f $elapsed, $tail)
+            Write-Host ("`r" + $line.PadRight((Get-UIWidth))) -NoNewline -ForegroundColor DarkGray
+            $shown = $true
+            Start-Sleep -Milliseconds 400
+        }
+        if ($shown) { Write-Host '' }
+        if (-not $result.Ok -and -not $result.Error) {
+            $result.Error = ('tempo esgotado (120s); último log: {0} | arquivo: {1}' -f (Get-LogTail $errPath 2), $errPath)
+        }
+    } catch {
+        $result.Error = $_.Exception.Message
+    }
+    if (-not $result.Ok) { Stop-ImageServer $result }
+    return $result
+}
+
+function Stop-ImageServer {
+    param($Image)
+    if (-not $Image) { return }
+    if ($Image.Proc) {
+        Stop-ProcessTree $Image.Proc
+        $Image.Proc = $null
+    }
+    if ($Image.Swarm) {
+        if ($Image.Swarm.Proc) {
+            Stop-ProcessTree $Image.Swarm.Proc
+            $Image.Swarm.Proc = $null
+        }
+        foreach ($f in @($Image.Swarm.Files)) {
+            try { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue } catch { }
+        }
+        $Image.Swarm.Files = @()
+    }
+    foreach ($f in @($Image.Files)) {
+        try { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue } catch { }
+    }
+    $Image.Files = @()
+    if ($Image.Ok -and $Image.ErrLog) {
+        try { Remove-Item -LiteralPath $Image.ErrLog -Force -ErrorAction SilentlyContinue } catch { }
     }
 }
 
@@ -2972,6 +3721,10 @@ function Get-SettingsRows {
     if ($Cfg.Model.Mmproj) {
         $rows += [pscustomobject]@{ Key = 'vision'; Label = 'Visão'; Value = (Get-VisionLabel $Cfg); Color = 'White' }
     }
+    $imageColor = 'White'
+    if ($Cfg.Image -eq 'on') { $imageColor = 'Cyan' }
+    if (-not [string]::IsNullOrWhiteSpace([string]$Cfg.ImagePath) -and -not (Test-Path -LiteralPath ([string]$Cfg.ImagePath) -PathType Leaf)) { $imageColor = 'Red' }
+    $rows += [pscustomobject]@{ Key = 'image'; Label = 'Geração de Imagem'; Value = (Get-ImageLabel $Cfg); Color = $imageColor }
     $agentColor = 'White'
     if ($Cfg.Agent -eq 'on') { $agentColor = 'Yellow' }
     $rows += [pscustomobject]@{ Key = 'agent'; Label = 'Agente'; Value = (Get-AgentLabel $Cfg.Agent); Color = $agentColor }
@@ -3062,9 +3815,14 @@ function Change-CfgSetting {
             $opts = @('off', 'on')
             $Cfg.Research = [string](Cycle-List $opts $Cfg.Research $Direction)
         }
+        'image' {
+            if (-not [string]::IsNullOrWhiteSpace([string]$Cfg.ImagePath)) {
+                if ($Cfg.Image -eq 'on') { $Cfg.Image = 'off' } else { $Cfg.Image = 'on' }
+            }
+        }
         default { return }
     }
-    if (@('preset', 'port', 'host', 'browser', 'agent', 'research', 'template', 'threads', 'cacheram', 'batch') -notcontains $Key) {
+    if (@('preset', 'port', 'host', 'browser', 'agent', 'research', 'image', 'template', 'threads', 'cacheram', 'batch') -notcontains $Key) {
         $Cfg.Preset = 'personalizado'
     }
     Normalize-Cfg $Cfg
@@ -3181,6 +3939,24 @@ function Show-Settings {
                 }
             }
         }
+        if (-not [string]::IsNullOrWhiteSpace([string]$Cfg.ImagePath) -and -not (Test-Path -LiteralPath ([string]$Cfg.ImagePath) -PathType Leaf)) {
+            Write-Host ('      Geração de Imagem: caminho não encontrado: ' + [string]$Cfg.ImagePath) -ForegroundColor Red
+        }
+        if ($Cfg.Image -eq 'on') {
+            $issue = Get-ImageIssue $Cfg
+            if ($issue) {
+                Write-Host ('      Geração de Imagem: ' + $issue + ' — a opção será ignorada ao iniciar.') -ForegroundColor Red
+            } else {
+                Write-Host '      Geração de Imagem: o modelo poderá criar imagens pelo SwarmUI (o SwarmUI sobe junto com o llama-server).' -ForegroundColor Yellow
+            }
+        }
+        if ($rows[$sel].Key -eq 'image') {
+            if ([string]::IsNullOrWhiteSpace([string]$Cfg.ImagePath)) {
+                Write-Host '      Digite o caminho completo do launch-windows.bat do SwarmUI (ex.: D:/SwarmUI/launch-windows.bat).' -ForegroundColor Cyan
+            } else {
+                Write-Host '      Digite para trocar o caminho, Backspace apaga, Enter confirma, ←/→ liga/desliga.' -ForegroundColor DarkGray
+            }
+        }
 
         Write-Host ''
         $footer = '  ↑↓ navegar   ←→ alterar   Enter editar/iniciar   Esc voltar   Q sair'
@@ -3195,7 +3971,20 @@ function Show-Settings {
         }
         $typKey = [string]$rows[$sel].Key
         $nglTyping = (@('ngl', 'threads', 'batch') -contains $typKey) -and (([string]$key.KeyChar -match '^\d$') -or ($key.Key -eq 'Backspace'))
+        $imgChar = ($typKey -eq 'image') -and (-not [char]::IsControl($key.KeyChar))
+        $imgBack = ($typKey -eq 'image') -and ($kn -eq 'Backspace')
         if (-not $nglTyping) { $nglBuf = '' }
+        if ($imgChar -or $imgBack) {
+            $p = [string]$Cfg.ImagePath
+            if ($imgBack) {
+                if ($p.Length -gt 0) { $p = $p.Substring(0, $p.Length - 1) }
+            } elseif ($p.Length -lt 260) {
+                $p += [string]$key.KeyChar
+            }
+            $Cfg.ImagePath = $p
+            if ([string]::IsNullOrWhiteSpace($p)) { $Cfg.Image = 'off' } else { $Cfg.Image = 'on' }
+            continue
+        }
         switch ($kn) {
             'UpArrow'   { if ($sel -gt 0) { $sel-- } }
             'DownArrow' { if ($sel -lt ($rows.Count - 1)) { $sel++ } }
@@ -3214,7 +4003,15 @@ function Show-Settings {
             'Enter' {
                 $k = $rows[$sel].Key
                 if ($k -eq 'start') { return [pscustomobject]@{ Action = 'start' } }
-                if ($k -eq 'model') {
+                if ($k -eq 'image') {
+                    $Cfg.ImagePath = ConvertTo-ImagePath ([string]$Cfg.ImagePath)
+                    if ([string]::IsNullOrWhiteSpace([string]$Cfg.ImagePath)) {
+                        $Cfg.ImagePath = ''
+                        $Cfg.Image = 'off'
+                    } else {
+                        $Cfg.Image = 'on'
+                    }
+                } elseif ($k -eq 'model') {
                     $pick = Show-ModelPicker -CurrentPath $Cfg.Model.Path
                     $newModel = $null
                     if ($pick.Action -eq 'model' -or $pick.Action -eq 'editlast') { $newModel = $pick.Model }
@@ -3444,7 +4241,7 @@ function Remove-OldLogs {
 }
 
 function Show-StartSummary {
-    param($Cfg, [string]$LogPath, [string[]]$ServerArgs, $Research = $null)
+    param($Cfg, [string]$LogPath, [string[]]$ServerArgs, $Research = $null, $Image = $null)
     $w = Get-UIWidth
     Clear-Screen
     Show-Header 'Iniciando servidor'
@@ -3479,6 +4276,23 @@ function Show-StartSummary {
             Write-Host '  Pesquisa:   indisponível (llama-server.exe antigo, sem --ui-mcp-proxy)' -ForegroundColor Red
         } else {
             Write-Host '  Pesquisa:   desativada (Agente ligado)' -ForegroundColor Red
+        }
+    }
+    if ([string]$Cfg.Image -eq 'on') {
+        if ($Image -and $Image.Ok) {
+            Write-Host ('  Imagem:     ligada (SwarmUI na porta {0}, MCP na porta {1})' -f $Image.Swarm.Port, $Image.Port) -ForegroundColor Cyan
+            Write-Host ('  SwarmUI:    ' + [string]$Cfg.ImagePath) -ForegroundColor DarkGray
+            if ($Cfg.Host -ne '127.0.0.1') {
+                Write-Host '  Atenção:    rede aberta: qualquer aparelho na rede pode usar a geração de imagem por este PC.' -ForegroundColor Yellow
+            }
+        } elseif ($Image) {
+            Write-Host ('  Imagem:     falhou (' + $Image.Error + ')') -ForegroundColor Red
+        } elseif (-not (Test-ResearchSupported)) {
+            Write-Host '  Imagem:     indisponível (llama-server.exe antigo, sem --ui-mcp-proxy)' -ForegroundColor Red
+        } elseif ([string]::IsNullOrWhiteSpace([string]$Cfg.ImagePath)) {
+            Write-Host '  Imagem:     desativada (sem caminho)' -ForegroundColor Red
+        } else {
+            Write-Host ('  Imagem:     indisponível (' + (Get-ImageIssue $Cfg) + ')') -ForegroundColor Red
         }
     }
     $accessUrl = Get-ServerAccessUrl $Cfg.Host ([int]$Cfg.Port)
@@ -3701,6 +4515,7 @@ function Start-LlamaServer {
         } catch { $logPath = '' }
 
         $script:Research = $null
+        $script:Image = $null
         if (Test-ResearchWanted $Cfg) {
             Clear-Screen
             Show-Header 'Preparando pesquisa'
@@ -3708,10 +4523,30 @@ function Start-LlamaServer {
             Write-Host '  Iniciando o servidor de pesquisa (na primeira vez baixa as dependências; pode demorar)...' -ForegroundColor Gray
             $script:Research = Start-ResearchServer $logPath ([int]$Cfg.Ctx)
         }
+
+        if ([string]$Cfg.Image -eq 'on') {
+            $imageIssue = Get-ImageIssue $Cfg
+            if ($imageIssue) {
+                $script:Image = [pscustomobject]@{ Ok = $false; Error = $imageIssue; Port = 0; Proc = $null; Files = @(); ErrLog = ''; Swarm = $null; Url = '' }
+            } else {
+                Clear-Screen
+                Show-Header 'Preparando geração de imagem'
+                Write-Host ''
+                Write-Host '  Iniciando o SwarmUI e o servidor de imagem (na primeira vez o SwarmUI pode demorar)...' -ForegroundColor Gray
+                $script:Image = Start-ImageServer $logPath ([string]$Cfg.ImagePath) ([int]$Cfg.Port)
+            }
+        }
+
         $uiConfigPath = ''
-        if ($script:Research -and $script:Research.Ok) { $uiConfigPath = [string]$script:Research.UiConfig }
+        $researchPort = 0
+        $imagePort = 0
+        if ($script:Research -and $script:Research.Ok) { $researchPort = [int]$script:Research.Port }
+        if ($script:Image -and $script:Image.Ok) { $imagePort = [int]$script:Image.Port }
+        if ($researchPort -gt 0 -or $imagePort -gt 0) {
+            $uiConfigPath = Write-UiConfig -ResearchPort $researchPort -ImagePort $imagePort
+        }
         $serverArgs = Build-ServerArgs $Cfg $logPath $uiConfigPath
-        Show-StartSummary $Cfg $logPath $serverArgs $script:Research
+        Show-StartSummary $Cfg $logPath $serverArgs $script:Research $script:Image
 
         $serverUrl = ('http://127.0.0.1:{0}' -f [int]$Cfg.Port)
         $owuiUrl = 'http://localhost:8080'
@@ -3741,8 +4576,13 @@ function Start-LlamaServer {
             Stop-EscWatcher $esc
             Stop-LoadProgress $progress
             Enable-Mouse
+            Stop-ImageServer $script:Image
+            $script:Image = $null
             Stop-ResearchServer $script:Research
             $script:Research = $null
+            if ($uiConfigPath) {
+                try { Remove-Item -LiteralPath $uiConfigPath -Force -ErrorAction SilentlyContinue } catch { }
+            }
         }
 
         if ($browserJob) {
@@ -3788,6 +4628,7 @@ function Run-SelfTest {
     if ($lanIp) { Write-Host ('LAN:   ' + $lanIp) }
     if ($tsIp) { Write-Host ('Tailscale: ' + $tsIp) }
     Write-Host ('Porta configurada: ' + [int]$script:Global.Port)
+    Write-Host ('Geração de imagem: ' + [string]$script:Global.Image + '  ' + [string]$script:Global.ImagePath)
     Write-Host ''
 
     foreach ($m in $script:Models) {
@@ -3900,6 +4741,7 @@ try {
         }
     }
 } finally {
+    Stop-ImageServer $script:Image
     Stop-ResearchServer $script:Research
     Disable-Mouse
     try { [Console]::CursorVisible = $true } catch { }
