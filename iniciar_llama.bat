@@ -1010,6 +1010,7 @@ function Get-RecommendedCfg {
         Host       = [string]$script:Global.Host
         Browser    = [string]$script:Global.Browser
         Agent      = [string]$script:Global.Agent
+        Research   = [string]$script:Global.Research
     }
 }
 
@@ -1114,6 +1115,7 @@ function Normalize-Cfg {
     if (@('127.0.0.1', '0.0.0.0', 'tailscale') -notcontains [string]$Cfg.Host) { $Cfg.Host = '127.0.0.1' }
     if (@('llamacpp', 'openwebui', 'none') -notcontains [string]$Cfg.Browser) { $Cfg.Browser = 'llamacpp' }
     if (@('off', 'on') -notcontains [string]$Cfg.Agent) { $Cfg.Agent = 'off' }
+    if (@('off', 'on') -notcontains [string]$Cfg.Research) { $Cfg.Research = 'off' }
     if ([int]$Cfg.NPredict -lt -1) { $Cfg.NPredict = -1 }
     if ([int]$Cfg.NPredict -gt 32768) { $Cfg.NPredict = 32768 }
 }
@@ -1121,12 +1123,13 @@ function Normalize-Cfg {
 # ---------------------------------------------------------------------------
 # Persistent state
 # ---------------------------------------------------------------------------
-$script:Global = [pscustomobject]@{ port = 5001; host = '127.0.0.1'; browser = 'llamacpp'; agent = 'off' }
+$script:Global = [pscustomobject]@{ port = 5001; host = '127.0.0.1'; browser = 'llamacpp'; agent = 'off'; research = 'off' }
 $script:StateModels = @{}
 $script:LastModelPath = ''
 $script:LastCfg = $null
 $script:SessionCfg = @{}
 $script:Models = @()
+$script:Research = $null
 
 function Get-PropValue {
     param($Obj, [string]$Name, $Default = $null)
@@ -1149,6 +1152,8 @@ function Initialize-State {
             if (@('llamacpp', 'openwebui', 'none') -contains $browser) { $script:Global.Browser = $browser }
             $agent = [string](Get-PropValue $g 'agent' 'off')
             if (@('off', 'on') -contains $agent) { $script:Global.Agent = $agent }
+            $research = [string](Get-PropValue $g 'research' 'off')
+            if (@('off', 'on') -contains $research) { $script:Global.Research = $research }
         }
         $models = Get-PropValue $raw 'models' $null
         if ($models) {
@@ -1200,6 +1205,7 @@ function New-CfgForModel {
     $cfg.Host = [string]$script:Global.Host
     $cfg.Browser = [string]$script:Global.Browser
     $cfg.Agent = [string]$script:Global.Agent
+    $cfg.Research = [string]$script:Global.Research
     Normalize-Cfg $cfg
     if ($UseSession) { $script:SessionCfg[$Model.Path] = $cfg }
     return $cfg
@@ -1248,6 +1254,7 @@ function Save-Cfg {
         host    = [string]$Cfg.Host
         browser = [string]$Cfg.Browser
         agent   = [string]$Cfg.Agent
+        research = [string]$Cfg.Research
     }
     $script:LastCfg = $Cfg
     Write-State
@@ -1436,6 +1443,12 @@ function Get-AgentLabel {
     return 'desligado'
 }
 
+function Get-ResearchLabel {
+    param([string]$Research)
+    if ($Research -eq 'on') { return 'ligada (buscar e ler páginas da web)' }
+    return 'desligada'
+}
+
 function Get-HostLabel {
     param([string]$HostValue)
     if ($HostValue -eq 'tailscale') {
@@ -1569,7 +1582,7 @@ function Test-AgentSupported {
 }
 
 function Build-ServerArgs {
-    param($Cfg, [string]$LogPath)
+    param($Cfg, [string]$LogPath, [string]$UiConfigPath = '')
     $a = New-Object System.Collections.Generic.List[string]
     $presetPath = Write-ModelPresets $Cfg
     $a.Add('--models-preset'); $a.Add($presetPath)
@@ -1581,12 +1594,947 @@ function Build-ServerArgs {
     }
     $a.Add('--parallel'); $a.Add('1')
     if ([string]$Cfg.Agent -eq 'on' -and (Test-AgentSupported)) { $a.Add('--agent') }
+    if ($UiConfigPath) {
+        $a.Add('--ui-mcp-proxy')
+        $a.Add('--ui-config-file'); $a.Add($UiConfigPath)
+    }
     $a.Add('--host'); $a.Add((Get-BindHost ([string]$Cfg.Host)))
     $a.Add('--port'); $a.Add([string]$Cfg.Port)
     if ($LogPath) {
         $a.Add('--log-file'); $a.Add($LogPath)
     }
     return $a.ToArray()
+}
+
+function Get-UvPath {
+    $c = Get-Command uv.exe -ErrorAction SilentlyContinue
+    if (-not $c) { $c = Get-Command uv -ErrorAction SilentlyContinue }
+    if ($c) { return [string]$c.Source }
+    return ''
+}
+
+function Test-ResearchSupported {
+    if ($null -ne $script:ResearchSupported) { return [bool]$script:ResearchSupported }
+    $ok = $false
+    $prevEap = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $helpText = (& $script:ServerExe --help 2>&1 | Out-String)
+        if ($helpText -match '--ui-mcp-proxy' -and $helpText -match '--ui-config-file') { $ok = $true }
+    } catch {
+        $ok = $false
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
+    $script:ResearchSupported = $ok
+    return $ok
+}
+
+function Test-ResearchWanted {
+    param($Cfg)
+    if ([string]$Cfg.Research -ne 'on') { return $false }
+    if ([string]$Cfg.Agent -eq 'on' -and (Test-AgentSupported)) { return $false }
+    return (Test-ResearchSupported)
+}
+
+function Get-ResearchServerSource {
+    return @'
+import sys
+import os
+import re
+import json
+import math
+import time
+import socket
+import ssl
+import ipaddress
+import threading
+import unicodedata
+import html as htmllib
+import http.client
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit, urljoin, urlencode, quote, parse_qs
+from concurrent.futures import ThreadPoolExecutor
+
+import trafilatura
+
+PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 5000
+PARENT_PID = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+CTX = int(sys.argv[3]) if len(sys.argv) > 3 else 16384
+SEARXNG = os.environ.get("SEARXNG_URL", "").strip().rstrip("/")
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+MAX_BYTES = 2500000
+MAX_REDIRECTS = 5
+READ_DEADLINE = 25
+
+
+class FetchError(Exception):
+    pass
+
+
+def check_ip(addr):
+    ip = ipaddress.ip_address(addr.split("%")[0])
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    if (not ip.is_global) or ip.is_multicast:
+        raise FetchError("blocked address (private, local or reserved network)")
+    return str(ip)
+
+
+def open_conn(scheme, host, port, trusted):
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        raise FetchError("host not found")
+    addrs = []
+    for info in infos:
+        raw = info[4][0]
+        addrs.append(raw.split("%")[0] if trusted else check_ip(raw))
+    sock = None
+    last = None
+    for a in addrs:
+        try:
+            sock = socket.create_connection((a, port), timeout=12)
+            break
+        except OSError as e:
+            last = e
+    if sock is None:
+        raise FetchError("connection failed: %s" % last)
+    if scheme == "https":
+        ctx = ssl.create_default_context()
+        try:
+            sock = ctx.wrap_socket(sock, server_hostname=host)
+        except (ssl.SSLError, OSError) as e:
+            sock.close()
+            raise FetchError("TLS failed: %s" % e)
+        conn = http.client.HTTPSConnection(host, port, timeout=15, context=ctx)
+    else:
+        conn = http.client.HTTPConnection(host, port, timeout=15)
+    conn.sock = sock
+    return conn
+
+
+def http_get(url, accept="text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.5", trusted=False):
+    cur = url
+    for _ in range(MAX_REDIRECTS + 1):
+        parts = urlsplit(cur)
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            raise FetchError("only http and https URLs are allowed")
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        path = quote(parts.path or "/", safe="/%:@!$&'()*+,;=-._~")
+        if parts.query:
+            path += "?" + quote(parts.query, safe="/%:@!$&'()*+,;=-._~?")
+        conn = open_conn(parts.scheme, parts.hostname, port, trusted)
+        try:
+            conn.request("GET", path, headers={
+                "User-Agent": UA,
+                "Accept": accept,
+                "Accept-Language": "en-US,en;q=0.8,pt-BR;q=0.7",
+                "Accept-Encoding": "identity",
+                "Connection": "close",
+            })
+            resp = conn.getresponse()
+            if resp.status in (301, 302, 303, 307, 308):
+                loc = resp.getheader("Location")
+                if not loc:
+                    raise FetchError("redirect without Location")
+                cur = urljoin(cur, loc)
+                continue
+            if resp.status >= 400:
+                raise FetchError("HTTP %d" % resp.status)
+            ctype = (resp.getheader("Content-Type") or "").lower()
+            chunks = []
+            total = 0
+            deadline = time.time() + READ_DEADLINE
+            while total < MAX_BYTES and time.time() < deadline:
+                data = resp.read(65536)
+                if not data:
+                    break
+                chunks.append(data)
+                total += len(data)
+            return cur, ctype, b"".join(chunks)
+        except (http.client.HTTPException, OSError) as e:
+            raise FetchError("request failed: %s" % e)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    raise FetchError("too many redirects")
+
+
+def decode_body(body, ctype):
+    m = re.search(r"charset=([\w\-]+)", ctype or "")
+    for enc in ([m.group(1)] if m else []) + ["utf-8"]:
+        try:
+            return body.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return body.decode("utf-8", "replace")
+
+
+def strip_tags(s):
+    s = re.sub(r"(?is)<(script|style|noscript|svg).*?</\1>", " ", s)
+    s = re.sub(r"(?s)<[^>]+>", " ", s)
+    s = htmllib.unescape(s)
+    return re.sub(r"[ \t\r\f\v]+", " ", re.sub(r"\n\s*\n+", "\n\n", s)).strip()
+
+
+SKIP_EXT = re.compile(r"\.(png|jpe?g|gif|svg|webp|ico|css|js|json|xml|pdf|zip|gz|mp4|mp3|woff2?|ttf)$", re.I)
+LINK_HINTS = ("about", "sobre", "faq", "help", "ajuda", "terms", "termos", "privacy", "privacidade", "pricing", "precos", "blog", "docs", "contact", "contato", "features", "how", "como", "news", "press", "team", "story", "quem")
+NOISE_TOKENS = {"http", "https", "www", "com", "org", "net", "html"}
+BAD_TLDS = {"js", "py", "md", "rs", "sh", "ts", "cs", "rb", "pm", "gz", "so", "exe", "dll", "txt", "pdf", "png", "jpg", "doc", "docx", "html", "css", "json", "xml"}
+DOMAIN_RE = re.compile(r"(?i)\b((?:https?://)?(?:[a-z0-9][a-z0-9-]*\.)+([a-z]{2,24}))(/[^\s\"']*)?")
+
+
+def bare_host(host):
+    host = (host or "").lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+def url_key(url):
+    p = urlsplit(url)
+    return bare_host(p.hostname) + p.path.rstrip("/")
+
+
+def find_domains(text):
+    out = []
+    for m in DOMAIN_RE.finditer(text):
+        if m.group(2).lower() in BAD_TLDS:
+            continue
+        url = m.group(1) if m.group(1).lower().startswith("http") else "https://" + m.group(1)
+        url += (m.group(3) or "/").rstrip(".,;:!?)]}") or "/"
+        if url not in out:
+            out.append(url)
+    return out[:2]
+
+
+def meta_values(raw):
+    out = {}
+    for tag in re.findall(r"(?is)<meta\s[^>]*>", raw[:200000]):
+        attrs = {}
+        for k, v in re.findall(r"""([\w:-]+)\s*=\s*("[^"]*"|'[^']*')""", tag):
+            attrs[k.lower()] = v[1:-1]
+        key = (attrs.get("name") or attrs.get("property") or "").lower()
+        if key and attrs.get("content") and key not in out:
+            out[key] = htmllib.unescape(attrs["content"]).strip()
+    return out
+
+
+def page_links(raw, base):
+    host = bare_host(urlsplit(base).hostname)
+    seen = []
+    for href in re.findall(r"""(?is)<a\s[^>]*?href\s*=\s*("[^"]*"|'[^']*')""", raw[:600000]):
+        u = urljoin(base, htmllib.unescape(href[1:-1]).strip()).split("#")[0]
+        p = urlsplit(u)
+        if p.scheme not in ("http", "https") or not p.hostname:
+            continue
+        if bare_host(p.hostname) != host or SKIP_EXT.search(p.path):
+            continue
+        if u.rstrip("/") == base.rstrip("/") or u in seen:
+            continue
+        seen.append(u)
+    return seen
+
+
+def rank_links(links):
+    def score(item):
+        idx, u = item
+        path = urlsplit(u).path.lower()
+        hits = sum(1 for h in LINK_HINTS if h in path)
+        return (-hits, path.count("/"), idx)
+    return [u for _, u in sorted(enumerate(links), key=score)]
+
+
+def load_page(url):
+    final, ctype, body = http_get(url)
+    page = {"url": final, "title": "", "text": "", "desc": "", "date": "", "links": [], "thin": False}
+    if "html" in ctype or "xml" in ctype or not ctype:
+        raw = decode_body(body, ctype)
+        meta = meta_values(raw)
+        page["desc"] = clean(meta.get("og:description") or meta.get("description") or meta.get("twitter:description") or "")
+        tm = re.search(r"(?is)<title[^>]*>(.*?)</title>", raw)
+        page["title"] = clean(meta.get("og:title") or (tm.group(1) if tm else ""))
+        page["links"] = rank_links(page_links(raw, final))
+        text = None
+        try:
+            text = trafilatura.extract(body, url=final, include_comments=False, include_tables=True, favor_recall=True)
+        except Exception:
+            text = None
+        try:
+            tmeta = trafilatura.extract_metadata(body)
+            if tmeta is not None:
+                if tmeta.title and not page["title"]:
+                    page["title"] = clean(tmeta.title)
+                if tmeta.date:
+                    page["date"] = str(tmeta.date)
+        except Exception:
+            pass
+        if not text:
+            text = strip_tags(raw)
+        if len(text) < 300:
+            page["thin"] = True
+            parts = []
+            for x in (page["title"], page["desc"], text):
+                if x and x not in parts:
+                    parts.append(x)
+            text = "\n".join(parts)
+        page["text"] = text.strip()
+        if not page["text"]:
+            raise FetchError("no readable text (page may require JavaScript)")
+        return page
+    if ctype.startswith("text/") or "json" in ctype:
+        page["text"] = decode_body(body, ctype).strip()
+        page["title"] = final
+        if not page["text"]:
+            raise FetchError("empty page")
+        return page
+    raise FetchError("unsupported content type: %s" % (ctype.split(";")[0] or "unknown"))
+
+
+def clean(s):
+    return re.sub(r"\s+", " ", strip_tags(s or "")).strip()
+
+
+def search_ddgs(query, n):
+    from ddgs import DDGS
+    items = DDGS().text(query, max_results=n)
+    out = []
+    for r in items or []:
+        if r.get("href"):
+            out.append({"title": clean(r.get("title")), "url": r["href"], "snippet": clean(r.get("body"))})
+    return out
+
+
+def search_html(query, n):
+    _, ctype, body = http_get("https://html.duckduckgo.com/html/?" + urlencode({"q": query}))
+    page = decode_body(body, ctype)
+    out = []
+    pat = re.compile(r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>(.*?)(?=class="result__a"|$)', re.S)
+    for m in pat.finditer(page):
+        href = htmllib.unescape(m.group(1))
+        if href.startswith("//"):
+            href = "https:" + href
+        q = parse_qs(urlsplit(href).query)
+        if "uddg" in q:
+            href = q["uddg"][0]
+        if not href.startswith("http"):
+            continue
+        sm = re.search(r'class="result__snippet"[^>]*>(.*?)</a>', m.group(3), re.S)
+        out.append({"title": clean(m.group(2)), "url": href, "snippet": clean(sm.group(1)) if sm else ""})
+        if len(out) >= n:
+            break
+    return out
+
+
+def search_searx(query, n):
+    _, ctype, body = http_get(SEARXNG + "/search?" + urlencode({"q": query, "format": "json"}), "application/json", True)
+    data = json.loads(decode_body(body, ctype))
+    out = []
+    for r in data.get("results", [])[:n]:
+        if r.get("url"):
+            out.append({"title": clean(r.get("title")), "url": r["url"], "snippet": clean(r.get("content"))})
+    return out
+
+
+def do_search(query, n):
+    engines = []
+    if SEARXNG:
+        engines.append(("searxng", search_searx))
+    engines.append(("ddgs", search_ddgs))
+    engines.append(("duckduckgo-html", search_html))
+    errors = []
+    for name, fn in engines:
+        try:
+            res = fn(query, n)
+            if res:
+                return res
+            errors.append("%s: no results" % name)
+        except Exception as e:
+            errors.append("%s: %s" % (name, e))
+    raise RuntimeError("search failed (" + "; ".join(errors) + ")")
+
+
+def hard_budget():
+    return max(4000, (CTX - 3500) * 3)
+
+
+def default_budget():
+    return max(4000, min(int(CTX * 1.5), 120000, hard_budget()))
+
+
+def clamp(v, lo, hi, default):
+    try:
+        v = int(v)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, v))
+
+
+def norm_tokens(s):
+    s = unicodedata.normalize("NFKD", s.lower())
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return re.findall(r"\w+", s)
+
+
+def bm25(query_tokens, docs_tokens):
+    n = len(docs_tokens)
+    if n == 0:
+        return []
+    avg = (sum(len(t) for t in docs_tokens) / n) or 1.0
+    df = {}
+    for toks in docs_tokens:
+        for w in set(toks):
+            df[w] = df.get(w, 0) + 1
+    scores = []
+    for toks in docs_tokens:
+        tf = {}
+        for w in toks:
+            tf[w] = tf.get(w, 0) + 1
+        s = 0.0
+        for q in set(query_tokens):
+            f = tf.get(q, 0)
+            if not f:
+                continue
+            idf = math.log(1 + (n - df[q] + 0.5) / (df[q] + 0.5))
+            s += idf * (f * 2.2) / (f + 1.2 * (0.25 + 0.75 * len(toks) / avg))
+        scores.append(s)
+    return scores
+
+
+def split_chunks(text, size=900, limit=60):
+    chunks = []
+    cur = ""
+    for para in re.split(r"\n+", text):
+        para = para.strip()
+        if not para:
+            continue
+        while len(para) > size * 1.5:
+            cut = para.rfind(" ", 0, size)
+            if cut < size // 2:
+                cut = size
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            chunks.append(para[:cut].strip())
+            para = para[cut:].strip()
+        if cur and len(cur) + len(para) + 1 > size:
+            chunks.append(cur)
+            cur = para
+        else:
+            cur = (cur + "\n" + para) if cur else para
+    if cur:
+        chunks.append(cur)
+    return chunks[:limit]
+
+
+def tool_search_links(args):
+    query = str(args.get("query", "")).strip()
+    if not query:
+        raise ValueError("query is required")
+    n = clamp(args.get("max_results"), 1, 15, 8)
+    res = do_search(query, n)
+    lines = []
+    for i, r in enumerate(res, 1):
+        lines.append("%d. %s\n   %s\n   %s" % (i, r["title"] or r["url"], r["url"], r["snippet"]))
+    lines.append("\nSnippets only, not the page content. To read a page call fetch_url(url); for the actual content of several pages call web_search.")
+    return "\n".join(lines)
+
+
+def tool_fetch_url(args):
+    url = str(args.get("url", "")).strip()
+    if not url:
+        raise ValueError("url is required")
+    if not re.match(r"(?i)^https?://", url):
+        url = "https://" + url
+    limit = clamp(args.get("max_chars"), 1000, hard_budget(), default_budget())
+    offset = clamp(args.get("offset"), 0, 10000000, 0)
+    page = load_page(url)
+    text = page["text"]
+    head = "%s\n%s" % (page["title"] or page["url"], page["url"])
+    if page["date"]:
+        head += "\nDate: " + page["date"]
+    if page["thin"]:
+        head += "\n[note: very little text could be read; the page probably needs JavaScript]"
+    part = text[offset:offset + limit]
+    if not part:
+        return "%s\n\n[no more content: the page has %d characters]" % (head, len(text))
+    out = "%s\n\n%s" % (head, part)
+    rest = len(text) - (offset + len(part))
+    if rest > 0:
+        out += "\n\n[truncated: %d more characters. Call fetch_url again with offset=%d to continue]" % (rest, offset + len(part))
+    if offset == 0 and page["links"]:
+        out += "\n\nLinks on this site (use fetch_url to read them):\n" + "\n".join(page["links"][:12])
+    return out
+
+
+def multi_search(queries, per):
+    scores = {}
+    items = {}
+    errors = []
+    for q in queries:
+        try:
+            res = do_search(q, per)
+        except Exception as e:
+            errors.append(str(e))
+            continue
+        for rank, r in enumerate(res):
+            key = url_key(r["url"])
+            scores[key] = scores.get(key, 0.0) + 1.0 / (60 + rank)
+            if key not in items:
+                items[key] = r
+    if not items:
+        raise RuntimeError(errors[0] if errors else "no results")
+    return [items[k] for k in sorted(items, key=lambda k: -scores[k])]
+
+
+def tool_web_search(args):
+    query = str(args.get("query", "")).strip()
+    if not query:
+        raise ValueError("query is required")
+    deep = str(args.get("depth", "")).lower() == "deep"
+    n = clamp(args.get("sources"), 1, 10, 10 if deep else 5)
+    budget = clamp(args.get("max_chars"), 1500, hard_budget(), default_budget())
+    extra = args.get("queries")
+    queries = [query]
+    if isinstance(extra, list):
+        for x in extra:
+            x = str(x).strip()
+            if x and x not in queries and len(queries) < 4:
+                queries.append(x)
+
+    seeds = []
+    variants = []
+
+    def addv(v):
+        if v and v not in variants:
+            variants.append(v)
+
+    for q in queries:
+        addv(q)
+        doms = find_domains(q)
+        for d in doms:
+            if d not in seeds:
+                seeds.append(d)
+            addv('"%s"' % bare_host(urlsplit(d).hostname))
+        if not doms and len(q.split()) <= 4 and '"' not in q:
+            addv('"%s"' % q)
+    variants = variants[:6]
+
+    try:
+        results = multi_search(variants, 8)
+    except Exception:
+        if not seeds:
+            raise
+        results = []
+
+    picked = []
+    seen_keys = set()
+    per_host = {}
+
+    def add(r):
+        key = url_key(r["url"])
+        host = bare_host(urlsplit(r["url"]).hostname)
+        if key in seen_keys or per_host.get(host, 0) >= 2:
+            return
+        seen_keys.add(key)
+        per_host[host] = per_host.get(host, 0) + 1
+        picked.append(r)
+
+    for d in seeds:
+        add({"url": d, "title": "", "snippet": "", "seed": True})
+    for r in results:
+        if len(picked) >= n:
+            break
+        add(r)
+
+    def load(r):
+        try:
+            p = load_page(r["url"])
+            return {"url": p["url"], "title": r.get("title") or p["title"] or p["url"], "text": p["text"], "date": p["date"], "thin": p["thin"], "links": p["links"], "error": "", "snippet": r.get("snippet", ""), "linked": r.get("linked", False), "seed": r.get("seed", False)}
+        except Exception as e:
+            return {"url": r["url"], "title": r.get("title") or r["url"], "text": "", "date": "", "thin": False, "links": [], "error": str(e), "snippet": r.get("snippet", ""), "linked": r.get("linked", False), "seed": r.get("seed", False)}
+
+    with ThreadPoolExecutor(max_workers=max(1, len(picked))) as pool:
+        docs = list(pool.map(load, picked))
+
+    more = []
+    for d in docs:
+        if d["url"] in seeds or any(d["url"].rstrip("/") == s.rstrip("/") for s in seeds):
+            for link in d["links"]:
+                key = url_key(link)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                more.append({"url": link, "title": "", "snippet": "", "linked": True})
+                if len(more) >= 3:
+                    break
+    if more:
+        with ThreadPoolExecutor(max_workers=len(more)) as pool:
+            docs += list(pool.map(load, more))
+
+    chunks = []
+    for di, d in enumerate(docs):
+        for pos, c in enumerate(split_chunks(d["text"], 900, 200)):
+            chunks.append((di, pos, c))
+    qt = [w for w in norm_tokens(" ".join(queries)) if w not in NOISE_TOKENS]
+    scores = bm25(qt, [norm_tokens(c[2]) for c in chunks])
+    by_doc = {}
+    for i, c in enumerate(chunks):
+        by_doc.setdefault(c[0], []).append(scores[i])
+
+    def tier(di):
+        if docs[di]["seed"]:
+            return 0
+        return 1 if docs[di]["linked"] else 2
+
+    def relevance(di):
+        return sum(sorted(by_doc.get(di, [0.0]), reverse=True)[:3])
+
+    ranked = sorted([di for di in range(len(docs)) if docs[di]["text"]], key=lambda di: (tier(di), -relevance(di), di))
+    keep = [di for di in ranked if tier(di) < 2 or relevance(di) > 0]
+    ranked = keep or ranked[:2]
+    remaining = budget
+    cap = max(3000, int(budget * 0.6))
+    shown = {}
+    for di in ranked:
+        if remaining < 1200:
+            break
+        text = docs[di]["text"]
+        room = min(remaining, cap)
+        part = text
+        if len(text) > room:
+            part = text[:room]
+            cut = part.rfind("\n")
+            if cut > room * 0.6:
+                part = part[:cut]
+        shown[di] = part
+        remaining -= len(part)
+
+    extra = []
+    per_doc = {}
+    for i in sorted([i for i in range(len(chunks)) if chunks[i][0] not in shown and scores[i] > 0], key=lambda i: -scores[i]):
+        di = chunks[i][0]
+        if per_doc.get(di, 0) >= 2 or len(chunks[i][2]) > remaining:
+            continue
+        extra.append(i)
+        per_doc[di] = per_doc.get(di, 0) + 1
+        remaining -= len(chunks[i][2])
+    extra.sort(key=lambda i: (chunks[i][0], chunks[i][1]))
+
+    readable = sum(1 for d in docs if d["text"])
+    thin = sum(1 for d in docs if d["thin"])
+    out = ["Query: " + " | ".join(queries), "", "Sources (%d read, %d total):" % (readable, len(docs))]
+    for di, d in enumerate(docs):
+        line = "[%d] %s - %s" % (di + 1, d["title"] or d["url"], d["url"])
+        if d["date"]:
+            line += " (%s)" % d["date"]
+        if d["linked"]:
+            line += " (internal page of the site)"
+        if d["error"]:
+            line += " (could not be read: %s)" % d["error"]
+            if d["snippet"]:
+                line += "\n    search snippet: " + d["snippet"][:300]
+        elif di in shown:
+            if len(shown[di]) >= len(d["text"]):
+                line += " - full text, %d characters" % len(d["text"])
+            else:
+                line += " - first %d of %d characters; call fetch_url with offset=%d for the rest" % (len(shown[di]), len(d["text"]), len(shown[di]))
+        elif per_doc.get(di):
+            line += " - excerpts only; call fetch_url to read it fully"
+        elif d["text"]:
+            line += " - not included (%s); call fetch_url to read it" % ("no match with the query" if tier(di) == 2 and relevance(di) <= 0 else "no room left")
+        out.append(line)
+    for di in sorted(shown):
+        out.append("")
+        out.append("=== [%d] %s ===" % (di + 1, docs[di]["title"] or docs[di]["url"]))
+        out.append(shown[di])
+    if extra:
+        out.append("")
+        out.append("=== Other relevant excerpts ===")
+        for i in extra:
+            out.append("")
+            out.append("[%d] %s" % (chunks[i][0] + 1, chunks[i][2]))
+    if not shown and not extra:
+        out.append("")
+        out.append("(nothing readable was found)")
+    out.append("")
+    if thin:
+        out.append("Note: %d page(s) have little text (probably JavaScript-rendered); only their title and description could be read." % thin)
+    out.append("Instructions: answer only from these sources and cite them as [n] with the URL. If they do not cover the question, say so, then call web_search again with different queries or fetch_url on a promising URL. Never tell the user to search by themselves.")
+    return "\n".join(out)
+
+
+TOOLS = [
+    {
+        "name": "search_links",
+        "description": "Returns only a list of links with title and snippet, NOT the content of the pages. Use it only to discover URLs (for example the official site of something); then read a page with fetch_url, or use web_search to get the content.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query"},
+                "max_results": {"type": "integer", "description": "Number of results, 1 to 15 (default 8)"},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "fetch_url",
+        "description": "Download one web page and return its main text (as much as fits the context window). Use offset to continue a cut page, and the listed links to follow the site.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Full http or https URL"},
+                "max_chars": {"type": "integer", "description": "Maximum characters to return (default is sized to the context window)"},
+                "offset": {"type": "integer", "description": "Character offset to start from (default 0)"},
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "web_search",
+        "description": "Search the web, download the most promising pages and return their full text (sized to fit the context window), plus excerpts from the rest, all with numbered sources. Default tool for any question about current events, specific sites, people or products, or facts you are unsure about. If the query contains a domain or URL, that site (and a few of its internal pages) is read directly. For broad topics ('everything about X') pass several different angles in queries, or set depth to deep.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Main thing to find out"},
+                "queries": {"type": "array", "items": {"type": "string"}, "description": "Up to 3 extra, different search angles (optional)"},
+                "depth": {"type": "string", "enum": ["quick", "deep"], "description": "quick reads up to 5 pages, deep reads up to 10 to choose the best ones (default quick)"},
+                "sources": {"type": "integer", "description": "Number of pages to read, 1 to 10"},
+                "max_chars": {"type": "integer", "description": "Maximum characters of page text to return (default is sized to the context window)"},
+            },
+            "required": ["query"],
+        },
+    },
+]
+
+HANDLERS = {"search_links": tool_search_links, "fetch_url": tool_fetch_url, "web_search": tool_web_search}
+
+
+def rpc_error(rid, code, message):
+    return {"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": message}}
+
+
+def handle_rpc(msg):
+    if not isinstance(msg, dict):
+        return rpc_error(None, -32600, "invalid request")
+    if "id" not in msg:
+        return None
+    rid = msg["id"]
+    method = msg.get("method")
+    params = msg.get("params") or {}
+    if method == "initialize":
+        ver = params.get("protocolVersion") or "2025-03-26"
+        return {"jsonrpc": "2.0", "id": rid, "result": {
+            "protocolVersion": ver,
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": "llama-research", "version": "1.0"},
+        }}
+    if method == "ping":
+        return {"jsonrpc": "2.0", "id": rid, "result": {}}
+    if method == "tools/list":
+        return {"jsonrpc": "2.0", "id": rid, "result": {"tools": TOOLS}}
+    if method == "tools/call":
+        fn = HANDLERS.get(params.get("name"))
+        if fn is None:
+            return rpc_error(rid, -32602, "unknown tool: %s" % params.get("name"))
+        try:
+            text = fn(params.get("arguments") or {})
+            err = False
+        except Exception as e:
+            text = "Error: %s" % e
+            err = True
+        return {"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": text}], "isError": err}}
+    return rpc_error(rid, -32601, "method not found: %s" % method)
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):
+        pass
+
+    def host_ok(self):
+        host = (self.headers.get("Host") or "").lower()
+        name = host.rsplit(":", 1)[0] if not host.startswith("[") else host.split("]")[0] + "]"
+        return name in ("127.0.0.1", "localhost", "[::1]")
+
+    def send_body(self, status, body=b"", ctype="application/json"):
+        self.send_response(status)
+        if body:
+            self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def do_GET(self):
+        if not self.host_ok():
+            return self.send_body(403)
+        if self.path == "/health":
+            return self.send_body(200, b"ok", "text/plain")
+        self.send_response(405)
+        self.send_header("Allow", "POST")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_DELETE(self):
+        self.send_body(200 if self.host_ok() else 403)
+
+    def do_POST(self):
+        if not self.host_ok():
+            return self.send_body(403)
+        if self.path.split("?")[0] != "/mcp":
+            return self.send_body(404)
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        except Exception:
+            return self.send_body(400, json.dumps(rpc_error(None, -32700, "parse error")).encode("utf-8"))
+        if isinstance(payload, list):
+            replies = [r for r in (handle_rpc(m) for m in payload) if r is not None]
+            reply = replies or None
+        else:
+            reply = handle_rpc(payload)
+        if reply is None:
+            return self.send_body(202)
+        self.send_body(200, json.dumps(reply, ensure_ascii=False).encode("utf-8"))
+
+
+def watch_parent(pid):
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        handle = k32.OpenProcess(0x00100000, False, pid)
+        if handle:
+            k32.WaitForSingleObject(handle, 0xFFFFFFFF)
+            os._exit(0)
+    except Exception:
+        pass
+
+
+def main():
+    if PARENT_PID:
+        threading.Thread(target=watch_parent, args=(PARENT_PID,), daemon=True).start()
+    srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    srv.daemon_threads = True
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
+'@
+}
+
+function Write-UiConfig {
+    param([int]$McpPort)
+    $date = (Get-Date).ToString('yyyy-MM-dd (dddd)', [System.Globalization.CultureInfo]::InvariantCulture)
+    $sys = ('Current date: {0}. Your training data is older than this date, so your memory is outdated and may be wrong. If the user asks you to search something, always do it. Unless the answer is extremely obvious (greetings, simple math, code you can write directly, creative writing), call web_search before answering and never answer factual questions from memory. If the user gives a domain or URL, use web_search or fetch_url with it. For broad requests, give web_search several different angles in queries, or use depth=deep. Answer only from the results and cite them as [n] with their URLs. If the results do not answer the question, do not give up yet: try depth=deep, and use fetch_url on a page the results mention but did not include in full. After two or three failed tries, say plainly what you found and what you could not find. Never tell the user to search by themselves. Reply in the user language.' -f $date)
+    $server = [ordered]@{ enabled = $true; id = 'c0a8e5d2-3f1b-4c7a-9b6e-2d4f8a1e7c30'; url = ('http://127.0.0.1:{0}/mcp' -f $McpPort); useProxy = $true }
+    $servers = ConvertTo-Json -InputObject @($server) -Compress
+    $obj = [ordered]@{ mcpServers = $servers; systemMessage = $sys }
+    $json = ConvertTo-Json -InputObject $obj -Compress
+    $path = Join-Path $env:TEMP ('llama_webui_{0}.json' -f ([guid]::NewGuid().ToString('N')))
+    $enc = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($path, $json, $enc)
+    return $path
+}
+
+function Get-LogTail {
+    param([string]$Path, [int]$Count = 1)
+    try {
+        $fs = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        try {
+            $sr = New-Object System.IO.StreamReader($fs, [System.Text.Encoding]::UTF8)
+            $txt = $sr.ReadToEnd()
+        } finally {
+            $fs.Dispose()
+        }
+        $lines = @(($txt -split "`r?`n") | Where-Object { $_.Trim() })
+        if ($lines.Count -eq 0) { return '' }
+        return (($lines | Select-Object -Last $Count) -join ' | ')
+    } catch {
+        return ''
+    }
+}
+
+function Start-ResearchServer {
+    param([string]$LogPath, [int]$Ctx = 16384)
+    $uv = Get-UvPath
+    if (-not $uv) { return [pscustomobject]@{ Ok = $false; Error = 'uv não encontrado no PATH'; Port = 0; Proc = $null; Files = @() } }
+    $port = Get-NextFreePort 5000
+    $files = New-Object System.Collections.Generic.List[string]
+    $pyPath = Join-Path $env:TEMP ('llama_research_{0}.py' -f ([guid]::NewGuid().ToString('N')))
+    $outPath = Join-Path $env:TEMP ('llama_research_{0}.out' -f ([guid]::NewGuid().ToString('N')))
+    $files.Add($pyPath); $files.Add($outPath)
+    if ($LogPath) {
+        $errPath = ($LogPath -replace '\.log$', '') + '_pesquisa.log'
+    } else {
+        $errPath = Join-Path $env:TEMP ('llama_research_{0}.err' -f ([guid]::NewGuid().ToString('N')))
+        $files.Add($errPath)
+    }
+    $enc = New-Object System.Text.UTF8Encoding($false)
+    $result = [pscustomobject]@{ Ok = $false; Error = ''; Port = $port; Proc = $null; Files = $files; UiConfig = ''; ErrLog = $errPath }
+    try {
+        [System.IO.File]::WriteAllText($pyPath, ((Get-ResearchServerSource) -replace "`r`n", "`n"), $enc)
+        $uvArgs = @('run', '--no-project', '--with', 'ddgs', '--with', 'trafilatura', 'python', ('"' + $pyPath + '"'), [string]$port, [string]$PID, [string]$Ctx)
+        $proc = Start-Process -FilePath $uv -ArgumentList $uvArgs -WorkingDirectory $env:TEMP -WindowStyle Hidden -PassThru -RedirectStandardOutput $outPath -RedirectStandardError $errPath
+        $result.Proc = $proc
+        $started = Get-Date
+        $deadline = $started.AddSeconds(120)
+        $shown = $false
+        while ((Get-Date) -lt $deadline) {
+            if ($proc.HasExited) {
+                $result.Error = ('o servidor de pesquisa encerrou (código {0}): {1}' -f $proc.ExitCode, (Get-LogTail $errPath 3))
+                break
+            }
+            try {
+                $r = Invoke-WebRequest -Uri ('http://127.0.0.1:{0}/health' -f $port) -UseBasicParsing -TimeoutSec 1
+                if ([int]$r.StatusCode -eq 200) { $result.Ok = $true; break }
+            } catch { }
+            $elapsed = [int]((Get-Date) - $started).TotalSeconds
+            $room = (Get-UIWidth) - 30
+            $tail = Get-LogTail $errPath 1
+            if ($tail.Length -gt $room) { $tail = $tail.Substring(0, [Math]::Max(0, $room)) }
+            $line = ('  Aguardando a pesquisa... {0}s  {1}' -f $elapsed, $tail)
+            Write-Host ("`r" + $line.PadRight((Get-UIWidth))) -NoNewline -ForegroundColor DarkGray
+            $shown = $true
+            Start-Sleep -Milliseconds 400
+        }
+        if ($shown) { Write-Host '' }
+        if (-not $result.Ok -and -not $result.Error) {
+            $result.Error = ('tempo esgotado (120s); último log: {0} | arquivo: {1}' -f (Get-LogTail $errPath 2), $errPath)
+        }
+        if ($result.Ok) {
+            $cfgPath = Write-UiConfig $port
+            $files.Add($cfgPath)
+            $result.UiConfig = $cfgPath
+        }
+    } catch {
+        $result.Error = $_.Exception.Message
+    }
+    if (-not $result.Ok) { Stop-ResearchServer $result }
+    return $result
+}
+
+function Stop-ResearchServer {
+    param($Research)
+    if (-not $Research) { return }
+    if ($Research.Proc) {
+        try {
+            if (-not $Research.Proc.HasExited) {
+                Start-Process -FilePath 'taskkill.exe' -ArgumentList @('/PID', [string]$Research.Proc.Id, '/T', '/F') -WindowStyle Hidden -Wait | Out-Null
+            }
+        } catch { }
+        $Research.Proc = $null
+    }
+    foreach ($f in @($Research.Files)) {
+        try { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue } catch { }
+    }
+    $Research.Files = @()
+    if ($Research.Ok -and $Research.ErrLog) {
+        try { Remove-Item -LiteralPath $Research.ErrLog -Force -ErrorAction SilentlyContinue } catch { }
+    }
 }
 
 function Format-Command {
@@ -1868,6 +2816,9 @@ function Get-SettingsRows {
     $agentColor = 'White'
     if ($Cfg.Agent -eq 'on') { $agentColor = 'Yellow' }
     $rows += [pscustomobject]@{ Key = 'agent'; Label = 'Agente'; Value = (Get-AgentLabel $Cfg.Agent); Color = $agentColor }
+    $researchColor = 'White'
+    if ($Cfg.Research -eq 'on') { $researchColor = 'Cyan' }
+    $rows += [pscustomobject]@{ Key = 'research'; Label = 'Pesquisa'; Value = (Get-ResearchLabel $Cfg.Research); Color = $researchColor }
     if ($Cfg.Model.Meta.HasThinking) {
         $reason = $Cfg.Reasoning
         if ($reason -eq 'on') { $reason = 'ligado' }
@@ -1948,9 +2899,13 @@ function Change-CfgSetting {
             $opts = @('off', 'on')
             $Cfg.Agent = [string](Cycle-List $opts $Cfg.Agent $Direction)
         }
+        'research' {
+            $opts = @('off', 'on')
+            $Cfg.Research = [string](Cycle-List $opts $Cfg.Research $Direction)
+        }
         default { return }
     }
-    if (@('preset', 'port', 'host', 'browser', 'agent', 'template', 'threads', 'cacheram', 'batch') -notcontains $Key) {
+    if (@('preset', 'port', 'host', 'browser', 'agent', 'research', 'template', 'threads', 'cacheram', 'batch') -notcontains $Key) {
         $Cfg.Preset = 'personalizado'
     }
     Normalize-Cfg $Cfg
@@ -2051,6 +3006,20 @@ function Show-Settings {
                 }
             } else {
                 Write-Host '      Agente: este llama-server.exe é antigo e não tem --agent. A opção será ignorada; atualize o llama.cpp.' -ForegroundColor Red
+            }
+        }
+        if ($Cfg.Research -eq 'on') {
+            if (-not (Test-ResearchSupported)) {
+                Write-Host '      Pesquisa: este llama-server.exe é antigo e não tem --ui-mcp-proxy. A opção será ignorada; atualize o llama.cpp.' -ForegroundColor Red
+            } elseif ($Cfg.Agent -eq 'on' -and (Test-AgentSupported)) {
+                Write-Host '      Pesquisa: desativada enquanto o Agente estiver ligado (conteúdo da web + comandos no PC é arriscado).' -ForegroundColor Red
+            } elseif (-not (Get-UvPath)) {
+                Write-Host '      Pesquisa: uv não encontrado no PATH. Instale o uv para usar esta opção.' -ForegroundColor Red
+            } else {
+                Write-Host '      Pesquisa: o modelo poderá buscar na web e ler páginas (precisa de internet; instala dependências na 1ª vez).' -ForegroundColor Yellow
+                if ($Cfg.Host -ne '127.0.0.1') {
+                    Write-Host '      Atenção: com a rede aberta, qualquer aparelho que alcance a porta poderá usar a pesquisa por este PC.' -ForegroundColor Yellow
+                }
             }
         }
 
@@ -2316,7 +3285,7 @@ function Remove-OldLogs {
 }
 
 function Show-StartSummary {
-    param($Cfg, [string]$LogPath, [string[]]$ServerArgs)
+    param($Cfg, [string]$LogPath, [string[]]$ServerArgs, $Research = $null)
     $w = Get-UIWidth
     Clear-Screen
     Show-Header 'Iniciando servidor'
@@ -2337,6 +3306,20 @@ function Show-StartSummary {
             }
         } else {
             Write-Host '  Agente:     indisponível (llama-server.exe antigo, --agent ignorado)' -ForegroundColor Red
+        }
+    }
+    if ([string]$Cfg.Research -eq 'on') {
+        if ($Research -and $Research.Ok) {
+            Write-Host ('  Pesquisa:   ligada (servidor local na porta {0})' -f $Research.Port) -ForegroundColor Cyan
+            if ($Cfg.Host -ne '127.0.0.1') {
+                Write-Host '  Atenção:    rede aberta: qualquer aparelho na rede pode usar a pesquisa por este PC.' -ForegroundColor Yellow
+            }
+        } elseif ($Research) {
+            Write-Host ('  Pesquisa:   falhou (' + $Research.Error + ')') -ForegroundColor Red
+        } elseif (-not (Test-ResearchSupported)) {
+            Write-Host '  Pesquisa:   indisponível (llama-server.exe antigo, sem --ui-mcp-proxy)' -ForegroundColor Red
+        } else {
+            Write-Host '  Pesquisa:   desativada (Agente ligado)' -ForegroundColor Red
         }
     }
     $accessUrl = Get-ServerAccessUrl $Cfg.Host ([int]$Cfg.Port)
@@ -2558,8 +3541,18 @@ function Start-LlamaServer {
             $logPath = Join-Path $script:LogDir ('server_{0}_{1}.log' -f $stamp, $safe)
         } catch { $logPath = '' }
 
-        $serverArgs = Build-ServerArgs $Cfg $logPath
-        Show-StartSummary $Cfg $logPath $serverArgs
+        $script:Research = $null
+        if (Test-ResearchWanted $Cfg) {
+            Clear-Screen
+            Show-Header 'Preparando pesquisa'
+            Write-Host ''
+            Write-Host '  Iniciando o servidor de pesquisa (na primeira vez baixa as dependências; pode demorar)...' -ForegroundColor Gray
+            $script:Research = Start-ResearchServer $logPath ([int]$Cfg.Ctx)
+        }
+        $uiConfigPath = ''
+        if ($script:Research -and $script:Research.Ok) { $uiConfigPath = [string]$script:Research.UiConfig }
+        $serverArgs = Build-ServerArgs $Cfg $logPath $uiConfigPath
+        Show-StartSummary $Cfg $logPath $serverArgs $script:Research
 
         $serverUrl = ('http://127.0.0.1:{0}' -f [int]$Cfg.Port)
         $owuiUrl = 'http://localhost:8080'
@@ -2589,6 +3582,8 @@ function Start-LlamaServer {
             Stop-EscWatcher $esc
             Stop-LoadProgress $progress
             Enable-Mouse
+            Stop-ResearchServer $script:Research
+            $script:Research = $null
         }
 
         if ($browserJob) {
@@ -2746,6 +3741,7 @@ try {
         }
     }
 } finally {
+    Stop-ResearchServer $script:Research
     Disable-Mouse
     try { [Console]::CursorVisible = $true } catch { }
     try { $Host.UI.RawUI.WindowTitle = 'Llama Launcher' } catch { }
