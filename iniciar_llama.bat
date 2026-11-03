@@ -2180,10 +2180,32 @@ def load_batch(batch, core, wants, early):
     return got
 
 
+def as_list(v):
+    if v is None:
+        return []
+    if isinstance(v, str):
+        s = v.strip()
+        if s.startswith("["):
+            try:
+                v = json.loads(s)
+            except Exception:
+                v = re.split(r"[,\n]", s.strip("[]"))
+        else:
+            v = re.split(r"[,\n]", s)
+    if not isinstance(v, (list, tuple)):
+        v = [v]
+    return [str(x).strip().strip("\"'") for x in v if str(x).strip()]
+
+
 def tool_web_search(args):
-    query = str(args.get("query", "")).strip()
+    args = dict(args)
+    query = str(args.get("query") or args.get("q") or "").strip()
+    extra = as_list(args.get("queries")) + as_list(args.get("urls")) + as_list(args.get("url"))
+    if not query and extra:
+        query, extra = extra[0], extra[1:]
     if not query:
-        raise ValueError("query is required")
+        raise ValueError("pass query (string) or queries (list of strings)")
+    args["queries"] = extra
     deep = str(args.get("depth", "")).lower() == "deep"
     n = clamp(args.get("sources"), 1, 10, 10 if deep else 6)
     budget = clamp(args.get("max_chars"), 1500, hard_budget(), default_budget())
@@ -2435,12 +2457,12 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Main thing to find out"},
-                "queries": {"type": "array", "items": {"type": "string"}, "description": "Up to 3 extra, different search angles (optional)"},
+                "queries": {"type": "array", "items": {"type": "string"}, "description": "Different search angles or URLs, up to 4. Can be used instead of query"},
                 "depth": {"type": "string", "enum": ["quick", "deep"], "description": "quick (default): short answer from the best excerpts of the most promising pages, reading more only if needed; deep: full text of up to 10 pages"},
                 "sources": {"type": "integer", "description": "Maximum number of pages to read, 1 to 10"},
                 "max_chars": {"type": "integer", "description": "Maximum characters of page text to return (quick is capped at about 4000 unless you set this; deep is sized to the context window)"},
             },
-            "required": ["query"],
+            "required": [],
         },
     },
 ]
