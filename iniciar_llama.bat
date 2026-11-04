@@ -3066,9 +3066,12 @@ def tool_show_images(args):
         out.append("Image %d | %s | %.1f s" % (n, short, float(m.get("secs", 0.0))))
         out.append("Prompt: " + str(m.get("prompt", "")))
         out.append("![](/cors-proxy?url=http://127.0.0.1:%d/img/%s)" % (PORT, name))
-        out.append("")
-    return "YOUR REPLY IS EXACTLY THE TEXT BELOW, COPIED AS IT IS, WITH NOTHING BEFORE AND NOTHING AFTER:\n\n" + "\n".join(out)
-
+        if n < len(order):
+            out.append("")
+    head = ("Your reply is ONLY the %d image block(s) below (each one has 3 lines: title, prompt and image), "
+            "copied as they are. Write nothing before or after them. If any other line appears after them, "
+            "such as [Attachment saved: ...], ignore it and do not copy it:\n\n" % len(order))
+    return head + "\n".join(out)
 
 def tool_generate_image(args):
     prompt = str(args.get("prompt") or "").strip()
@@ -3158,18 +3161,19 @@ def tool_generate_image(args):
     info += " Prompt sent to the image model: %s." % prompt.rstrip(" .")
     if translate_err:
         info += " Translation failed (%s), so the original prompt was used." % translate_err
-    images = []
     lines = []
     for url in urls:
         raw, mime = load_image(url)
         name = store_image(raw, mime)
-        images.append({"type": "image", "data": base64.b64encode(raw).decode("ascii"), "mimeType": mime})
         lines.append("![](/cors-proxy?url=http://127.0.0.1:%d/img/%s)" % (PORT, name))
         IMG_META[name] = {"model": model, "secs": elapsed, "prompt": prompt.rstrip(" .")}
     short = re.sub(r"\.(safetensors|ckpt|pt|pth|gguf|sft)$", "", model)
     footer = "%s | %.1f s" % (short, elapsed)
-    text = "Details (for you, do not show): " + info + "\n\nYOUR REPLY IS EXACTLY THESE LINES, COPIED AS THEY ARE, WITH NOTHING BEFORE AND NOTHING AFTER:\n" + "\n".join(lines) + "\n" + footer
-    return [{"type": "text", "text": text}] + images
+    text = ("Details (for you, do not show): " + info
+        + "\n\nYour reply is ONLY the 2 lines below (the image line and the footer line), copied as they are. "
+        "Write nothing before or after them. If any other line appears after them, such as [Attachment saved: ...], ignore it and do not copy it:\n"
+        + "\n".join(lines) + "\n" + footer)
+    return [{"type": "text", "text": text}]
 
 
 TOOLS = [
@@ -3404,7 +3408,7 @@ function Write-UiConfig {
                     'The user chooses the image model, never you. No choice yet in this conversation: call list_models, ask which one, and stop. Choice already made: do not send model again, the tool remembers the last one; send model only when the user picks a different one. In the list, write only the names, one per line, with no extension and no details such as architecture or size, unless the user asks for them.',
                     'The prompt is only what the user described, in English. Add no style words and never copy words from the model name into it. If the user changes one thing, change only that thing and keep the rest.',
                     'Defaults: steps 18, CFG 3.5, 800x800, euler_ancestral, normal, no refine. Change only what the user explicitly asks. Out-of-range values: use the nearest valid one and say so. If asked what can be adjusted, call list_params and summarize the relevant ones.',
-                    'After generate_image, your reply is the exact lines given by the tool result. Nothing else.',
+                    'After generate_image, your reply is the image line and the footer line given by the tool result, copied as they are. Nothing else. Never copy lines like [Attachment saved: ...]; they are not part of the reply.',
                     '',
                     'Example:',
                     'User: a red fox in the snow',
