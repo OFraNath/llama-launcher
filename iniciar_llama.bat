@@ -2672,9 +2672,11 @@ LLAMA_PORT = int(sys.argv[5]) if len(sys.argv) > 5 else 0
 IMAGE_DIR = (sys.argv[6] if len(sys.argv) > 6 else "").strip()
 
 IMG_MAX = 40
+DEFAULT_NEGATIVE = "(worst quality, low quality, normal quality:1.3), lowres, jpeg artifacts, blurry, (bad anatomy, bad proportions:1.2), extra limbs, missing limbs, fused fingers, (bad hands:1.3), extra fingers, fewer fingers, missing fingers, mutated hands, (bad feet, extra digits:1.1), (asymmetrical eyes:1.2), cross-eyed, mismatched pupils, empty eyes, (asymmetrical face:1.2), deformed face, distorted mouth, (messy hair, hair through clothes:1.1), floating hair strands, (cluttered clothing, excessive frills, over-detailed outfit:1.3), asymmetrical clothing, ribbons everywhere, random straps, fabric errors, wrinkled fabric artifacts, cropped, out of frame, worst crop, text, signature, watermark, logo, artist name, username"
 IMG_STORE = {}
 IMG_ORDER = []
 IMG_META = {}
+CURRENT_MODEL = {"name": ""}
 IMG_LOCK = threading.Lock()
 IMG_NAME_RE = re.compile(r"^[A-Za-z0-9]{8,64}\.(png|jpg|webp|gif)$")
 IMG_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif"}
@@ -3074,9 +3076,12 @@ def tool_generate_image(args):
     if not prompt:
         raise ValueError("prompt is required")
     if not model:
-        raise ValueError("model is required. Call list_models and ask the user which image model to use")
+        model = CURRENT_MODEL["name"]
+    if not model:
+        raise ValueError("No image model chosen yet. Call list_models and ask the user which image model to use")
     interrupt_all()
     model = resolve_model(model)
+    CURRENT_MODEL["name"] = model
     prompt, translate_err = translate_prompt(prompt)
     warnings = []
     width = _number(args, "width", DEFAULTS["width"], 64, 2048, True, warnings)
@@ -3102,6 +3107,8 @@ def tool_generate_image(args):
         negative = args.get("negative_prompt")
     if negative is not None and str(negative).strip():
         req["negativeprompt"] = str(negative).strip()
+    else:
+        req["negativeprompt"] = DEFAULT_NEGATIVE
     seed = args.get("seed")
     if seed is not None and str(seed).strip() != "":
         try:
@@ -3190,13 +3197,13 @@ TOOLS = [
     },
     {
         "name": "generate_image",
-        "description": "Generate one image from an English prompt. Call it directly, with no text before it. The model is required and the user chooses it. The result contains the exact reply to send.",
+        "description": "Generate one image from an English prompt. Call it directly, with no text before it. The user chooses the image model: send model only when the user picks one (the first time or a change), otherwise omit it and the last used model is reused. The result contains the exact reply to send.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "prompt": {"type": "string", "description": "Positive prompt in English: what the user described, without inventing elements, style, quality tags or negative prompt."},
-                "model": {"type": "string", "description": "Full image model name exactly as the user chose it. Never choose it yourself."},
-                "negative_prompt": {"type": "string", "description": "Negative prompt. Omit unless the user asks for one."},
+                "model": {"type": "string", "description": "Full image model name exactly as the user chose it. Send it only the first time or when the user picks a different one; if omitted, the last used model is reused. Never choose it yourself."},
+                "negative_prompt": {"type": "string", "description": "Negative prompt. A good default is already applied. Omit unless the user asks for a specific one, which then replaces the default."},
                 "steps": {"type": "integer", "description": "Sampling steps (default 18, 1 to 150)."},
                 "cfgscale": {"type": "number", "description": "CFG scale (default 3.5, 0 to 30)."},
                 "width": {"type": "integer", "description": "Image width in pixels (default 800, 64 to 2048, multiple of 8)."},
@@ -3210,7 +3217,7 @@ TOOLS = [
                 "refinerupscalemethod": {"type": "string", "description": "Refiner upscale method id (default pixel-lanczos). Omit unless asked; values come from list_params."},
                 "refinerdotiling": {"type": "boolean", "description": "Whether the refiner should use tiling. Omit unless asked."},
             },
-            "required": ["prompt", "model"],
+            "required": ["prompt"],
         },
     },
 ]
@@ -3394,7 +3401,7 @@ function Write-UiConfig {
         $imageLines = @(
                     'IMAGES (tools list_models, list_params, generate_image, show_images)',
                     'Call generate_image only when the user clearly asks for an image, and call it right away, with no text before it.',
-                    'The user chooses the image model, never you. No choice yet in this conversation: call list_models, ask which one, and stop. Choice already made: reuse it. In the list, write only the names, one per line, with no extension and no details such as architecture or size, unless the user asks for them.',
+                    'The user chooses the image model, never you. No choice yet in this conversation: call list_models, ask which one, and stop. Choice already made: do not send model again, the tool remembers the last one; send model only when the user picks a different one. In the list, write only the names, one per line, with no extension and no details such as architecture or size, unless the user asks for them.',
                     'The prompt is only what the user described, in English. Add no style words and never copy words from the model name into it. If the user changes one thing, change only that thing and keep the rest.',
                     'Defaults: steps 18, CFG 3.5, 800x800, euler_ancestral, normal, no refine. Change only what the user explicitly asks. Out-of-range values: use the nearest valid one and say so. If asked what can be adjusted, call list_params and summarize the relevant ones.',
                     'After generate_image, your reply is the exact lines given by the tool result. Nothing else.',
@@ -3410,9 +3417,13 @@ function Write-UiConfig {
                     ('![](/cors-proxy?url=' + $imgUrl + 'EXAMPLE1.png)'),
                     'modelB | 11.5 s',
                     'User: another one',
-                    '(you call generate_image again: same model, same prompt, no questions)',
+                    '(you call generate_image again: same prompt, no model, no questions)',
                     ('![](/cors-proxy?url=' + $imgUrl + 'EXAMPLE2.png)'),
                     'modelB | 12.0 s',
+                    'User: now with modelA',
+                    '(you call generate_image with model modelA and the same prompt)',
+                    ('![](/cors-proxy?url=' + $imgUrl + 'EXAMPLE3.png)'),
+                    'modelA | 9.8 s',
                     'User: show me all the images with their prompts',
                     '(you call show_images and reply with exactly the text it returns)'
                 )
