@@ -2674,6 +2674,7 @@ IMAGE_DIR = (sys.argv[6] if len(sys.argv) > 6 else "").strip()
 IMG_MAX = 40
 IMG_STORE = {}
 IMG_ORDER = []
+IMG_META = {}
 IMG_LOCK = threading.Lock()
 IMG_NAME_RE = re.compile(r"^[A-Za-z0-9]{8,64}\.(png|jpg|webp|gif)$")
 IMG_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif"}
@@ -2727,6 +2728,7 @@ def new_session():
 
 
 def tool_list_models(args):
+    want_details = bool((args or {}).get("details"))
     sid = new_session()
     obj = swarm_call("/API/ListModels", {
         "session_id": sid,
@@ -2738,13 +2740,16 @@ def tool_list_models(args):
         "dataImages": False,
     }, timeout=180)
     files = obj.get("files") or []
-    lines = ["Stable-Diffusion checkpoints available in SwarmUI. Show these names to the user and ask which one to use. Do not call generate_image until the user answers:"]
+    lines = ["Image models:"]
     count = 0
     for item in files:
         name = str(item.get("name") or "").strip()
         if not name:
             continue
         count += 1
+        if not want_details:
+            lines.append("- " + re.sub(r"\.(safetensors|ckpt|pt|pth|gguf|sft)$", "", name.replace("\\", "/").rsplit("/", 1)[-1]))
+            continue
         bits = []
         title = str(item.get("title") or "").strip()
         if title and title != name:
@@ -2760,7 +2765,12 @@ def tool_list_models(args):
         suffix = ("  (" + ", ".join(bits) + ")") if bits else ""
         lines.append("- " + name + suffix)
     if count == 0:
-        return "No Stable-Diffusion checkpoints were found in SwarmUI. Add one in the SwarmUI Models tab first."
+        return "No image models were found in SwarmUI. Add one in the SwarmUI Models tab first."
+    lines.append("")
+    if want_details:
+        lines.append("NOW: answer what the user asked about these image models, then ask which one to use, and stop. Do not call generate_image in this turn.")
+    else:
+        lines.append("NOW: ask the user which image model to use (in the language of the user), listing ONLY the names above, one per line, with no extra details, and stop. Wait for the answer. Do not call generate_image in this turn.")
     return "\n".join(lines)
 
 
@@ -2897,7 +2907,7 @@ def resolve_model(name):
     close = difflib.get_close_matches(target, list(norm.keys()), n=2, cutoff=0.8)
     if len(close) == 1 or (len(close) == 2 and norm[close[0]] == norm[close[1]]):
         return norm[close[0]]
-    raise ValueError("Model not found: %s. Available checkpoints: %s. Ask the user which one to use, then call generate_image again with the exact name." % (name, "; ".join(names[:40])))
+    raise ValueError("Model not found: %s. Available image models: %s. Ask the user which one to use, then call generate_image again with the exact name." % (name, "; ".join(names[:40])))
 
 
 def _number(args, key, default, low, high, integer=False, warnings=None):
@@ -2962,7 +2972,9 @@ def store_image(raw, mime):
         IMG_STORE[name] = raw
         IMG_ORDER.append(name)
         while len(IMG_ORDER) > IMG_MAX:
-            IMG_STORE.pop(IMG_ORDER.pop(0), None)
+            old = IMG_ORDER.pop(0)
+            IMG_STORE.pop(old, None)
+            IMG_META.pop(old, None)
     if IMAGE_DIR:
         try:
             os.makedirs(IMAGE_DIR, exist_ok=True)
@@ -3039,13 +3051,30 @@ def interrupt_all():
         sys.stderr.flush()
 
 
+def tool_show_images(args):
+    with IMG_LOCK:
+        order = list(IMG_ORDER)
+        meta = dict(IMG_META)
+    if not order:
+        return "No images were generated in this session yet. Tell the user that."
+    out = []
+    for n, name in enumerate(order, 1):
+        m = meta.get(name) or {}
+        short = re.sub(r"\.(safetensors|ckpt|pt|pth|gguf|sft)$", "", str(m.get("model", "")))
+        out.append("Image %d | %s | %.1f s" % (n, short, float(m.get("secs", 0.0))))
+        out.append("Prompt: " + str(m.get("prompt", "")))
+        out.append("![](/cors-proxy?url=http://127.0.0.1:%d/img/%s)" % (PORT, name))
+        out.append("")
+    return "YOUR REPLY IS EXACTLY THE TEXT BELOW, COPIED AS IT IS, WITH NOTHING BEFORE AND NOTHING AFTER:\n\n" + "\n".join(out)
+
+
 def tool_generate_image(args):
     prompt = str(args.get("prompt") or "").strip()
     model = str(args.get("model") or "").strip()
     if not prompt:
         raise ValueError("prompt is required")
     if not model:
-        raise ValueError("model is required. Call list_models and ask the user which checkpoint to use")
+        raise ValueError("model is required. Call list_models and ask the user which image model to use")
     interrupt_all()
     model = resolve_model(model)
     prompt, translate_err = translate_prompt(prompt)
@@ -3129,15 +3158,18 @@ def tool_generate_image(args):
         name = store_image(raw, mime)
         images.append({"type": "image", "data": base64.b64encode(raw).decode("ascii"), "mimeType": mime})
         lines.append("![](/cors-proxy?url=http://127.0.0.1:%d/img/%s)" % (PORT, name))
-    text = info + "\n\nImage line (copy it exactly as the first line of your reply):\n" + "\n".join(lines)
+        IMG_META[name] = {"model": model, "secs": elapsed, "prompt": prompt.rstrip(" .")}
+    short = re.sub(r"\.(safetensors|ckpt|pt|pth|gguf|sft)$", "", model)
+    footer = "%s | %.1f s" % (short, elapsed)
+    text = "Details (for you, do not show): " + info + "\n\nYOUR REPLY IS EXACTLY THESE LINES, COPIED AS THEY ARE, WITH NOTHING BEFORE AND NOTHING AFTER:\n" + "\n".join(lines) + "\n" + footer
     return [{"type": "text", "text": text}] + images
 
 
 TOOLS = [
     {
         "name": "list_models",
-        "description": "List the Stable-Diffusion checkpoint models available in SwarmUI. Call this before generating whenever the user has not already chosen a model, then ask the user which one to use and show the full names.",
-        "inputSchema": {"type": "object", "properties": {}, "required": []},
+        "description": "List the image model names available in SwarmUI. Use it when the user has not chosen an image model yet in this conversation. Names only; set details=true only if the user asks for technical details.",
+        "inputSchema": {"type": "object", "properties": {"details": {"type": "boolean", "description": "Include architecture, resolution and loaded state. Only when the user asks for details."}}, "required": []},
     },
     {
         "name": "list_params",
@@ -3152,13 +3184,18 @@ TOOLS = [
         },
     },
     {
+        "name": "show_images",
+        "description": "Show again ALL the images generated in this session, each with its model, time and prompt. Use it when the user asks for all the images, the earlier images or the prompts used.",
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
         "name": "generate_image",
-        "description": "Generate one image with SwarmUI from a text prompt. The prompt must be in english. Call this tool directly; never announce it in text first. The model is required. Defaults: steps 18, CFG 3.5, 800x800, sampler euler_ancestral, scheduler normal, refine off. Only change a default when the user explicitly asks. The result contains an image line (a markdown line that starts with an exclamation mark followed by empty square brackets) that displays the image in the chat. After the call, start your reply with that line copied exactly, character by character, without changing it, translating it or wrapping it in a code block; then, on a new line, write one short sentence in the same language as the user last message (this tool result is in English, but your reply must not be), saying which model was used and how long the generation took, with no other file names, paths or URLs and no description of where the image is.",
+        "description": "Generate one image from an English prompt. Call it directly, with no text before it. The model is required and the user chooses it. The result contains the exact reply to send.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "prompt": {"type": "string", "description": "Positive prompt in English: what the user described, without inventing elements, style, quality tags or negative prompt."},
-                "model": {"type": "string", "description": "Full checkpoint name exactly as the user chose it. Never choose it yourself."},
+                "model": {"type": "string", "description": "Full image model name exactly as the user chose it. Never choose it yourself."},
                 "negative_prompt": {"type": "string", "description": "Negative prompt. Omit unless the user asks for one."},
                 "steps": {"type": "integer", "description": "Sampling steps (default 18, 1 to 150)."},
                 "cfgscale": {"type": "number", "description": "CFG scale (default 3.5, 0 to 30)."},
@@ -3178,7 +3215,7 @@ TOOLS = [
     },
 ]
 
-HANDLERS = {"list_models": tool_list_models, "list_params": tool_list_params, "generate_image": tool_generate_image}
+HANDLERS = {"list_models": tool_list_models, "list_params": tool_list_params, "generate_image": tool_generate_image, "show_images": tool_show_images}
 
 
 def rpc_error(rid, code, message):
@@ -3333,12 +3370,53 @@ function Write-UiConfig {
 
     $parts = @()
     if ($ResearchPort -gt 0) {
-        $parts += ('Current date: {0}. Your training data is older than this date, so your memory is outdated and may be wrong. If the user asks you to search something, always do it. Unless the answer is extremely obvious (greetings, simple math, code you can write directly, creative writing), call web_search before answering and never answer factual questions from memory. If the user gives a domain or URL, use web_search or fetch_url with it. For broad requests, give web_search several different angles in queries, or use depth=deep. Answer only from the results. When your answer is based on web_search or fetch_url results, add at the end a line Sources: (translated to the language of the user) followed by a bullet list with only the URLs you actually used, like: - https://example.com. Never list a source you did not use, and never add a Sources line when you did not search or read pages (for example after generating an image). If the results do not answer the question, do not give up yet: try depth=deep, and use fetch_url on a page the results mention but did not include in full. After two or three failed tries, say plainly what you found and what you could not find. Never tell the user to search by themselves. Reply in the user language.' -f $date)
+        $researchLines = @(
+            'Current date: {0}. Your training data is older than this date, so your memory may be outdated.',
+            'For facts, news, people, products or anything you are unsure about, call web_search BEFORE answering. No search for greetings, simple math, code or creative writing. If the user gives a URL or domain, use fetch_url or web_search with it.',
+            'If the results do not answer, try depth=deep or fetch_url on a promising page. After 2 or 3 tries, say what you found and what you could not find. Never tell the user to search by themselves.',
+            'Answer only from the results, in the language of the user, and end with the sources you really used. Example:',
+            '',
+            'User: who won the 2022 World Cup?',
+            '(you call web_search)',
+            'Argentina won the 2022 World Cup, beating France on penalties.',
+            '',
+            'Sources:',
+            '- https://example.com/world-cup-final',
+            '',
+            'Write the word Sources in the language of the user. No Sources line when you did not search (for example after generating an image).'
+        )
+        $parts += (($researchLines -join "`n") -f $date)
     } else {
         $parts += ('Current date: {0}. Your training data is older than this date, so your memory is outdated and may be wrong.' -f $date)
     }
     if ($ImagePort -gt 0) {
-        $parts += ('Image generation (MCP tools list_models, list_params and generate_image). Call generate_image only when the user clearly wants to obtain an image, never for a casual mention, and when you call it never announce it first: call it right away with no text before it. The model is required and only the user chooses it, so never pick one yourself: if the user has not chosen a model in this conversation (or asked you not to ask again), call list_models, show the full names, ask which one to use and end that turn without calling generate_image; when the user answers, your very next action is the generate_image call with the chosen full model name and the original request. Defaults are steps 18, CFG 3.5, 800x800, sampler euler_ancestral, scheduler normal and refine off; change only what the user explicitly asks for, and enable refine only when the user asks to refine or upscale, since the refiner controls only work with it. If the user asks what can be adjusted, call list_params and present only the relevant parameters (steps, CFG, resolution, sampler, scheduler, refine and its controls) with a short explanation and the current default, without dumping the whole list unless the user asks for it. If the user asks for a value outside the valid range, adjust it to the nearest valid limit and tell the user. Never offer to change donotsave, donotsaveintermediates, refinermethod or the refiner model, because the server fixes them (if asked, explain them briefly). After generate_image returns, start your reply with the image line from the result (the markdown line that starts with an exclamation mark followed by empty square brackets), copied exactly, character by character, without changing it, translating it or wrapping it in a code block; then, on a new line, write one short sentence in the same language as the user last message (the tool result is in English, but your reply must not be), saying which model was used and how long the generation took, with no Sources line and no other file names, paths or URLs. To repeat a previous image (for example the same image with refine on), call generate_image again with the seed reported in that image result and the same prompt, model, size, steps, CFG, sampler and scheduler. Reply in the user language.')
+        $imgUrl = 'http://127.0.0.1:' + [string]$ImagePort + '/img/'
+        $imageLines = @(
+                    'IMAGES (tools list_models, list_params, generate_image, show_images)',
+                    'Call generate_image only when the user clearly asks for an image, and call it right away, with no text before it.',
+                    'The user chooses the image model, never you. No choice yet in this conversation: call list_models, ask which one, and stop. Choice already made: reuse it. In the list, write only the names, one per line, with no extension and no details such as architecture or size, unless the user asks for them.',
+                    'The prompt is only what the user described, in English. Add no style words and never copy words from the model name into it. If the user changes one thing, change only that thing and keep the rest.',
+                    'Defaults: steps 18, CFG 3.5, 800x800, euler_ancestral, normal, no refine. Change only what the user explicitly asks. Out-of-range values: use the nearest valid one and say so. If asked what can be adjusted, call list_params and summarize the relevant ones.',
+                    'After generate_image, your reply is the exact lines given by the tool result. Nothing else.',
+                    '',
+                    'Example:',
+                    'User: a red fox in the snow',
+                    '(you call list_models)',
+                    'Which image model do you want?',
+                    '- modelA',
+                    '- modelB',
+                    'User: modelB',
+                    '(you call generate_image with model modelB and prompt "a red fox in the snow")',
+                    ('![](/cors-proxy?url=' + $imgUrl + 'EXAMPLE1.png)'),
+                    'modelB | 11.5 s',
+                    'User: another one',
+                    '(you call generate_image again: same model, same prompt, no questions)',
+                    ('![](/cors-proxy?url=' + $imgUrl + 'EXAMPLE2.png)'),
+                    'modelB | 12.0 s',
+                    'User: show me all the images with their prompts',
+                    '(you call show_images and reply with exactly the text it returns)'
+                )
+        $parts += ($imageLines -join "`n")
     }
 
     $serversJson = ConvertTo-Json -InputObject @($servers) -Compress
