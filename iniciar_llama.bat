@@ -84,7 +84,6 @@ function Clear-Screen {
     try { [Console]::Clear() } catch { Clear-Host }
 }
 
-# Registra a linha atual da tela como clicável (Id = índice do item)
 function Register-Hit {
     param([int]$Id)
     try { $script:Hit[[int][Console]::CursorTop] = $Id } catch { }
@@ -154,8 +153,7 @@ function Write-Footer {
 }
 
 # ---------------------------------------------------------------------------
-# Mouse (Win32 console input). Clique esquerdo = Enter, direito = voltar/<-,
-# roda = cima/baixo. Se falhar, o launcher continua só com teclado.
+# Mouse (Win32 console input)
 # ---------------------------------------------------------------------------
 function Initialize-Mouse {
     $src = @'
@@ -456,7 +454,7 @@ function Get-ServerAccessUrl {
 }
 
 # ---------------------------------------------------------------------------
-# GGUF metadata reader (fast: stops before the tokenizer arrays)
+# GGUF metadata reader
 # ---------------------------------------------------------------------------
 function Read-GGUFString {
     param($Reader)
@@ -572,7 +570,7 @@ function Read-GGUF-Meta {
         if ($magic -ne 'GGUF') { throw 'Arquivo não é GGUF.' }
         $ver = $br.ReadUInt32()
         if ($ver -lt 1 -or $ver -gt 4) { throw "Versão GGUF não suportada: $ver" }
-        [void]$br.ReadUInt64()  # tensor count
+        [void]$br.ReadUInt64()
         $kvCount = [int64]$br.ReadUInt64()
 
         $arch = ''
@@ -2242,7 +2240,6 @@ def doc_confident(d, core, wants):
 
 
 def meta_hit(d, core):
-    # page is about the query if its domain holds a query term, or its title/description cover half of them
     if not core or not d["text"]:
         return False
     host = set(norm_tokens(bare_host(urlsplit(d["url"]).hostname)))
@@ -2720,6 +2717,15 @@ PARENT_PID = int(sys.argv[2]) if len(sys.argv) > 2 else 0
 SWARM = (sys.argv[3] if len(sys.argv) > 3 else "http://127.0.0.1:7801").rstrip("/")
 SWARM_PID = int(sys.argv[4]) if len(sys.argv) > 4 else 0
 LLAMA_PORT = int(sys.argv[5]) if len(sys.argv) > 5 else 0
+IMAGE_DIR = (sys.argv[6] if len(sys.argv) > 6 else "").strip()
+
+IMG_MAX = 40
+IMG_STORE = {}
+IMG_ORDER = []
+IMG_LOCK = threading.Lock()
+IMG_NAME_RE = re.compile(r"^[A-Za-z0-9]{8,64}\.(png|jpg|webp|gif)$")
+IMG_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif"}
+IMG_MIME = {"png": "image/png", "jpg": "image/jpeg", "webp": "image/webp", "gif": "image/gif"}
 
 DEFAULTS = {
     "steps": 18,
@@ -2997,6 +3003,39 @@ def load_image(url):
     return data, ctype
 
 
+def store_image(raw, mime):
+    ext = IMG_EXT.get(str(mime).lower()) or IMG_EXT.get(sniff_type(raw), "png")
+    name = os.urandom(8).hex() + "." + ext
+    with IMG_LOCK:
+        IMG_STORE[name] = raw
+        IMG_ORDER.append(name)
+        while len(IMG_ORDER) > IMG_MAX:
+            IMG_STORE.pop(IMG_ORDER.pop(0), None)
+    if IMAGE_DIR:
+        try:
+            os.makedirs(IMAGE_DIR, exist_ok=True)
+            with open(os.path.join(IMAGE_DIR, name), "wb") as fh:
+                fh.write(raw)
+        except Exception as e:
+            sys.stderr.write("could not save image to disk: %s\n" % e)
+            sys.stderr.flush()
+    return name
+
+
+def get_stored_image(name):
+    if not IMG_NAME_RE.match(name):
+        return None
+    with IMG_LOCK:
+        raw = IMG_STORE.get(name)
+    if raw is None and IMAGE_DIR:
+        try:
+            with open(os.path.join(IMAGE_DIR, name), "rb") as fh:
+                raw = fh.read()
+        except Exception:
+            raw = None
+    return raw
+
+
 TRANSLATE_SYSTEM = (
     "You are a literal translator. Translate the user's text into English. "
     "Keep exactly the same meaning and level of detail: do not add, remove, interpret or embellish anything. "
@@ -3137,11 +3176,15 @@ def tool_generate_image(args):
     info += " Prompt sent to the image model: %s." % prompt.rstrip(" .")
     if translate_err:
         info += " Translation failed (%s), so the original prompt was used." % translate_err
-    contents = [{"type": "text", "text": info}]
+    images = []
+    lines = []
     for url in urls:
         raw, mime = load_image(url)
-        contents.append({"type": "image", "data": base64.b64encode(raw).decode("ascii"), "mimeType": mime})
-    return contents
+        name = store_image(raw, mime)
+        images.append({"type": "image", "data": base64.b64encode(raw).decode("ascii"), "mimeType": mime})
+        lines.append("![](/cors-proxy?url=http://127.0.0.1:%d/img/%s)" % (PORT, name))
+    text = info + "\n\nImage line (copy it exactly as the first line of your reply):\n" + "\n".join(lines)
+    return [{"type": "text", "text": text}] + images
 
 
 TOOLS = [
@@ -3164,7 +3207,7 @@ TOOLS = [
     },
     {
         "name": "generate_image",
-        "description": "Generate one image with SwarmUI from a text prompt. The prompt must be in english. Call this tool directly; never announce it in text first. The model is required. Defaults: steps 18, CFG 3.5, 800x800, sampler euler_ancestral, scheduler normal, refine off. Only change a default when the user explicitly asks. The image is displayed to the user automatically. After the call, reply with one short sentence written in the same language as the user last message (this tool result is in English, but your reply must not be), saying which model was used and how long the generation took, without attachment names, file names, paths, URLs, markdown image syntax or any description of where the image is.",
+        "description": "Generate one image with SwarmUI from a text prompt. The prompt must be in english. Call this tool directly; never announce it in text first. The model is required. Defaults: steps 18, CFG 3.5, 800x800, sampler euler_ancestral, scheduler normal, refine off. Only change a default when the user explicitly asks. The result contains an image line (a markdown line that starts with an exclamation mark followed by empty square brackets) that displays the image in the chat. After the call, start your reply with that line copied exactly, character by character, without changing it, translating it or wrapping it in a code block; then, on a new line, write one short sentence in the same language as the user last message (this tool result is in English, but your reply must not be), saying which model was used and how long the generation took, with no other file names, paths or URLs and no description of where the image is.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -3256,8 +3299,23 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if not self.host_ok():
             return self.send_body(403)
-        if self.path == "/health":
+        route = self.path.split("?")[0]
+        if route == "/health":
             return self.send_body(200, b"ok", "text/plain")
+        if route.startswith("/img/"):
+            name = route[5:]
+            raw = get_stored_image(name)
+            if raw is None:
+                return self.send_body(404, b"not found", "text/plain")
+            ctype = IMG_MIME.get(name.rsplit(".", 1)[-1], "application/octet-stream")
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(raw)
+            return
         self.send_response(405)
         self.send_header("Allow", "POST")
         self.send_header("Content-Length", "0")
@@ -3334,7 +3392,7 @@ function Write-UiConfig {
         $parts += ('Current date: {0}. Your training data is older than this date, so your memory is outdated and may be wrong.' -f $date)
     }
     if ($ImagePort -gt 0) {
-        $parts += ('Image generation (MCP tools list_models, list_params and generate_image). Call generate_image only when the user clearly wants to obtain an image, never for a casual mention, and when you call it never announce it first: call it right away with no text before it. The model is required and only the user chooses it, so never pick one yourself: if the user has not chosen a model in this conversation (or asked you not to ask again), call list_models, show the full names, ask which one to use and end that turn without calling generate_image; when the user answers, your very next action is the generate_image call with the chosen full model name and the original request. Defaults are steps 18, CFG 3.5, 800x800, sampler euler_ancestral, scheduler normal and refine off; change only what the user explicitly asks for, and enable refine only when the user asks to refine or upscale, since the refiner controls only work with it. If the user asks what can be adjusted, call list_params and present only the relevant parameters (steps, CFG, resolution, sampler, scheduler, refine and its controls) with a short explanation and the current default, without dumping the whole list unless the user asks for it. If the user asks for a value outside the valid range, adjust it to the nearest valid limit and tell the user. Never offer to change donotsave, donotsaveintermediates, refinermethod or the refiner model, because the server fixes them (if asked, explain them briefly). After generate_image returns, the image is already displayed: reply with one short sentence written in the same language as the user last message (the tool result is in English, but your reply must not be), saying which model was used and how long the generation took, with no Sources line, attachment names, file names, paths, URLs or markdown image syntax. To repeat a previous image (for example the same image with refine on), call generate_image again with the seed reported in that image result and the same prompt, model, size, steps, CFG, sampler and scheduler. Reply in the user language.')
+        $parts += ('Image generation (MCP tools list_models, list_params and generate_image). Call generate_image only when the user clearly wants to obtain an image, never for a casual mention, and when you call it never announce it first: call it right away with no text before it. The model is required and only the user chooses it, so never pick one yourself: if the user has not chosen a model in this conversation (or asked you not to ask again), call list_models, show the full names, ask which one to use and end that turn without calling generate_image; when the user answers, your very next action is the generate_image call with the chosen full model name and the original request. Defaults are steps 18, CFG 3.5, 800x800, sampler euler_ancestral, scheduler normal and refine off; change only what the user explicitly asks for, and enable refine only when the user asks to refine or upscale, since the refiner controls only work with it. If the user asks what can be adjusted, call list_params and present only the relevant parameters (steps, CFG, resolution, sampler, scheduler, refine and its controls) with a short explanation and the current default, without dumping the whole list unless the user asks for it. If the user asks for a value outside the valid range, adjust it to the nearest valid limit and tell the user. Never offer to change donotsave, donotsaveintermediates, refinermethod or the refiner model, because the server fixes them (if asked, explain them briefly). After generate_image returns, start your reply with the image line from the result (the markdown line that starts with an exclamation mark followed by empty square brackets), copied exactly, character by character, without changing it, translating it or wrapping it in a code block; then, on a new line, write one short sentence in the same language as the user last message (the tool result is in English, but your reply must not be), saying which model was used and how long the generation took, with no Sources line and no other file names, paths or URLs. To repeat a previous image (for example the same image with refine on), call generate_image again with the seed reported in that image result and the same prompt, model, size, steps, CFG, sampler and scheduler. Reply in the user language.')
     }
 
     $serversJson = ConvertTo-Json -InputObject @($servers) -Compress
@@ -3524,6 +3582,7 @@ function Start-ImageServer {
         return $result
     }
 
+    $imageSaveDir = ''
     $files = New-Object System.Collections.Generic.List[string]
     $pyPath = Join-Path $env:TEMP ('llama_image_{0}.py' -f ([guid]::NewGuid().ToString('N')))
     $outPath = Join-Path $env:TEMP ('llama_image_{0}.out' -f ([guid]::NewGuid().ToString('N')))
@@ -3542,7 +3601,7 @@ function Start-ImageServer {
         [System.IO.File]::WriteAllText($pyPath, ((Get-ImageServerSource) -replace "`r`n", "`n"), $enc)
         $swarmPid = 0
         if ($swarm.Proc) { $swarmPid = [int]$swarm.Proc.Id }
-        $uvArgs = @('run', '--no-project', 'python', ('"' + $pyPath + '"'), [string]$port, [string]$PID, [string]$swarm.Url, [string]$swarmPid, [string]$LlamaPort)
+        $uvArgs = @('run', '--no-project', 'python', ('"' + $pyPath + '"'), [string]$port, [string]$PID, [string]$swarm.Url, [string]$swarmPid, [string]$LlamaPort, ('"' + $imageSaveDir + '"'))
         $proc = Start-Process -FilePath $uv -ArgumentList $uvArgs -WorkingDirectory $env:TEMP -WindowStyle Hidden -PassThru -RedirectStandardOutput $outPath -RedirectStandardError $errPath
         $result.Proc = $proc
         $started = Get-Date
@@ -4292,7 +4351,6 @@ function Start-BrowserJob {
             if (Test-WebReady $OpenWebUiUrl) {
                 Write-BrowserLog 'Open WebUI já estava em execução.'
             } elseif (Get-Command 'uvx' -ErrorAction SilentlyContinue) {
-                # Inicia o Open WebUI direto (equivale ao iniciar_openwebui.bat)
                 try {
                     $env:DATA_DIR = 'C:\OpenWebUI\data'
                     $uvxCmd = 'uvx --python 3.11 open-webui@latest serve --host 0.0.0.0 --port 8080 || pause'
