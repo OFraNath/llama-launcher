@@ -3004,14 +3004,15 @@ def translate_prompt(text):
         "messages": [
             {"role": "user", "content": TRANSLATE_SYSTEM + "\n\nText to translate:\n" + text},
         ],
-        "temperature": 0,
+        "max_tokens": 512,
         "stream": False,
+        "chat_template_kwargs": {"enable_thinking": False, "reasoning_effort": "low"},
     }
     try:
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request("http://127.0.0.1:%d/v1/chat/completions" % LLAMA_PORT, data=data,
                                      headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=10) as resp:
             obj = json.loads(resp.read().decode("utf-8"))
         out = str(obj["choices"][0]["message"]["content"] or "")
         out = re.sub(r"<think>.*?</think>", "", out, flags=re.S)
@@ -3029,6 +3030,15 @@ def translate_prompt(text):
         return text, str(e)[:120]
 
 
+def interrupt_all():
+    try:
+        sid = new_session()
+        swarm_call("/API/InterruptAll", {"session_id": sid, "other_sessions": True}, timeout=15)
+    except Exception as e:
+        sys.stderr.write("interrupt failed: %s\n" % e)
+        sys.stderr.flush()
+
+
 def tool_generate_image(args):
     prompt = str(args.get("prompt") or "").strip()
     model = str(args.get("model") or "").strip()
@@ -3036,6 +3046,7 @@ def tool_generate_image(args):
         raise ValueError("prompt is required")
     if not model:
         raise ValueError("model is required. Call list_models and ask the user which checkpoint to use")
+    interrupt_all()
     model = resolve_model(model)
     prompt, translate_err = translate_prompt(prompt)
     warnings = []
