@@ -1524,85 +1524,6 @@ function Get-LoadFlagStyle {
     return $style
 }
 
-function Get-PresetName {
-    param($Model)
-    $n = ([string]$Model.Display -replace '[\[\]\r\n]', '').Trim()
-    if ([string]::IsNullOrWhiteSpace($n)) { $n = [System.IO.Path]::GetFileNameWithoutExtension([string]$Model.Path) }
-    return $n
-}
-
-function ConvertTo-PresetPath {
-    param([string]$Path)
-    return ($Path -replace '\\', '/')
-}
-
-function Get-PresetLines {
-    param($Cfg, [bool]$LoadOnStartup)
-    $m = $Cfg.Model
-    $l = New-Object System.Collections.Generic.List[string]
-    $l.Add('[' + (Get-PresetName $m) + ']')
-    $l.Add('model = ' + (ConvertTo-PresetPath ([string]$m.Path)))
-    $l.Add('ctx-size = ' + [string]$Cfg.Ctx)
-    if ([int]$Cfg.NPredict -ge 0) { $l.Add('n-predict = ' + [string]$Cfg.NPredict) }
-    $l.Add('cache-type-k = ' + [string]$Cfg.Ctk)
-    $l.Add('cache-type-v = ' + [string]$Cfg.Ctv)
-
-    $quantK = ($Cfg.Ctk -notin @('f16', 'f32', 'bf16'))
-    $quantV = ($Cfg.Ctv -notin @('f16', 'f32', 'bf16'))
-    if ($quantK -or $quantV) { $l.Add('flash-attn = on') } else { $l.Add('flash-attn = auto') }
-
-    if ([string]$Cfg.Template -eq 'chatml') { $l.Add('chat-template = chatml') }
-    if ($Cfg.Threads -match '^\d+$') { $l.Add('threads = ' + [string]$Cfg.Threads) }
-    if ($Cfg.Batch -match '^\d+$') {
-        $l.Add('ubatch-size = ' + [string]$Cfg.Batch)
-        if ([int]$Cfg.Batch -gt 2048) { $l.Add('batch-size = ' + [string]$Cfg.Batch) }
-    }
-    if ($Cfg.CacheRam -eq 'off') {
-        $l.Add('cache-ram = 0')
-    } else {
-        $cr = Get-AutoCacheRamMiB $Cfg
-        if ($cr -ge 0) { $l.Add('cache-ram = ' + [string]$cr) }
-    }
-
-    $l.Add('fit = on')
-    if ($Cfg.Ngl -ne 'auto') { $l.Add('n-gpu-layers = ' + [string]$Cfg.Ngl) }
-
-    if ($Cfg.Vision -ne 'off' -and $m.Mmproj) {
-        $l.Add('mmproj = ' + (ConvertTo-PresetPath ([string]$m.Mmproj.FullName)))
-        if ($Cfg.Vision -eq 'cpu') { $l.Add('no-mmproj-offload = true') }
-    }
-
-    if ($Cfg.Reasoning -ne 'auto' -and $m.Meta.HasThinking) {
-        $l.Add('reasoning = ' + [string]$Cfg.Reasoning)
-    }
-
-    if ($LoadOnStartup) { $l.Add('load-on-startup = true') } else { $l.Add('load-on-startup = false') }
-    $l.Add('')
-    return $l.ToArray()
-}
-
-function Write-ModelPresets {
-    param($Cfg)
-    $path = Join-Path $script:Root 'llama_presets.ini'
-    $lines = New-Object System.Collections.Generic.List[string]
-    $lines.Add('version = 1')
-    $lines.Add('')
-    $selName = Get-PresetName $Cfg.Model
-    $seen = @{}
-    $seen[$selName] = $true
-    foreach ($line in (Get-PresetLines $Cfg $true)) { $lines.Add($line) }
-    foreach ($m in $script:Models) {
-        $n = Get-PresetName $m
-        if ($seen.ContainsKey($n)) { continue }
-        $seen[$n] = $true
-        $other = New-CfgForModel $m $false
-        foreach ($line in (Get-PresetLines $other $false)) { $lines.Add($line) }
-    }
-    $enc = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllText($path, (($lines.ToArray()) -join "`n"), $enc)
-    return $path
-}
-
 function Test-AgentSupported {
     if ($null -ne $script:AgentSupported) { return [bool]$script:AgentSupported }
     $ok = $false
@@ -1622,10 +1543,41 @@ function Test-AgentSupported {
 
 function Build-ServerArgs {
     param($Cfg, [string]$LogPath, [string]$UiConfigPath = '')
+    $m = $Cfg.Model
     $a = New-Object System.Collections.Generic.List[string]
-    $presetPath = Write-ModelPresets $Cfg
-    $a.Add('--models-preset'); $a.Add($presetPath)
-    $a.Add('--models-max'); $a.Add('1')
+    $a.Add('-m'); $a.Add([string]$m.Path)
+    $a.Add('--ctx-size'); $a.Add([string]$Cfg.Ctx)
+    if ([int]$Cfg.NPredict -ge 0) { $a.Add('--n-predict'); $a.Add([string]$Cfg.NPredict) }
+    $a.Add('--cache-type-k'); $a.Add([string]$Cfg.Ctk)
+    $a.Add('--cache-type-v'); $a.Add([string]$Cfg.Ctv)
+
+    $quant = ($Cfg.Ctk -notin @('f16', 'f32', 'bf16')) -or ($Cfg.Ctv -notin @('f16', 'f32', 'bf16'))
+    $a.Add('--flash-attn'); $a.Add($(if ($quant) { 'on' } else { 'auto' }))
+
+    if ([string]$Cfg.Template -eq 'chatml') { $a.Add('--chat-template'); $a.Add('chatml') }
+    if ($Cfg.Threads -match '^\d+$') { $a.Add('--threads'); $a.Add([string]$Cfg.Threads) }
+    if ($Cfg.Batch -match '^\d+$') {
+        $a.Add('--ubatch-size'); $a.Add([string]$Cfg.Batch)
+        if ([int]$Cfg.Batch -gt 2048) { $a.Add('--batch-size'); $a.Add([string]$Cfg.Batch) }
+    }
+    if ($Cfg.CacheRam -eq 'off') {
+        $a.Add('--cache-ram'); $a.Add('0')
+    } else {
+        $cr = Get-AutoCacheRamMiB $Cfg
+        if ($cr -ge 0) { $a.Add('--cache-ram'); $a.Add([string]$cr) }
+    }
+
+    $a.Add('--fit'); $a.Add('on')
+    if ($Cfg.Ngl -ne 'auto') { $a.Add('--n-gpu-layers'); $a.Add([string]$Cfg.Ngl) }
+
+    if ($Cfg.Vision -ne 'off' -and $m.Mmproj) {
+        $a.Add('--mmproj'); $a.Add([string]$m.Mmproj.FullName)
+        if ($Cfg.Vision -eq 'cpu') { $a.Add('--no-mmproj-offload') }
+    }
+    if ($Cfg.Reasoning -ne 'auto' -and $m.Meta.HasThinking) {
+        $a.Add('--reasoning'); $a.Add([string]$Cfg.Reasoning)
+    }
+
     $a.Add('--jinja')
     switch (Get-LoadFlagStyle) {
         'loadmode' { $a.Add('--load-mode'); $a.Add('none') }
@@ -3045,20 +2997,6 @@ TRANSLATE_SYSTEM = (
 )
 
 
-def llama_loaded_model():
-    try:
-        with urllib.request.urlopen("http://127.0.0.1:%d/v1/models" % LLAMA_PORT, timeout=5) as resp:
-            obj = json.loads(resp.read().decode("utf-8"))
-        for item in obj.get("data") or []:
-            st = item.get("status")
-            val = st.get("value") if isinstance(st, dict) else st
-            if str(val).lower() == "loaded" and item.get("id"):
-                return str(item["id"])
-    except Exception:
-        pass
-    return ""
-
-
 def translate_prompt(text):
     if LLAMA_PORT <= 0:
         return text, "llama-server port not provided"
@@ -3069,9 +3007,6 @@ def translate_prompt(text):
         "temperature": 0,
         "stream": False,
     }
-    loaded = llama_loaded_model()
-    if loaded:
-        body["model"] = loaded
     try:
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request("http://127.0.0.1:%d/v1/chat/completions" % LLAMA_PORT, data=data,
@@ -3828,7 +3763,6 @@ function Show-ModelPicker {
         $nameW = [Math]::Max(20, $w - 48)
         $typeW = 13
         $statusW = 17
-        $drawnModels = $false
 
         for ($i = 0; $i -lt $rows.Count; $i++) {
             $row = $rows[$i]
@@ -3844,7 +3778,6 @@ function Show-ModelPicker {
                 $txt = $prefix + '* ' + $label
                 Write-Row $txt $isSel 'Cyan'
                 Write-Host ''
-                Write-Host '  Modelos' -ForegroundColor DarkGray
             } else {
                 $m = $row.Model
                 $type = Get-ModelTypeLabel $m
@@ -3861,11 +3794,9 @@ function Show-ModelPicker {
                 $sta = Fit-Text $status $statusW
                 $txt = $prefix + $name + ' ' + $size + '  ' + $typ + ' ' + $sta
                 Write-Row $txt $isSel $color
-                $drawnModels = $true
             }
         }
 
-        if (-not $script:LastCfg -and $drawnModels) { }
         Write-Host ''
         $footer = '  ↑↓ navegar   Enter abrir   L última   E editar última   R atualizar   Q sair'
         Write-Footer $footer
@@ -4110,50 +4041,45 @@ function Show-Settings {
         elseif ($mi.Level -eq 'dim') { $tag = 'CPU'; $color = 'DarkGray' }
         Write-Host ('  [' + $tag + '] ' + $mi.Text) -ForegroundColor $color
         if ($mi.Level -eq 'bad') {
-            $hint = 'Reduza o contexto/KV ou deixe a GPU no automático (--fit).'
+            $hint = 'Reduza o contexto/KV ou use GPU automática.'
             if ($Cfg.Ngl -eq 'auto') { $hint = 'Reduza o contexto/KV.' }
             Write-Host ('      ' + $hint) -ForegroundColor DarkYellow
         }
         $wGB = $Cfg.Model.Size / 1GB
         if ($wGB -gt ($mi.FreeRam - 2.0)) {
             Write-Host '      Fixar na RAM pode travar o Windows.' -ForegroundColor Yellow
-        } else {
-            Write-Host '      Fixa o modelo na RAM: carga mais lenta, mas sem quedas de velocidade por paginação.' -ForegroundColor DarkGray
         }
         if (-not (Test-PortFree ([int]$Cfg.Port))) {
-            Write-Host ('      Porta {0} em uso: o launcher vai perguntar o que fazer ao iniciar.' -f $Cfg.Port) -ForegroundColor Yellow
+            Write-Host ('      Porta {0} em uso.' -f $Cfg.Port) -ForegroundColor Yellow
         }
         $accessUrl = Get-ServerAccessUrl $Cfg.Host ([int]$Cfg.Port)
         if ($Cfg.Host -eq 'tailscale' -and -not $accessUrl) {
-            Write-Host '      Tailscale não detectado. Instale/ative o Tailscale para usar este modo.' -ForegroundColor Yellow
+            Write-Host '      Tailscale não detectado.' -ForegroundColor Yellow
         } elseif ($accessUrl) {
             Write-Host ('      Acesso: {0}' -f $accessUrl) -ForegroundColor DarkCyan
         }
         if ($Cfg.Host -ne '127.0.0.1') {
-            Write-Host '      Atenção: escuta em todas as interfaces, sem senha. Use apenas em redes confiáveis.' -ForegroundColor Yellow
+            Write-Host '      Rede aberta, sem senha: use só em redes confiáveis.' -ForegroundColor Yellow
         }
         if ($Cfg.Agent -eq 'on') {
             if (Test-AgentSupported) {
-                Write-Host '      Agente: o modelo poderá ler/gravar arquivos e executar comandos neste PC (sem limite de pasta).' -ForegroundColor Yellow
+                Write-Host '      Agente: o modelo poderá ler/gravar arquivos e executar comandos neste PC.' -ForegroundColor Yellow
                 if ($Cfg.Host -ne '127.0.0.1') {
-                    Write-Host '      PERIGO: com a rede aberta, qualquer aparelho que alcance a porta poderá fazer isso. Prefira Rede = local.' -ForegroundColor Red
+                    Write-Host '      PERIGO: rede aberta + agente. Use Rede = local.' -ForegroundColor Red
                 }
             } else {
-                Write-Host '      Agente: este llama-server.exe é antigo e não tem --agent. A opção será ignorada; atualize o llama.cpp.' -ForegroundColor Red
+                Write-Host '      Agente: llama-server.exe sem --agent; opção ignorada.' -ForegroundColor Red
             }
         }
         if ($Cfg.Research -eq 'on') {
             if (-not (Test-ResearchSupported)) {
-                Write-Host '      Pesquisa: este llama-server.exe é antigo e não tem --ui-mcp-proxy. A opção será ignorada; atualize o llama.cpp.' -ForegroundColor Red
+                Write-Host '      Pesquisa: llama-server.exe sem --ui-mcp-proxy; opção ignorada.' -ForegroundColor Red
             } elseif ($Cfg.Agent -eq 'on' -and (Test-AgentSupported)) {
-                Write-Host '      Pesquisa: desativada enquanto o Agente estiver ligado (conteúdo da web + comandos no PC é arriscado).' -ForegroundColor Red
+                Write-Host '      Pesquisa: desativada com o Agente ligado.' -ForegroundColor Red
             } elseif (-not (Get-UvPath)) {
-                Write-Host '      Pesquisa: uv não encontrado no PATH. Instale o uv para usar esta opção.' -ForegroundColor Red
+                Write-Host '      Pesquisa: uv não encontrado no PATH.' -ForegroundColor Red
             } else {
-                Write-Host '      Pesquisa: o modelo poderá buscar na web e ler páginas (precisa de internet; instala dependências na 1ª vez).' -ForegroundColor Yellow
-                if ($Cfg.Host -ne '127.0.0.1') {
-                    Write-Host '      Atenção: com a rede aberta, qualquer aparelho que alcance a porta poderá usar a pesquisa por este PC.' -ForegroundColor Yellow
-                }
+                Write-Host '      Pesquisa: o modelo poderá buscar na web (requer internet).' -ForegroundColor Yellow
             }
         }
         if (-not [string]::IsNullOrWhiteSpace([string]$Cfg.ImagePath) -and -not (Test-Path -LiteralPath ([string]$Cfg.ImagePath) -PathType Leaf)) {
@@ -4162,16 +4088,16 @@ function Show-Settings {
         if ($Cfg.Image -eq 'on') {
             $issue = Get-ImageIssue $Cfg
             if ($issue) {
-                Write-Host ('      Geração de Imagem: ' + $issue + ' — a opção será ignorada ao iniciar.') -ForegroundColor Red
+                Write-Host ('      Geração de Imagem: ' + $issue + ' (ignorada ao iniciar).') -ForegroundColor Red
             } else {
-                Write-Host '      Geração de Imagem: o modelo poderá criar imagens pelo SwarmUI (o SwarmUI sobe junto com o llama-server).' -ForegroundColor Yellow
+                Write-Host '      Geração de Imagem: o modelo poderá criar imagens pelo SwarmUI.' -ForegroundColor Yellow
             }
         }
         if ($rows[$sel].Key -eq 'image') {
             if ([string]::IsNullOrWhiteSpace([string]$Cfg.ImagePath)) {
                 Write-Host '      Digite o caminho completo do launch-windows.bat do SwarmUI (ex.: D:/SwarmUI/launch-windows.bat).' -ForegroundColor Cyan
             } else {
-                Write-Host '      Digite para trocar o caminho, Backspace apaga, Enter confirma, ←/→ liga/desliga.' -ForegroundColor DarkGray
+                Write-Host '      Digite para trocar o caminho; Enter confirma.' -ForegroundColor DarkGray
             }
         }
 
@@ -4279,7 +4205,7 @@ function Start-BrowserJob {
     param($Cfg, [string]$ServerUrl, [string]$OpenWebUiUrl, [string]$OpenWebUiBat, [string]$LogDir)
 
     $scriptBlock = {
-        param($ServerUrl, $Target, $OpenWebUiUrl, $OpenWebUiBat, $LogDir, $ModelName)
+        param($ServerUrl, $Target, $OpenWebUiUrl, $OpenWebUiBat, $LogDir)
 
         $logPath = ''
         try {
@@ -4372,13 +4298,11 @@ function Start-BrowserJob {
             }
         }
 
+        # /health só responde 200 depois que o modelo termina de carregar.
         $serverOk = $false
-        $serverDeadline = (Get-Date).AddSeconds(600)
-        while ((Get-Date) -lt $serverDeadline) {
-            if (Test-WebReady ($ServerUrl + '/health') $true) {
-                $serverOk = $true
-                break
-            }
+        $deadline = (Get-Date).AddSeconds(1800)
+        while ((Get-Date) -lt $deadline) {
+            if (Test-WebReady ($ServerUrl + '/health') $true) { $serverOk = $true; break }
             Start-Sleep -Milliseconds 700
         }
         if (-not $serverOk) {
@@ -4386,35 +4310,6 @@ function Start-BrowserJob {
             return
         }
         Write-BrowserLog 'llama-server pronto.'
-
-        $modelOk = $false
-        $modelDeadline = (Get-Date).AddSeconds(1800)
-        while ((Get-Date) -lt $modelDeadline) {
-            $state = ''
-            try {
-                $resp = Invoke-WebRequest -Uri ($ServerUrl + '/models') -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
-                $json = $resp.Content | ConvertFrom-Json
-                $items = @()
-                if ($json.data) { $items = @($json.data) } elseif ($json.models) { $items = @($json.models) }
-                foreach ($it in $items) {
-                    if ([string]$it.id -eq $ModelName) {
-                        if ($it.status -and $it.status.value) { $state = [string]$it.status.value }
-                        break
-                    }
-                }
-            } catch { }
-            if ($state -eq 'loaded') { $modelOk = $true; break }
-            if ($state -eq 'failed') {
-                Write-BrowserLog 'Falha ao carregar o modelo selecionado.'
-                break
-            }
-            Start-Sleep -Milliseconds 700
-        }
-        if (-not $modelOk) {
-            Write-BrowserLog 'Modelo não ficou pronto; navegador não será aberto.'
-            return
-        }
-        Write-BrowserLog ('Modelo ' + $ModelName + ' pronto.')
 
         if ($Target -eq 'llamacpp') {
             $null = Open-BrowserUrl $ServerUrl
@@ -4442,7 +4337,7 @@ function Start-BrowserJob {
     }
 
     try {
-        return Start-Job -ScriptBlock $scriptBlock -ArgumentList $ServerUrl, $Cfg.Browser, $OpenWebUiUrl, $OpenWebUiBat, $LogDir, (Get-PresetName $Cfg.Model)
+        return Start-Job -ScriptBlock $scriptBlock -ArgumentList $ServerUrl, $Cfg.Browser, $OpenWebUiUrl, $OpenWebUiBat, $LogDir
     } catch {
         return $null
     }
@@ -4457,7 +4352,7 @@ function Remove-OldLogs {
 }
 
 function Show-StartSummary {
-    param($Cfg, [string]$LogPath, [string[]]$ServerArgs, $Research = $null, $Image = $null)
+    param($Cfg, [string]$LogPath, $Research = $null, $Image = $null)
     $w = Get-UIWidth
     Clear-Screen
     Show-Header 'Iniciando servidor'
@@ -4474,7 +4369,7 @@ function Show-StartSummary {
             Write-Host '  Agente:     ligado (ler/gravar arquivos e executar comandos)' -ForegroundColor Yellow
             Write-Host ('  Pasta base: ' + $script:Root) -ForegroundColor Yellow
             if ($Cfg.Host -ne '127.0.0.1') {
-                Write-Host '  PERIGO:     rede aberta + agente = qualquer aparelho na rede pode executar comandos aqui.' -ForegroundColor Red
+                Write-Host '  PERIGO:     rede aberta + agente: qualquer aparelho na rede pode executar comandos aqui.' -ForegroundColor Red
             }
         } else {
             Write-Host '  Agente:     indisponível (llama-server.exe antigo, --agent ignorado)' -ForegroundColor Red
@@ -4483,9 +4378,6 @@ function Show-StartSummary {
     if ([string]$Cfg.Research -eq 'on') {
         if ($Research -and $Research.Ok) {
             Write-Host ('  Pesquisa:   ligada (servidor local na porta {0})' -f $Research.Port) -ForegroundColor Cyan
-            if ($Cfg.Host -ne '127.0.0.1') {
-                Write-Host '  Atenção:    rede aberta: qualquer aparelho na rede pode usar a pesquisa por este PC.' -ForegroundColor Yellow
-            }
         } elseif ($Research) {
             Write-Host ('  Pesquisa:   falhou (' + $Research.Error + ')') -ForegroundColor Red
         } elseif (-not (Test-ResearchSupported)) {
@@ -4498,9 +4390,6 @@ function Show-StartSummary {
         if ($Image -and $Image.Ok) {
             Write-Host ('  Imagem:     ligada (SwarmUI na porta {0}, MCP na porta {1})' -f $Image.Swarm.Port, $Image.Port) -ForegroundColor Cyan
             Write-Host ('  SwarmUI:    ' + [string]$Cfg.ImagePath) -ForegroundColor DarkGray
-            if ($Cfg.Host -ne '127.0.0.1') {
-                Write-Host '  Atenção:    rede aberta: qualquer aparelho na rede pode usar a geração de imagem por este PC.' -ForegroundColor Yellow
-            }
         } elseif ($Image) {
             Write-Host ('  Imagem:     falhou (' + $Image.Error + ')') -ForegroundColor Red
         } elseif (-not (Test-ResearchSupported)) {
@@ -4520,16 +4409,8 @@ function Show-StartSummary {
 
     if ($LogPath) { Write-Host ('  Log:        ' + $LogPath) -ForegroundColor DarkGray }
     Write-Host ''
-    Write-Host '  Comando:' -ForegroundColor DarkGray
-    Write-Host ('  ' + (Format-Command $script:ServerExe $ServerArgs)) -ForegroundColor DarkGray
-    Write-Host ''
-    if ($Cfg.Browser -eq 'none') {
-        Write-Host '  Carregando o modelo...' -ForegroundColor Cyan
-    } else {
-        Write-Host '  Carregando o modelo... o navegador abrirá quando o servidor estiver pronto.' -ForegroundColor Cyan
-    }
-    Write-Host '  Pressione Ctrl+C nesta janela para encerrar o servidor.' -ForegroundColor DarkGray
-    Write-Host '  Pressione Esc duas vezes para encerrar o servidor e voltar ao menu.' -ForegroundColor DarkGray
+    Write-Host '  Carregando o modelo...' -ForegroundColor Cyan
+    Write-Host '  Ctrl+C encerra o servidor; Esc duas vezes encerra e volta ao menu.' -ForegroundColor DarkGray
     Write-Host ''
 }
 
@@ -4555,7 +4436,7 @@ function Start-EscWatcher {
                         }
                         $last = Get-Date
                         [Console]::ForegroundColor = 'Yellow'
-                        [Console]::WriteLine('  Pressione Esc novamente para encerrar o servidor e voltar ao menu.')
+                        [Console]::WriteLine('  Esc de novo para encerrar o servidor.')
                         [Console]::ResetColor()
                     } else {
                         $last = [datetime]::MinValue
@@ -4577,14 +4458,14 @@ function Stop-EscWatcher {
 }
 
 function Start-LoadProgress {
-    param([int]$Port, [string]$ModelName, [double]$TotalBytes)
+    param([int]$Port, [double]$TotalBytes)
     $state = [hashtable]::Synchronized(@{ Stop = $false })
     $ps = $null
     $handle = $null
     try {
         $ps = [powershell]::Create()
         [void]$ps.AddScript({
-            param($State, $ServerPid, $Port, $ModelName, $Total)
+            param($State, $ServerPid, $Port, $Total)
             if ($Total -le 0) { $Total = 1 }
             $sw = [System.Diagnostics.Stopwatch]::StartNew()
             $childPid = 0
@@ -4592,18 +4473,11 @@ function Start-LoadProgress {
             while (-not $State.Stop) {
                 $loaded = $false
                 try {
-                    $resp = Invoke-WebRequest -Uri ('http://127.0.0.1:{0}/models' -f $Port) -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
-                    $json = $resp.Content | ConvertFrom-Json
-                    $items = @()
-                    if ($json.data) { $items = @($json.data) } elseif ($json.models) { $items = @($json.models) }
-                    foreach ($it in $items) {
-                        if ([string]$it.id -eq $ModelName -and $it.status -and [string]$it.status.value -eq 'loaded') { $loaded = $true }
-                    }
+                    $resp = Invoke-WebRequest -Uri ('http://127.0.0.1:{0}/health' -f $Port) -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
+                    if ([int]$resp.StatusCode -eq 200) { $loaded = $true }
                 } catch { }
                 if ($childPid -eq 0) {
-                    foreach ($r in @(Get-CimInstance Win32_Process -Filter ("Name='llama-server.exe' AND ParentProcessId={0}" -f $ServerPid))) {
-                        foreach ($c in @(Get-CimInstance Win32_Process -Filter ("Name='llama-server.exe' AND ParentProcessId={0}" -f $r.ProcessId))) { $childPid = [int]$c.ProcessId }
-                    }
+                    foreach ($r in @(Get-CimInstance Win32_Process -Filter ("Name='llama-server.exe' AND ParentProcessId={0}" -f $ServerPid))) { $childPid = [int]$r.ProcessId }
                 }
                 $read = 0.0
                 if ($childPid -ne 0) {
@@ -4631,7 +4505,7 @@ function Start-LoadProgress {
                 if ($loaded) { break }
                 Start-Sleep -Milliseconds 500
             }
-        }).AddArgument($state).AddArgument($PID).AddArgument($Port).AddArgument($ModelName).AddArgument($TotalBytes)
+        }).AddArgument($state).AddArgument($PID).AddArgument($Port).AddArgument($TotalBytes)
         $handle = $ps.BeginInvoke()
     } catch { }
     return [pscustomobject]@{ Ps = $ps; Handle = $handle; State = $state }
@@ -4762,7 +4636,7 @@ function Start-LlamaServer {
             $uiConfigPath = Write-UiConfig -ResearchPort $researchPort -ImagePort $imagePort
         }
         $serverArgs = Build-ServerArgs $Cfg $logPath $uiConfigPath
-        Show-StartSummary $Cfg $logPath $serverArgs $script:Research $script:Image
+        Show-StartSummary $Cfg $logPath $script:Research $script:Image
 
         $serverUrl = ('http://127.0.0.1:{0}' -f [int]$Cfg.Port)
         $owuiUrl = 'http://localhost:8080'
@@ -4777,7 +4651,7 @@ function Start-LlamaServer {
 
         Disable-Mouse
         $esc = Start-EscWatcher
-        $progress = Start-LoadProgress ([int]$Cfg.Port) (Get-PresetName $Cfg.Model) ([double]$Cfg.Model.Size)
+        $progress = Start-LoadProgress ([int]$Cfg.Port) ([double]$Cfg.Model.Size)
         $code = 0
         try {
             Push-Location $script:Root
