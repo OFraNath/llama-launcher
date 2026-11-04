@@ -3028,7 +3028,6 @@ def translate_prompt(text):
             {"role": "user", "content": TRANSLATE_SYSTEM + "\n\nText to translate:\n" + text},
         ],
         "temperature": 0,
-        "max_tokens": 300,
         "stream": False,
     }
     loaded = llama_loaded_model()
@@ -3096,8 +3095,13 @@ def tool_generate_image(args):
         except (TypeError, ValueError):
             raise ValueError("seed must be an integer")
         req["seed"] = max(-1, seedv)
+    if req.get("seed", -1) < 0:
+        import random
+        req["seed"] = random.randint(0, 2147483647)
     refine = args.get("refine")
-    if isinstance(refine, str):
+    if refine is None or refine == "":
+        refine = any(args.get(k) not in (None, "") for k in ("refinercontrolpercentage", "refinerupscale", "refinerupscalemethod"))
+    elif isinstance(refine, str):
         refine = refine.strip().lower() in ("1", "true", "yes", "on")
     else:
         refine = bool(refine)
@@ -3107,6 +3111,8 @@ def tool_generate_image(args):
         if args.get("refinerupscale") is not None and args.get("refinerupscale") != "":
             req["refinerupscale"] = _number(args, "refinerupscale", 1.0, 0.25, 8, False, warnings)
         method = str(args.get("refinerupscalemethod") or "").strip()
+        if not method and req.get("refinerupscale", 1.0) != 1.0:
+            method = "pixel-lanczos"
         if method:
             req["refinerupscalemethod"] = method
         tiling = args.get("refinerdotiling")
@@ -3117,18 +3123,20 @@ def tool_generate_image(args):
                 req["refinerdotiling"] = bool(tiling)
     sid = new_session()
     req["session_id"] = sid
+    t0 = time.time()
     obj = swarm_call("/API/GenerateText2Image", req, timeout=900)
+    elapsed = time.time() - t0
     urls = obj.get("images") or []
     if not urls:
         raise RuntimeError("SwarmUI returned no image")
-    info = "Generated image with model %s (%sx%s, steps=%s, CFG=%s, sampler=%s, scheduler=%s)." % (
-        model, width, height, req["steps"], req["cfgscale"], req["sampler"], req["scheduler"])
+    info = "Generated image with model %s (%sx%s, steps=%s, CFG=%s, sampler=%s, scheduler=%s, seed=%s)." % (
+        model, width, height, req["steps"], req["cfgscale"], req["sampler"], req["scheduler"], req["seed"])
     if warnings:
         info += " Adjustments: " + "; ".join(warnings) + "."
-    info += " Prompt sent to the image model: %s." % prompt
+    info += " Generation time: %.1f seconds." % elapsed
+    info += " Prompt sent to the image model: %s." % prompt.rstrip(" .")
     if translate_err:
         info += " Translation failed (%s), so the original prompt was used." % translate_err
-    info += " The image is ALREADY displayed to the user inside this tool result. Do not write attachment names, file names, paths, URLs, markdown image syntax or the words Attachment saved, and do not say where the image is. Reply with one short sentence, in the user language, saying which model was used."
     contents = [{"type": "text", "text": info}]
     for url in urls:
         raw, mime = load_image(url)
@@ -3156,7 +3164,7 @@ TOOLS = [
     },
     {
         "name": "generate_image",
-        "description": "Generate one image with SwarmUI from a text prompt. The prompt must be in english. Call this tool directly; never announce it in text first. The model is required. Defaults: steps 18, CFG 3.5, 800x800, sampler euler_ancestral, scheduler normal, refine off. Only change a default when the user explicitly asks.",
+        "description": "Generate one image with SwarmUI from a text prompt. The prompt must be in english. Call this tool directly; never announce it in text first. The model is required. Defaults: steps 18, CFG 3.5, 800x800, sampler euler_ancestral, scheduler normal, refine off. Only change a default when the user explicitly asks. The image is displayed to the user automatically. After the call, reply with one short sentence, in the user language, saying which model was used and how long the generation took (for example: image generated with model X in N seconds), without attachment names, file names, paths, URLs, markdown image syntax or any description of where the image is.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -3169,8 +3177,8 @@ TOOLS = [
                 "height": {"type": "integer", "description": "Image height in pixels (default 800, 64 to 2048, multiple of 8)."},
                 "sampler": {"type": "string", "description": "Sampler id (default euler_ancestral). Use values from list_params."},
                 "scheduler": {"type": "string", "description": "Scheduler id (default normal). Use values from list_params."},
-                "seed": {"type": "integer", "description": "Seed; -1 for random (default)."},
-                "refine": {"type": "boolean", "description": "Enable the refiner stage (required for the refiner* controls). Off by default; only enable when the user asks."},
+                "seed": {"type": "integer", "description": "Seed; -1 for random (default). To repeat a previous image (for example the same image with refine on), reuse the seed reported in that result together with the same prompt, model, size, steps, CFG, sampler and scheduler."},
+                "refine": {"type": "boolean", "description": "Enable the refiner stage. Enabled automatically when any refiner* control is given. Off by default; only enable when the user asks."},
                 "refinercontrolpercentage": {"type": "number", "description": "Refiner control percentage (default 0.2, 0 to 1)."},
                 "refinerupscale": {"type": "number", "description": "Refiner upscale factor (0.25 to 8; 1 means no upscale). Omit unless asked."},
                 "refinerupscalemethod": {"type": "string", "description": "Refiner upscale method id (default pixel-lanczos). Omit unless asked; values come from list_params."},
@@ -3321,12 +3329,12 @@ function Write-UiConfig {
 
     $parts = @()
     if ($ResearchPort -gt 0) {
-        $parts += ('Current date: {0}. Your training data is older than this date, so your memory is outdated and may be wrong. If the user asks you to search something, always do it. Unless the answer is extremely obvious (greetings, simple math, code you can write directly, creative writing), call web_search before answering and never answer factual questions from memory. If the user gives a domain or URL, use web_search or fetch_url with it. For broad requests, give web_search several different angles in queries, or use depth=deep. Answer only from the results. At the end of your answer, add a line Sources: (translated to the language of the user) followed by a bullet list with only the URLs you actually used, like: - https://example.com. Never list a source you did not use. If the results do not answer the question, do not give up yet: try depth=deep, and use fetch_url on a page the results mention but did not include in full. After two or three failed tries, say plainly what you found and what you could not find. Never tell the user to search by themselves. Reply in the user language.' -f $date)
+        $parts += ('Current date: {0}. Your training data is older than this date, so your memory is outdated and may be wrong. If the user asks you to search something, always do it. Unless the answer is extremely obvious (greetings, simple math, code you can write directly, creative writing), call web_search before answering and never answer factual questions from memory. If the user gives a domain or URL, use web_search or fetch_url with it. For broad requests, give web_search several different angles in queries, or use depth=deep. Answer only from the results. When your answer is based on web_search or fetch_url results, add at the end a line Sources: (translated to the language of the user) followed by a bullet list with only the URLs you actually used, like: - https://example.com. Never list a source you did not use, and never add a Sources line when you did not search or read pages (for example after generating an image). If the results do not answer the question, do not give up yet: try depth=deep, and use fetch_url on a page the results mention but did not include in full. After two or three failed tries, say plainly what you found and what you could not find. Never tell the user to search by themselves. Reply in the user language.' -f $date)
     } else {
         $parts += ('Current date: {0}. Your training data is older than this date, so your memory is outdated and may be wrong.' -f $date)
     }
     if ($ImagePort -gt 0) {
-        $parts += ('Image generation (MCP tools list_models, list_params and generate_image). Call generate_image only when the user clearly wants to obtain an image, never for a casual mention, and when you call it never announce it first: call it right away with no text before it. The model is required and only the user chooses it, so never pick one yourself: if the user has not chosen a model in this conversation (or asked you not to ask again), call list_models, show the full names, ask which one to use and end that turn without calling generate_image; when the user answers, your very next action is the generate_image call with the chosen full model name and the original request. Defaults are steps 18, CFG 3.5, 800x800, sampler euler_ancestral, scheduler normal and refine off; change only what the user explicitly asks for, and enable refine only when the user asks to refine or upscale, since the refiner controls only work with it. If the user asks what can be adjusted, call list_params and present only the relevant parameters (steps, CFG, resolution, sampler, scheduler, refine and its controls) with a short explanation and the current default, without dumping the whole list unless the user asks for it. If the user asks for a value outside the valid range, adjust it to the nearest valid limit and tell the user. Never offer to change donotsave, donotsaveintermediates, refinermethod or the refiner model, because the server fixes them (if asked, explain them briefly). Reply in the user language.')
+        $parts += ('Image generation (MCP tools list_models, list_params and generate_image). Call generate_image only when the user clearly wants to obtain an image, never for a casual mention, and when you call it never announce it first: call it right away with no text before it. The model is required and only the user chooses it, so never pick one yourself: if the user has not chosen a model in this conversation (or asked you not to ask again), call list_models, show the full names, ask which one to use and end that turn without calling generate_image; when the user answers, your very next action is the generate_image call with the chosen full model name and the original request. Defaults are steps 18, CFG 3.5, 800x800, sampler euler_ancestral, scheduler normal and refine off; change only what the user explicitly asks for, and enable refine only when the user asks to refine or upscale, since the refiner controls only work with it. If the user asks what can be adjusted, call list_params and present only the relevant parameters (steps, CFG, resolution, sampler, scheduler, refine and its controls) with a short explanation and the current default, without dumping the whole list unless the user asks for it. If the user asks for a value outside the valid range, adjust it to the nearest valid limit and tell the user. Never offer to change donotsave, donotsaveintermediates, refinermethod or the refiner model, because the server fixes them (if asked, explain them briefly). After generate_image returns, the image is already displayed: reply with one short sentence saying which model was used and how long the generation took (for example: image generated with model X in N seconds), with no Sources line, attachment names, file names, paths, URLs or markdown image syntax. To repeat a previous image (for example the same image with refine on), call generate_image again with the seed reported in that image result and the same prompt, model, size, steps, CFG, sampler and scheduler. Reply in the user language.')
     }
 
     $serversJson = ConvertTo-Json -InputObject @($servers) -Compress
