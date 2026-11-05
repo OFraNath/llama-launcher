@@ -2676,14 +2676,7 @@ DEFAULT_NEGATIVE = "(worst quality, low quality, normal quality:1.3), lowres, jp
 IMG_STORE = {}
 IMG_ORDER = []
 IMG_META = {}
-CURRENT_MODEL = {"name": "", "t": 0.0}
-MODEL_TTL = 600.0
-
-
-def get_current_model():
-    if CURRENT_MODEL["name"] and (time.time() - CURRENT_MODEL["t"]) > MODEL_TTL:
-        CURRENT_MODEL["name"] = ""
-    return CURRENT_MODEL["name"]
+CURRENT_MODEL = {"name": ""}
 IMG_LOCK = threading.Lock()
 IMG_NAME_RE = re.compile(r"^[A-Za-z0-9]{8,64}\.(png|jpg|webp|gif)$")
 IMG_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif"}
@@ -3086,7 +3079,6 @@ def tool_set_image_model(args):
     if not model:
         raise ValueError("model is required")
     CURRENT_MODEL["name"] = resolve_model(model)
-    CURRENT_MODEL["t"] = time.time()
     short = re.sub(r"\.(safetensors|ckpt|pt|pth|gguf|sft)$", "", CURRENT_MODEL["name"])
     return ("Image model set to %s. If the user also asked for a picture, call generate_image now with that request. "
             "If the user only asked to load or change the model, confirm it in one short sentence and wait for the next request. "
@@ -3097,9 +3089,9 @@ def tool_generate_image(args):
     prompt = str(args.get("prompt") or "").strip()
     if not prompt:
         raise ValueError("prompt is required")
-    model = get_current_model()
+    model = CURRENT_MODEL["name"]
     if not model:
-        raise ValueError("No image model chosen yet (or the choice expired). Call list_models, ask the user which one to use, then call set_image_model.")
+        raise ValueError("No image model chosen yet. Call list_models, ask the user which one to use, then call set_image_model.")
     interrupt_all()
     prompt, translate_err = translate_prompt(prompt)
     warnings = []
@@ -3166,7 +3158,6 @@ def tool_generate_image(args):
     t0 = time.time()
     obj = swarm_call("/API/GenerateText2Image", req, timeout=900)
     elapsed = time.time() - t0
-    CURRENT_MODEL["t"] = time.time()
     urls = obj.get("images") or []
     if not urls:
         raise RuntimeError("SwarmUI returned no image")
@@ -3431,11 +3422,11 @@ function Write-UiConfig {
             'When you call generate_image, call it right away with no text before it.'
         ) -join ' '
         $imageModel = @(
-            'You do not know which models exist: only the tools do. Never say that a model was loaded or chosen unless set_image_model returned success in this turn, and if it returns an error, tell the user and show the names it lists. Only the user chooses the model, so never pick one yourself, and never guess or invent a model name. Check these cases in order.',
-            'Case 1: if you already called set_image_model successfully earlier in this conversation, or the user asked you not to ask again, call generate_image directly.',
-            'Case 2: otherwise, if the user wrote a model name (in this message, or as the answer to your question), call set_image_model with the name exactly as the user wrote it. If the user also asked for a picture, your very next action is generate_image with the original request. If the user only asked to load or change the model, confirm it in one short sentence using the full name from the result, and wait.',
-            'Case 3: otherwise, the user has not chosen a model yet: your first and only action is list_models. Do not call set_image_model. Then write only the model names (no file extension, no details) one per line, ask which one to use, and end the turn without calling generate_image.'
-        ) -join ' '
+            'You do not know which models exist: only the tools do. Never say that a model was loaded or chosen unless set_image_model returned success in this turn, and if it returns an error, tell the user and show the names it lists. Only the user chooses the model, so never pick one yourself, and never guess or invent a model name. Check these cases in order:',
+            '1. If you already called set_image_model successfully earlier in this conversation, or the user asked you not to ask again, call generate_image directly.',
+            '2. Otherwise, if the user wrote a model name (in this message, or as the answer to your question), call set_image_model with the name exactly as the user wrote it. If the user also asked for a picture, your very next action is generate_image with the original request. If the user only asked to load or change the model, confirm it in one short sentence using the full name from the result, and wait.',
+            '3. Otherwise, the user has not chosen a model yet: your first and only action is list_models. Do not call set_image_model. Then write only the model names (no file extension, no details) one per line, ask which one to use, and end the turn without calling generate_image.'
+        ) -join "`n"
         $imageCall = @(
             'In generate_image, write the prompt in English with exactly what the user asked for. Add nothing, and do not copy words from the model name.',
             'The defaults (steps 18, CFG 3.5, 800x800, euler_ancestral, normal, refine off) are already applied: change only what the user explicitly asks, and enable refine only when the user asks to refine or upscale.',
@@ -3451,7 +3442,7 @@ function Write-UiConfig {
     }
 
     $serversJson = ConvertTo-Json -InputObject @($servers) -Compress
-    $obj = [ordered]@{ mcpServers = $serversJson; systemMessage = ($parts -join ' ') }
+    $obj = [ordered]@{ mcpServers = $serversJson; systemMessage = ($parts -join "`n`n") }
     $json = ConvertTo-Json -InputObject $obj -Compress
     $path = Join-Path $env:TEMP ('llama_webui_{0}.json' -f ([guid]::NewGuid().ToString('N')))
     $enc = New-Object System.Text.UTF8Encoding($false)
