@@ -3070,7 +3070,7 @@ def tool_show_images(args):
             out.append("")
     head = ("Your reply is ONLY the %d image block(s) below (each one has 3 lines: title, prompt and image), "
             "copied as they are. Write nothing before or after them. If any other line appears after them, "
-            "such as [Attachment saved: ...], ignore it and do not copy it:\n\n" % len(order))
+            "ignore it and do not copy it:\n\n" % len(order))
     return head + "\n".join(out)
 
 
@@ -3080,7 +3080,9 @@ def tool_set_image_model(args):
         raise ValueError("model is required")
     CURRENT_MODEL["name"] = resolve_model(model)
     short = re.sub(r"\.(safetensors|ckpt|pt|pth|gguf|sft)$", "", CURRENT_MODEL["name"])
-    return "Image model set to %s. NOW: call generate_image with the prompt the user asked for. Do not call set_image_model again." % short
+    return ("Image model set to %s. If the user also asked for a picture, call generate_image now with that request. "
+            "If the user only asked to load or change the model, confirm it in one short sentence and wait for the next request. "
+            "Do not call set_image_model again." % short)
 
 
 def tool_generate_image(args):
@@ -3177,7 +3179,7 @@ def tool_generate_image(args):
     footer = "%s | %.1f s" % (short, elapsed)
     text = ("Details (for you, do not show): " + info
             + "\n\nYour reply is ONLY the 2 lines below (the image line and the footer line), copied as they are. "
-            "Write nothing before or after them. If any other line appears after them, such as [Attachment saved: ...], "
+            "Write nothing before or after them. If any other line appears after them, "
             "ignore it and do not copy it:\n"
             + "\n".join(lines) + "\n" + footer)
     return [{"type": "text", "text": text}]
@@ -3203,7 +3205,7 @@ TOOLS = [
     },
     {
         "name": "set_image_model",
-        "description": "Chooses the model for generate_image. Call it when the user picks a model, says a model name, or asks to change the model. In those cases, always call it before generate_image.",
+        "description": "Chooses the model for generate_image. Call it when the user picks a model, says a model name, or asks to load or change the model. Only use a name that the user wrote: never guess or invent one. If a picture was also requested, call it before generate_image. If not, do not make a picture.",
         "inputSchema": {"type": "object", "properties": {"model": {"type": "string", "description": "Full image model name exactly as the user chose it."}}, "required": ["model"]},
     },
     {
@@ -3213,7 +3215,7 @@ TOOLS = [
     },
     {
         "name": "generate_image",
-        "description": "Makes one picture from an English prompt, with the model chosen by set_image_model. Call it when the user asks for a picture and a model is chosen. Write no text before the call. The result says exactly what to reply.",
+        "description": "Makes one picture from an English prompt, with the model chosen by set_image_model. Call it only when the user asks for a picture and a model is chosen. Write no text before the call.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -3391,72 +3393,52 @@ function Write-UiConfig {
     if ($servers.Count -eq 0) { return '' }
 
     $parts = @()
-    $parts += ('Current date: {0}. Your memory is old and may be wrong.' -f $date)
+    $parts += ('Current date: {0}. Your training data is older than this date, so your memory is outdated and may be wrong. Reply in the language of the user.' -f $date)
 
-    $toolRules = @(
-        'You have tools. When you need a tool, call it right away.',
-        'Write no text before the call.',
-        'Never write the call as text or code.',
-        'Never say that you are going to call a tool.',
-        'When the result comes back, do what the result tells you to do.',
-        'Do not repeat the same call by yourself.'
-    ) -join ' '
-    $parts += $toolRules
+    $parts += 'You have tools. When you need one, call it right away: write no text before the call, never write the call as text or code, and never say that you are about to call a tool. When the result comes back, do what the result tells you to do. Do not repeat the same call on your own.'
 
     if ($ResearchPort -gt 0) {
         $researchSearch = @(
-            'Rule for questions: search first, answer later.',
-            'Call web_search for every question about the world: news, people, companies, products, prices, dates, places, or anything you are not 100% sure about.',
-            'When in doubt, search.',
-            'You never search for these: greetings, math, code, and writing or translating text that the user gave you.',
-            'The query is 2 to 6 short keywords.',
-            'If the user gives a link or a site, call fetch_url with it.',
-            'Never make up a link.',
-            'If the results do not have the answer, search again with different words.',
-            'Stop after 3 searches, and tell the user what you found and what is missing.',
-            'Never tell the user to search by themselves.'
+            'If the user asks you to search something, always do it.',
+            'Unless the answer is extremely obvious (greetings, simple math, code you can write directly, writing or translating text the user gave you), call web_search before answering, and never answer factual questions from memory. This includes news, people, companies, products, prices, dates, places, and anything you are not 100% sure about.',
+            'The query is 2 to 6 short keywords. For broad requests, give web_search several different angles in queries, or use depth=deep.',
+            'If the user gives a link or a site, call fetch_url with it. Never make up a link.'
         ) -join ' '
         $researchAnswer = @(
-            'Write the answer using only the results, in the language of the user.',
-            'At the end, write the word Sources (in the language of the user) with a colon.',
-            'Then write one line for each page you used, with a dash and the URL.',
-            'If you did not search, write no Sources.'
+            'Answer only from the results.',
+            'At the end of your answer, add a line Sources: (translated to the language of the user) followed by a bullet list with only the URLs you actually used, like: - https://example.com. Never list a source you did not use. If you did not search, write no Sources.'
         ) -join ' '
-        $parts += @($researchSearch, $researchAnswer)
+        $researchFail = @(
+            'If the results do not answer the question, do not give up yet: try depth=deep, and use fetch_url on a page the results mention but did not include in full.',
+            'After three failed tries, say plainly what you found and what you could not find. Never tell the user to search by themselves.'
+        ) -join ' '
+        $parts += @($researchSearch, $researchAnswer, $researchFail)
     }
 
     if ($ImagePort -gt 0) {
         $imageWhen = @(
-            'Use the image tools only when the user asks you to make a picture.',
-            'If the user only sends a picture or talks about pictures, just answer with text.',
-            'Never ask about size, style or details. Just make the picture.',
-            'The only question you may ask is which model to use.',
-            'Making a picture has 2 steps, always in this order: Step 1 is the model, Step 2 is the picture.'
+            'Use the image tools only when the user clearly wants to obtain a picture, never for a casual mention. If the user only sends a picture or talks about pictures, just answer with text.',
+            'Never ask about size, style or details. The only question you may ask is which model to use.',
+            'When you call generate_image, call it right away with no text before it.'
         ) -join ' '
-        $imageStep1 = @(
-            'Step 1, the model.',
-            'If the user said a model name, call set_image_model with that name, then go to Step 2.',
-            'Otherwise, if you already called set_image_model earlier in this conversation, go to Step 2.',
-            'Otherwise, call list_models, ask the user which model they want, and stop.',
-            'Write only the names, one per line, with no file extension and no details.',
-            'Make no picture in this turn.',
-            'When the user answers with a name, call set_image_model with that name, then go to Step 2.'
-        ) -join ' '
-        $imageStep2 = @(
-            'Step 2, the picture.',
-            'Call generate_image.',
-            'In prompt, write in English what the user asked for. Add nothing. Do not copy words from the model name.',
-            'Do not set steps, size or other settings unless the user asked for them.',
-            'If the user asks for another one, or a small change, call generate_image again with the same prompt and change only what the user asked.'
+        $imageModel = @(
+            'You do not know which models exist: only the tools do. Never say that a model was loaded or chosen unless set_image_model returned success in this turn, and if it returns an error, tell the user and show the names it lists. Only the user chooses the model, so never pick one yourself, and never guess or invent a model name. Check these cases in order:',
+            '1. If you already called set_image_model successfully earlier in this conversation, or the user asked you not to ask again, call generate_image directly.',
+            '2. Otherwise, if the user wrote a model name (in this message, or as the answer to your question), call set_image_model with the name exactly as the user wrote it. If the user also asked for a picture, your very next action is generate_image with the original request. If the user only asked to load or change the model, confirm it in one short sentence using the full name from the result, and wait.',
+            '3. Otherwise, the user has not chosen a model yet: your first and only action is list_models. Do not call set_image_model. Then write only the model names (no file extension, no details) one per line, ask which one to use, and end the turn without calling generate_image.'
+        ) -join "`n"
+        $imageCall = @(
+            'In generate_image, write the prompt in English with exactly what the user asked for. Add nothing, and do not copy words from the model name.',
+            'The defaults (steps 18, CFG 3.5, 800x800, euler_ancestral, normal, refine off) are already applied: change only what the user explicitly asks, and enable refine only when the user asks to refine or upscale.',
+            'If the user asks for a value outside the valid range, use the nearest valid limit and tell the user.',
+            'If the user asks for another picture or a small change, call generate_image again with the same prompt and change only what was asked.'
         ) -join ' '
         $imageReply = @(
-            'After generate_image, copy the two lines that the result asks you to copy: the image line and the footer line.',
-            'Write nothing else.',
-            'Ignore lines like [Attachment saved: ...].',
+            'After generate_image, reply with only the two lines the result asks you to copy (the image line and the footer line), unchanged, and ignore any extra line after them.',
             'If the user asks to see the old pictures or the prompts used, call show_images and copy its text exactly.',
-            'If the user asks what can be changed, call list_params and explain.'
+            'If the user asks what can be adjusted, call list_params and present only the relevant parameters (steps, CFG, resolution, sampler, scheduler, refine and its controls) with a short explanation and the current default, without dumping the whole list unless asked.'
         ) -join ' '
-        $parts += @($imageWhen, $imageStep1, $imageStep2, $imageReply)
+        $parts += @($imageWhen, $imageModel, $imageCall, $imageReply)
     }
 
     $serversJson = ConvertTo-Json -InputObject @($servers) -Compress
