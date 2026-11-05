@@ -2490,7 +2490,7 @@ def tool_web_search(args):
 TOOLS = [
     {
         "name": "search_links",
-        "description": "Returns only a list of links with title and snippet, NOT the content of the pages. Use it only to discover URLs (for example the official site of something); then read a page with fetch_url, or use web_search to get the content.",
+        "description": "Only finds website addresses. Returns links with titles, never page content. Use it when the user wants the address of a site. To get content for an answer, use web_search.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2502,7 +2502,7 @@ TOOLS = [
     },
     {
         "name": "fetch_url",
-        "description": "Download one web page and return its main text (as much as fits the context window). Use offset to continue a cut page, and the listed links to follow the site.",
+        "description": "Reads one web page and returns its text. Use it when the user gives a link, or to read a page from the search results in full. Use offset to continue a cut page. The link must come from the user or from a tool result. Never make one up.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2515,11 +2515,11 @@ TOOLS = [
     },
     {
         "name": "web_search",
-        "description": "Search the web, read the most promising pages and return the most relevant excerpts, all with numbered sources. The default (quick) is short and cheap; use depth=deep to get the full text of up to 10 pages. Default tool for any question about current events, specific sites, people or products, or facts you are unsure about. If the query contains a domain or URL, that site (and a few of its internal pages) is read directly. For broad topics ('everything about X') pass several different angles in queries, or set depth to deep.",
+        "description": "Searches the web, reads the best pages and returns excerpts with numbered sources. Use it for questions about news, facts, people, companies, products and prices. Use depth=deep for broad questions. For broad topics, put several angles in queries. If the query has a domain or URL, that site is read.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "Main thing to find out"},
+                "query": {"type": "string", "description": "2 to 6 short keywords, not a full sentence"},
                 "queries": {"type": "array", "items": {"type": "string"}, "description": "Different search angles or URLs, up to 4. Can be used instead of query"},
                 "depth": {"type": "string", "enum": ["quick", "deep"], "description": "quick (default): short answer from the best excerpts of the most promising pages, reading more only if needed; deep: full text of up to 10 pages"},
                 "sources": {"type": "integer", "description": "Maximum number of pages to read, 1 to 10"},
@@ -2909,7 +2909,7 @@ def resolve_model(name):
     close = difflib.get_close_matches(target, list(norm.keys()), n=2, cutoff=0.8)
     if len(close) == 1 or (len(close) == 2 and norm[close[0]] == norm[close[1]]):
         return norm[close[0]]
-    raise ValueError("Model not found: %s. Available image models: %s. Ask the user which one to use, then call generate_image again with the exact name." % (name, "; ".join(names[:40])))
+    raise ValueError("Model not found: %s. Available image models: %s. Ask the user which one to use, then call set_image_model with the exact name." % (name, "; ".join(names[:40])))
 
 
 def _number(args, key, default, low, high, integer=False, warnings=None):
@@ -3003,11 +3003,11 @@ def get_stored_image(name):
 
 
 TRANSLATE_SYSTEM = (
-    "You are a literal translator. Translate the user's text into English. "
-    "Keep exactly the same meaning and level of detail: do not add, remove, interpret or embellish anything. "
-    "Write short descriptive English phrases separated by commas. "
+    "You are a literal translator. Translate into English the text that appears after the line Text to translate. "
+    "Keep exactly the same meaning and the same level of detail. Do not add, remove or interpret anything. "
+    "Write short descriptive phrases separated by commas. "
     "If the text is already in English, return it unchanged. "
-    "Output only the translation, with no quotes, notes or explanations."
+    "Reply with the translation only. No quotes, no notes, no explanations."
 )
 
 
@@ -3073,18 +3073,24 @@ def tool_show_images(args):
             "such as [Attachment saved: ...], ignore it and do not copy it:\n\n" % len(order))
     return head + "\n".join(out)
 
+
+def tool_set_image_model(args):
+    model = str(args.get("model") or "").strip()
+    if not model:
+        raise ValueError("model is required")
+    CURRENT_MODEL["name"] = resolve_model(model)
+    short = re.sub(r"\.(safetensors|ckpt|pt|pth|gguf|sft)$", "", CURRENT_MODEL["name"])
+    return "Image model set to %s. NOW: call generate_image with the prompt the user asked for. Do not call set_image_model again." % short
+
+
 def tool_generate_image(args):
     prompt = str(args.get("prompt") or "").strip()
-    model = str(args.get("model") or "").strip()
     if not prompt:
         raise ValueError("prompt is required")
+    model = CURRENT_MODEL["name"]
     if not model:
-        model = CURRENT_MODEL["name"]
-    if not model:
-        raise ValueError("No image model chosen yet. Call list_models and ask the user which image model to use")
+        raise ValueError("No image model chosen yet. Call list_models, ask the user which one to use, then call set_image_model.")
     interrupt_all()
-    model = resolve_model(model)
-    CURRENT_MODEL["name"] = model
     prompt, translate_err = translate_prompt(prompt)
     warnings = []
     width = _number(args, "width", DEFAULTS["width"], 64, 2048, True, warnings)
@@ -3170,16 +3176,17 @@ def tool_generate_image(args):
     short = re.sub(r"\.(safetensors|ckpt|pt|pth|gguf|sft)$", "", model)
     footer = "%s | %.1f s" % (short, elapsed)
     text = ("Details (for you, do not show): " + info
-        + "\n\nYour reply is ONLY the 2 lines below (the image line and the footer line), copied as they are. "
-        "Write nothing before or after them. If any other line appears after them, such as [Attachment saved: ...], ignore it and do not copy it:\n"
-        + "\n".join(lines) + "\n" + footer)
+            + "\n\nYour reply is ONLY the 2 lines below (the image line and the footer line), copied as they are. "
+            "Write nothing before or after them. If any other line appears after them, such as [Attachment saved: ...], "
+            "ignore it and do not copy it:\n"
+            + "\n".join(lines) + "\n" + footer)
     return [{"type": "text", "text": text}]
 
 
 TOOLS = [
     {
         "name": "list_models",
-        "description": "List the image model names available in SwarmUI. Use it when the user has not chosen an image model yet in this conversation. Names only; set details=true only if the user asks for technical details.",
+        "description": "Use it when the user wants a picture and you have not called set_image_model yet. Returns the model names. After it, ask the user which one to use and stop. Names only. Set details=true only if the user asks for details.",
         "inputSchema": {"type": "object", "properties": {"details": {"type": "boolean", "description": "Include architecture, resolution and loaded state. Only when the user asks for details."}}, "required": []},
     },
     {
@@ -3195,18 +3202,22 @@ TOOLS = [
         },
     },
     {
+        "name": "set_image_model",
+        "description": "Chooses the model for generate_image. Call it when the user picks a model, says a model name, or asks to change the model. In those cases, always call it before generate_image.",
+        "inputSchema": {"type": "object", "properties": {"model": {"type": "string", "description": "Full image model name exactly as the user chose it."}}, "required": ["model"]},
+    },
+    {
         "name": "show_images",
-        "description": "Show again ALL the images generated in this session, each with its model, time and prompt. Use it when the user asks for all the images, the earlier images or the prompts used.",
+        "description": "Shows all pictures made in this session, with model, time and prompt. Use it only when the user asks to see the old pictures or the prompts used.",
         "inputSchema": {"type": "object", "properties": {}, "required": []},
     },
     {
         "name": "generate_image",
-        "description": "Generate one image from an English prompt. Call it directly, with no text before it. The user chooses the image model: send model only when the user picks one (the first time or a change), otherwise omit it and the last used model is reused. The result contains the exact reply to send.",
+        "description": "Makes one picture from an English prompt, with the model chosen by set_image_model. Call it when the user asks for a picture and a model is chosen. Write no text before the call. The result says exactly what to reply.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "prompt": {"type": "string", "description": "Positive prompt in English: what the user described, without inventing elements, style, quality tags or negative prompt."},
-                "model": {"type": "string", "description": "Full image model name exactly as the user chose it. Send it only the first time or when the user picks a different one; if omitted, the last used model is reused. Never choose it yourself."},
                 "negative_prompt": {"type": "string", "description": "Negative prompt. A good default is already applied. Omit unless the user asks for a specific one, which then replaces the default."},
                 "steps": {"type": "integer", "description": "Sampling steps (default 18, 1 to 150)."},
                 "cfgscale": {"type": "number", "description": "CFG scale (default 3.5, 0 to 30)."},
@@ -3226,7 +3237,7 @@ TOOLS = [
     },
 ]
 
-HANDLERS = {"list_models": tool_list_models, "list_params": tool_list_params, "generate_image": tool_generate_image, "show_images": tool_show_images}
+HANDLERS = {"list_models": tool_list_models, "list_params": tool_list_params, "generate_image": tool_generate_image, "show_images": tool_show_images, "set_image_model": tool_set_image_model}
 
 
 def rpc_error(rid, code, message):
@@ -3380,58 +3391,72 @@ function Write-UiConfig {
     if ($servers.Count -eq 0) { return '' }
 
     $parts = @()
+    $parts += ('Current date: {0}. Your memory is old and may be wrong.' -f $date)
+
+    $toolRules = @(
+        'You have tools. When you need a tool, call it right away.',
+        'Write no text before the call.',
+        'Never write the call as text or code.',
+        'Never say that you are going to call a tool.',
+        'When the result comes back, do what the result tells you to do.',
+        'Do not repeat the same call by yourself.'
+    ) -join ' '
+    $parts += $toolRules
+
     if ($ResearchPort -gt 0) {
-        $researchLines = @(
-            'Current date: {0}. Your training data is older than this date, so your memory may be outdated.',
-            'For facts, news, people, products or anything you are unsure about, call web_search BEFORE answering. No search for greetings, simple math, code or creative writing. If the user gives a URL or domain, use fetch_url or web_search with it.',
-            'If the results do not answer, try depth=deep or fetch_url on a promising page. After 2 or 3 tries, say what you found and what you could not find. Never tell the user to search by themselves.',
-            'Answer only from the results, in the language of the user, and end with the sources you really used. Example:',
-            '',
-            'User: who won the 2022 World Cup?',
-            '(you call web_search)',
-            'Argentina won the 2022 World Cup, beating France on penalties.',
-            '',
-            'Sources:',
-            '- https://example.com/world-cup-final',
-            '',
-            'Write the word Sources in the language of the user. No Sources line when you did not search (for example after generating an image).'
-        )
-        $parts += (($researchLines -join "`n") -f $date)
-    } else {
-        $parts += ('Current date: {0}. Your training data is older than this date, so your memory is outdated and may be wrong.' -f $date)
+        $researchSearch = @(
+            'Rule for questions: search first, answer later.',
+            'Call web_search for every question about the world: news, people, companies, products, prices, dates, places, or anything you are not 100% sure about.',
+            'When in doubt, search.',
+            'You never search for these: greetings, math, code, and writing or translating text that the user gave you.',
+            'The query is 2 to 6 short keywords.',
+            'If the user gives a link or a site, call fetch_url with it.',
+            'Never make up a link.',
+            'If the results do not have the answer, search again with different words.',
+            'Stop after 3 searches, and tell the user what you found and what is missing.',
+            'Never tell the user to search by themselves.'
+        ) -join ' '
+        $researchAnswer = @(
+            'Write the answer using only the results, in the language of the user.',
+            'At the end, write the word Sources (in the language of the user) with a colon.',
+            'Then write one line for each page you used, with a dash and the URL.',
+            'If you did not search, write no Sources.'
+        ) -join ' '
+        $parts += @($researchSearch, $researchAnswer)
     }
+
     if ($ImagePort -gt 0) {
-        $imgUrl = 'http://127.0.0.1:' + [string]$ImagePort + '/img/'
-        $imageLines = @(
-                    'IMAGES (tools list_models, list_params, generate_image, show_images)',
-                    'Call generate_image only when the user clearly asks for an image, and call it right away, with no text before it.',
-                    'The user chooses the image model, never you. No choice yet in this conversation: call list_models, ask which one, and stop. Choice already made: do not send model again, the tool remembers the last one; send model only when the user picks a different one. In the list, write only the names, one per line, with no extension and no details such as architecture or size, unless the user asks for them.',
-                    'The prompt is only what the user described, in English. Add no style words and never copy words from the model name into it. If the user changes one thing, change only that thing and keep the rest.',
-                    'Defaults: steps 18, CFG 3.5, 800x800, euler_ancestral, normal, no refine. Change only what the user explicitly asks. Out-of-range values: use the nearest valid one and say so. If asked what can be adjusted, call list_params and summarize the relevant ones.',
-                    'After generate_image, your reply is the image line and the footer line given by the tool result, copied as they are. Nothing else. Never copy lines like [Attachment saved: ...]; they are not part of the reply.',
-                    '',
-                    'Example:',
-                    'User: a red fox in the snow',
-                    '(you call list_models)',
-                    'Which image model do you want?',
-                    '- modelA',
-                    '- modelB',
-                    'User: modelB',
-                    '(you call generate_image with model modelB and prompt "a red fox in the snow")',
-                    ('![](/cors-proxy?url=' + $imgUrl + 'EXAMPLE1.png)'),
-                    'modelB | 11.5 s',
-                    'User: another one',
-                    '(you call generate_image again: same prompt, no model, no questions)',
-                    ('![](/cors-proxy?url=' + $imgUrl + 'EXAMPLE2.png)'),
-                    'modelB | 12.0 s',
-                    'User: now with modelA',
-                    '(you call generate_image with model modelA and the same prompt)',
-                    ('![](/cors-proxy?url=' + $imgUrl + 'EXAMPLE3.png)'),
-                    'modelA | 9.8 s',
-                    'User: show me all the images with their prompts',
-                    '(you call show_images and reply with exactly the text it returns)'
-                )
-        $parts += ($imageLines -join "`n")
+        $imageWhen = @(
+            'Use the image tools only when the user asks you to make a picture.',
+            'If the user only sends a picture or talks about pictures, just answer with text.',
+            'Never ask about size, style or details. Just make the picture.',
+            'The only question you may ask is which model to use.',
+            'Making a picture has 2 steps, always in this order: Step 1 is the model, Step 2 is the picture.'
+        ) -join ' '
+        $imageStep1 = @(
+            'Step 1, the model.',
+            'If the user said a model name, call set_image_model with that name, then go to Step 2.',
+            'Otherwise, if you already called set_image_model earlier in this conversation, go to Step 2.',
+            'Otherwise, call list_models, ask the user which model they want, and stop.',
+            'Write only the names, one per line, with no file extension and no details.',
+            'Make no picture in this turn.',
+            'When the user answers with a name, call set_image_model with that name, then go to Step 2.'
+        ) -join ' '
+        $imageStep2 = @(
+            'Step 2, the picture.',
+            'Call generate_image.',
+            'In prompt, write in English what the user asked for. Add nothing. Do not copy words from the model name.',
+            'Do not set steps, size or other settings unless the user asked for them.',
+            'If the user asks for another one, or a small change, call generate_image again with the same prompt and change only what the user asked.'
+        ) -join ' '
+        $imageReply = @(
+            'After generate_image, copy the two lines that the result asks you to copy: the image line and the footer line.',
+            'Write nothing else.',
+            'Ignore lines like [Attachment saved: ...].',
+            'If the user asks to see the old pictures or the prompts used, call show_images and copy its text exactly.',
+            'If the user asks what can be changed, call list_params and explain.'
+        ) -join ' '
+        $parts += @($imageWhen, $imageStep1, $imageStep2, $imageReply)
     }
 
     $serversJson = ConvertTo-Json -InputObject @($servers) -Compress
