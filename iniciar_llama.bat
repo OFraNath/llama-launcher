@@ -302,13 +302,21 @@ function Read-Key {
 }
 
 function Initialize-Console {
+    $wantW = 100
+    $wantH = 46
     try {
         $raw = $Host.UI.RawUI
         $ws = $raw.WindowSize
         $max = $raw.MaxWindowSize
-        $nw = [Math]::Min($max.Width, [Math]::Max($ws.Width, 100))
-        $nh = [Math]::Min($max.Height, [Math]::Max($ws.Height, 34))
+        $nw = [Math]::Min($max.Width, [Math]::Max($ws.Width, $wantW))
+        $nh = [Math]::Min($max.Height, [Math]::Max($ws.Height, $wantH))
         if ($nw -ne $ws.Width -or $nh -ne $ws.Height) {
+            try {
+                $bs = $raw.BufferSize
+                if ($bs.Width -lt $nw -or $bs.Height -lt $nh) {
+                    $raw.BufferSize = New-Object System.Management.Automation.Host.Size -ArgumentList ([Math]::Max($bs.Width, $nw)), ([Math]::Max($bs.Height, $nh))
+                }
+            } catch { }
             $raw.WindowSize = New-Object System.Management.Automation.Host.Size -ArgumentList $nw, $nh
         }
     } catch { }
