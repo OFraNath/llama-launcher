@@ -50,6 +50,9 @@ $script:Hit = @{}
 $script:FootHit = @()
 $script:MouseOk = $false
 $script:LastClick = [datetime]::MinValue
+$script:Bench = @{}
+$script:BenchRunning = $false
+$script:BenchText = ''
 
 # ---------------------------------------------------------------------------
 # Console helpers
@@ -181,6 +184,7 @@ public static class LlamaConsole {
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetConsoleMode(IntPtr h, uint m);
     [DllImport("kernel32.dll", EntryPoint = "ReadConsoleInputW", SetLastError = true)]
     static extern bool ReadConsoleInput(IntPtr h, out INPUT_RECORD r, uint len, out uint read);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetNumberOfConsoleInputEvents(IntPtr h, out uint n);
 
     static IntPtr hIn = GetStdHandle(-10);
     static uint origMode;
@@ -198,35 +202,50 @@ public static class LlamaConsole {
     public static void Disable() {
         if (haveOrig) SetConsoleMode(hIn, origMode);
     }
+    static LlamaEvt Conv(INPUT_RECORD r) {
+        if (r.EventType == 1) {
+            if (r.bKeyDown == 0) return null;
+            ushort vk = r.wVirtualKeyCode;
+            if (vk == 0x10 || vk == 0x11 || vk == 0x12 || vk == 0x14 || vk == 0x90 || vk == 0x91) return null;
+            LlamaEvt e = new LlamaEvt();
+            e.Kind = 1; e.Key = ((ConsoleKey)vk).ToString(); e.Ch = (char)r.UnicodeChar;
+            return e;
+        }
+        if (r.EventType == 2) {
+            uint flags = r.EventFlags; uint b = r.ButtonState;
+            if ((flags & 4) != 0) {
+                short delta = unchecked((short)(b >> 16));
+                LlamaEvt w = new LlamaEvt();
+                w.Kind = (delta > 0) ? 4 : 5;
+                return w;
+            }
+            uint pressed = b & ~prevButtons;
+            prevButtons = b;
+            if ((flags & (1u | 2u | 8u)) != 0) return null;
+            LlamaEvt c = null;
+            if ((pressed & 1u) != 0) { c = new LlamaEvt(); c.Kind = 2; }
+            else if ((pressed & 2u) != 0) { c = new LlamaEvt(); c.Kind = 3; }
+            if (c != null) { c.X = r.MouseX; c.Y = r.MouseY; return c; }
+        }
+        return null;
+    }
     public static LlamaEvt Read() {
         while (true) {
             INPUT_RECORD r; uint n;
             if (!ReadConsoleInput(hIn, out r, 1, out n) || n == 0) return null;
-            if (r.EventType == 1) {
-                if (r.bKeyDown == 0) continue;
-                ushort vk = r.wVirtualKeyCode;
-                if (vk == 0x10 || vk == 0x11 || vk == 0x12 || vk == 0x14 || vk == 0x90 || vk == 0x91) continue;
-                LlamaEvt e = new LlamaEvt();
-                e.Kind = 1; e.Key = ((ConsoleKey)vk).ToString(); e.Ch = (char)r.UnicodeChar;
-                return e;
-            }
-            if (r.EventType == 2) {
-                uint flags = r.EventFlags; uint b = r.ButtonState;
-                if ((flags & 4) != 0) {
-                    short delta = unchecked((short)(b >> 16));
-                    LlamaEvt w = new LlamaEvt();
-                    w.Kind = (delta > 0) ? 4 : 5;
-                    return w;
-                }
-                uint pressed = b & ~prevButtons;
-                prevButtons = b;
-                if ((flags & (1u | 2u | 8u)) != 0) continue; // mover / duplo clique / roda horizontal
-                LlamaEvt c = null;
-                if ((pressed & 1u) != 0) { c = new LlamaEvt(); c.Kind = 2; }
-                else if ((pressed & 2u) != 0) { c = new LlamaEvt(); c.Kind = 3; }
-                if (c != null) { c.X = r.MouseX; c.Y = r.MouseY; return c; }
-            }
+            LlamaEvt e = Conv(r);
+            if (e != null) return e;
         }
+    }
+    public static LlamaEvt TryRead() {
+        uint cnt;
+        while (GetNumberOfConsoleInputEvents(hIn, out cnt) && cnt > 0) {
+            INPUT_RECORD r; uint n;
+            if (!ReadConsoleInput(hIn, out r, 1, out n) || n == 0) return null;
+            LlamaEvt e = Conv(r);
+            if (e != null) return e;
+        }
+        return null;
     }
 }
 '@
@@ -4002,6 +4021,7 @@ function Get-SettingsRows {
     $rows += [pscustomobject]@{ Key = 'port'; Label = 'Porta'; Value = ([string]$Cfg.Port); Color = $portColor }
     $rows += [pscustomobject]@{ Key = 'host'; Label = 'Rede'; Value = (Get-HostLabel $Cfg.Host); Color = 'White' }
     $rows += [pscustomobject]@{ Key = 'browser'; Label = 'Navegador'; Value = (Get-BrowserLabel $Cfg.Browser); Color = 'White' }
+    $rows += (Get-BenchRow $Cfg)
     $rows += [pscustomobject]@{ Key = 'start'; Label = 'INICIAR SERVIDOR'; Value = ''; Color = 'Green' }
     return $rows
 }
@@ -4095,6 +4115,17 @@ function Write-SettingRow {
         Write-Row $txt $Selected 'Green'
         return
     }
+    if ($Row.Key -eq 'bench') {
+        $prefix = '   '
+        if ($Selected) { $prefix = ' > ' }
+        $txt = (Fit-Text ($prefix + $Row.Label) 17) + ' ' + (Cut-Text ([string]$Row.Value) ($w - 18))
+        if ($Selected) {
+            Write-Row $txt $true
+        } else {
+            Write-Host (Fit-Text $txt $w) -ForegroundColor $Row.Color
+        }
+        return
+    }
     $label = Fit-Text ('  ' + $Row.Label) 17
     $value = Cut-Text ([string]$Row.Value) ($w - 18)
     $txt = $label + ' ' + $value
@@ -4105,11 +4136,248 @@ function Write-SettingRow {
     }
 }
 
+function Get-BenchRow {
+    param($Cfg)
+    $label = 'BENCHMARK'
+    $value = ''
+    $color = 'Cyan'
+    if ($script:BenchRunning) {
+        $label = 'CANCELAR'
+        $value = [string]$script:BenchText
+        $color = 'Yellow'
+    } elseif ($script:Bench.ContainsKey([string]$Cfg.Model.Path)) {
+        $value = [string]$script:Bench[[string]$Cfg.Model.Path]
+        if ($value -eq 'falhou') { $color = 'Red' }
+    }
+    return [pscustomobject]@{ Key = 'bench'; Label = $label; Value = $value; Color = $color }
+}
+
+function Get-RowTop {
+    param([int]$Index)
+    foreach ($k in @($script:Hit.Keys)) {
+        if ([int]$script:Hit[$k] -eq $Index) { return [int]$k }
+    }
+    return -1
+}
+
+function Update-BenchRow {
+    param($Cfg, [int]$Top, [string]$Text)
+    $script:BenchText = $Text
+    if ($Top -lt 0) { return }
+    try {
+        $l = [Console]::CursorLeft
+        $t = [Console]::CursorTop
+        [Console]::SetCursorPosition(0, $Top)
+        Write-SettingRow (Get-BenchRow $Cfg) $true
+        [Console]::SetCursorPosition($l, $t)
+    } catch { }
+}
+
+function Test-BenchCancel {
+    param([int]$Top = -1)
+    try {
+        if ($script:MouseOk) {
+            while ($true) {
+                $e = [LlamaConsole]::TryRead()
+                if ($null -eq $e) { break }
+                if ($e.Kind -eq 1 -and ($e.Key -eq 'Escape' -or $e.Key -eq 'Enter')) { return $true }
+                if ($e.Kind -eq 2 -and [int]$e.Y -eq $Top) { return $true }
+            }
+            return $false
+        }
+        while ([Console]::KeyAvailable) {
+            $k = [Console]::ReadKey($true)
+            if ($k.Key -eq 'Escape' -or $k.Key -eq 'Enter') { return $true }
+        }
+    } catch { }
+    return $false
+}
+
+function Invoke-BenchRequest {
+    param($Cfg, [int]$Top, [int]$Port, $Prompt, [int]$NPredict, [bool]$Report)
+    $result = [pscustomobject]@{ Status = 'error'; Timings = $null }
+    $req = $null
+    $resp = $null
+    $reader = $null
+    try {
+        if ($Prompt -is [string]) {
+            $promptJson = ($Prompt | ConvertTo-Json -Compress)
+        } else {
+            $promptJson = '[' + (($Prompt) -join ',') + ']'
+        }
+        $extra = ''
+        if ($Report) { $extra = ',"return_progress":true' }
+        $body = '{"prompt":' + $promptJson + ',"n_predict":' + $NPredict + ',"temperature":0,"ignore_eos":true,"cache_prompt":false,"stream":true' + $extra + '}'
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
+        $req = [System.Net.HttpWebRequest]::Create(('http://127.0.0.1:{0}/completion' -f $Port))
+        $req.Method = 'POST'
+        $req.ContentType = 'application/json'
+        $req.Proxy = $null
+        $req.Timeout = 7200000
+        $req.ReadWriteTimeout = 7200000
+        $req.ContentLength = $bytes.Length
+        $rs = $req.GetRequestStream()
+        $rs.Write($bytes, 0, $bytes.Length)
+        $rs.Close()
+        $respTask = $req.GetResponseAsync()
+        while (-not $respTask.Wait(100)) {
+            if (Test-BenchCancel $Top) { $result.Status = 'cancel'; return $result }
+        }
+        $resp = $respTask.Result
+        $reader = New-Object System.IO.StreamReader($resp.GetResponseStream(), [System.Text.Encoding]::UTF8)
+        $count = 0
+        while ($true) {
+            $lineTask = $reader.ReadLineAsync()
+            while (-not $lineTask.Wait(100)) {
+                if (Test-BenchCancel $Top) { $result.Status = 'cancel'; return $result }
+            }
+            $line = $lineTask.Result
+            if ($null -eq $line) { break }
+            if (-not $line.StartsWith('data:')) { continue }
+            $json = $line.Substring(5).Trim()
+            if ($json -eq '' -or $json -eq '[DONE]') { continue }
+            $obj = $json | ConvertFrom-Json
+            if ($obj.error) { break }
+            if ($obj.prompt_progress) {
+                if ($Report -and [double]$obj.prompt_progress.total -gt 0) {
+                    $pp = [int][Math]::Min(100, [Math]::Floor(100.0 * [double]$obj.prompt_progress.processed / [double]$obj.prompt_progress.total))
+                    Update-BenchRow $Cfg $Top ('Processando prompt {0}%' -f $pp)
+                }
+                continue
+            }
+            if ($obj.stop -eq $true) {
+                if ($obj.timings) { $result.Timings = $obj.timings; $result.Status = 'ok' }
+                break
+            }
+            $count++
+            if ($Report -and $count -le $NPredict) {
+                Update-BenchRow $Cfg $Top ('Escrevendo {0}/{1}' -f $count, $NPredict)
+            }
+        }
+        if ($result.Status -eq 'ok' -and $Report) {
+            Update-BenchRow $Cfg $Top ('Escrevendo {0}/{0}' -f $NPredict)
+            Start-Sleep -Milliseconds 250
+        }
+    } catch {
+        $result.Status = 'error'
+    } finally {
+        try { if ($reader) { $reader.Dispose() } } catch { }
+        try { if ($resp) { $resp.Close() } } catch { }
+        try { if ($req) { $req.Abort() } } catch { }
+    }
+    return $result
+}
+
+function Get-BenchPrompt {
+    param([int]$Port, [string]$BaseText, [int]$Ctx)
+    $nCtx = $Ctx
+    try {
+        $props = Invoke-RestMethod -Uri ('http://127.0.0.1:{0}/props' -f $Port) -TimeoutSec 10
+        $v = [int]$props.default_generation_settings.n_ctx
+        if ($v -gt 0) { $nCtx = $v }
+    } catch { }
+    $json = @{ content = $BaseText; add_special = $false } | ConvertTo-Json -Compress
+    $tok = Invoke-RestMethod -Method Post -Uri ('http://127.0.0.1:{0}/tokenize' -f $Port) -ContentType 'application/json' -Body ([System.Text.Encoding]::UTF8.GetBytes($json)) -TimeoutSec 60
+    $base = @($tok.tokens | ForEach-Object { [int]$_ })
+    if ($base.Count -eq 0) { throw 'tokenize' }
+    $target = [Math]::Max(16, $nCtx - 116)
+    $ids = New-Object 'System.Collections.Generic.List[int]'
+    while ($ids.Count -lt $target) { $ids.AddRange([int[]]$base) }
+    if ($ids.Count -gt $target) { $ids.RemoveRange($target, $ids.Count - $target) }
+    return ,$ids.ToArray()
+}
+
+function Invoke-Benchmark {
+    param($Cfg, [int]$Top)
+    $path = [string]$Cfg.Model.Path
+    $script:BenchRunning = $true
+    $proc = $null
+    $tag = [guid]::NewGuid().ToString('N')
+    $outFile = Join-Path $env:TEMP ('llama_bench_' + $tag + '.out')
+    $errFile = Join-Path $env:TEMP ('llama_bench_' + $tag + '.err')
+    $status = 'error'
+    $final = $null
+    try {
+        Update-BenchRow $Cfg $Top 'Iniciando...'
+        if (-not (Test-Path -LiteralPath $script:ServerExe) -or -not (Test-Path -LiteralPath $path)) { throw 'arquivo' }
+        $port = Get-NextFreePort ([int]$Cfg.Port + 1)
+        $c = $Cfg | Select-Object *
+        $c.Host = '127.0.0.1'
+        $c.Port = $port
+        $c.Agent = 'off'
+        $srvArgs = @(Build-ServerArgs $c '' '')
+        $argLine = (@($srvArgs | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }) -join ' ')
+        $proc = Start-Process -FilePath $script:ServerExe -ArgumentList $argLine -WorkingDirectory $script:Root -WindowStyle Hidden -PassThru -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+
+        $total = [double]$Cfg.Model.Size
+        if ($total -le 0) { $total = 1 }
+        $ready = $false
+        $cancel = $false
+        $deadline = [datetime]::UtcNow.AddMinutes(20)
+        while ([datetime]::UtcNow -lt $deadline) {
+            if (Test-BenchCancel $Top) { $cancel = $true; break }
+            if ($proc.HasExited) { break }
+            if (Test-LlamaHealth $port) { $ready = $true; break }
+            $pct = 0
+            try {
+                $p = Get-CimInstance Win32_Process -Filter ('ProcessId={0}' -f $proc.Id)
+                if ($p) { $pct = [int][Math]::Min(99, [Math]::Floor(100.0 * [double]$p.ReadTransferCount / $total)) }
+            } catch { }
+            Update-BenchRow $Cfg $Top ('Carregando modelo... {0}%' -f $pct)
+            Start-Sleep -Milliseconds 300
+        }
+
+        if ($cancel) {
+            $status = 'cancel'
+        } elseif ($ready) {
+            $baseText = 'Escreva um texto longo e detalhado sobre a história da computação, dos primeiros ábacos aos modelos de linguagem atuais. '
+            Update-BenchRow $Cfg $Top 'Aquecendo...'
+            $warm = Invoke-BenchRequest $Cfg $Top $port ($baseText * 4) 4 $false
+            if ($warm.Status -eq 'cancel') {
+                $status = 'cancel'
+            } elseif ($warm.Status -eq 'ok') {
+                Update-BenchRow $Cfg $Top 'Preparando prompt...'
+                $fullPrompt = Get-BenchPrompt $port $baseText ([int]$Cfg.Ctx)
+                Update-BenchRow $Cfg $Top 'Processando prompt...'
+                $run = Invoke-BenchRequest $Cfg $Top $port $fullPrompt 100 $true
+                if ($run.Status -eq 'ok') {
+                    $final = $run.Timings
+                    $status = 'ok'
+                } elseif ($run.Status -eq 'cancel') {
+                    $status = 'cancel'
+                }
+            }
+        }
+    } catch {
+        $status = 'error'
+    } finally {
+        Stop-ProcessTree $proc
+        if ($proc) {
+            try { [void]$proc.WaitForExit(5000) } catch { }
+            try { $proc.Dispose() } catch { }
+        }
+        foreach ($f in @($outFile, $errFile)) {
+            try { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue } catch { }
+        }
+        try { while ([Console]::KeyAvailable) { [void][Console]::ReadKey($true) } } catch { }
+        Enable-Mouse
+        $script:BenchRunning = $false
+    }
+
+    if ($status -eq 'ok') {
+        $script:Bench[$path] = ('Proc. {0:N0} t/s  ·  Escrita {1:N1} t/s' -f [double]$final.prompt_per_second, [double]$final.predicted_per_second)
+    } elseif ($status -eq 'error') {
+        $script:Bench[$path] = 'falhou'
+    }
+    Update-Hardware
+}
+
 function Show-Settings {
     param($Cfg)
     $sel = -1
     $nglBuf = ''
     $snap0 = Get-CfgSnap $Cfg
+    $autoBench = $false
 
     while ($true) {
         $rows = @(Get-SettingsRows $Cfg)
@@ -4135,7 +4403,7 @@ function Show-Settings {
         Write-Host ''
 
         for ($i = 0; $i -lt $rows.Count; $i++) {
-            if ($rows[$i].Key -eq 'start') {
+            if ($rows[$i].Key -eq 'bench') {
                 Write-Host ('  ' + ('-' * [Math]::Max(10, $w - 4))) -ForegroundColor DarkGray
             }
             Register-Hit $i
@@ -4216,10 +4484,17 @@ function Show-Settings {
         $footer = '  ↑↓ navegar   ←→ alterar   Enter editar/iniciar   Esc voltar   Q sair'
         Write-Footer $footer
 
+        if ($autoBench) {
+            $autoBench = $false
+            Invoke-Benchmark $Cfg (Get-RowTop $sel)
+            continue
+        }
+
         $key = Read-Key
         $kn = [string]$key.Key
+        $clicked = $false
         if ($kn -eq 'MouseLeft') {
-            if ($key.Index -ge 0 -and $key.Index -lt $rows.Count) { $sel = $key.Index; $kn = 'Enter' } else { continue }
+            if ($key.Index -ge 0 -and $key.Index -lt $rows.Count) { $sel = $key.Index; $kn = 'Enter'; $clicked = $true } else { continue }
         } elseif ($kn -eq 'MouseRight') {
             if ($key.Index -ge 0 -and $key.Index -lt $rows.Count) { $sel = $key.Index; $kn = 'LeftArrow' } else { $kn = 'Escape' }
         }
@@ -4257,7 +4532,9 @@ function Show-Settings {
             'Enter' {
                 $k = $rows[$sel].Key
                 if ($k -eq 'start') { return [pscustomobject]@{ Action = 'start' } }
-                if ($k -eq 'image') {
+                if ($k -eq 'image' -and $clicked) {
+                    Change-CfgSetting $Cfg 'image' 1
+                } elseif ($k -eq 'image') {
                     $Cfg.ImagePath = ConvertTo-ImagePath ([string]$Cfg.ImagePath)
                     if ([string]::IsNullOrWhiteSpace([string]$Cfg.ImagePath)) {
                         $Cfg.ImagePath = ''
@@ -4274,6 +4551,8 @@ function Show-Settings {
                         Save-ModelCfg $Cfg $snap0
                         return [pscustomobject]@{ Action = 'switch'; Cfg = (New-CfgForModel $newModel) }
                     }
+                } elseif ($k -eq 'bench') {
+                    Invoke-Benchmark $Cfg (Get-RowTop $sel)
                 } else {
                     Change-CfgSetting $Cfg $k 1
                 }
@@ -4281,6 +4560,12 @@ function Show-Settings {
             'Escape' { Save-ModelCfg $Cfg $snap0; return [pscustomobject]@{ Action = 'back' } }
             'Q'      { Save-ModelCfg $Cfg $snap0; return [pscustomobject]@{ Action = 'exit' } }
             'S'      { return [pscustomobject]@{ Action = 'start' } }
+            'B'      {
+                for ($i = 0; $i -lt $rows.Count; $i++) {
+                    if ($rows[$i].Key -eq 'bench') { $sel = $i; break }
+                }
+                $autoBench = $true
+            }
             'Backspace' {
                 if ($nglTyping) {
                     $prop = 'Ngl'
