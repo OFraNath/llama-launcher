@@ -15,6 +15,7 @@ if not exist "%~dp0llama-server.exe" (
 )
 
 set "LLAMA_PS1=%TEMP%\llama_launcher_%RANDOM%%RANDOM%.ps1"
+set "LLAMA_NEW=%TEMP%\llama_launcher_new_%RANDOM%%RANDOM%.bat"
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$b=$env:LLAMA_BAT; $t=$env:LLAMA_PS1; try { $l=Get-Content -LiteralPath $b -Encoding UTF8; $i=[Array]::IndexOf($l,'#===PS1==='); if($i -lt 0){exit 2}; $l[($i+1)..($l.Count-1)] | Set-Content -LiteralPath $t -Encoding UTF8; exit 0 } catch { exit 3 }"
 if errorlevel 1 (
     echo [ERRO] Falha ao preparar o launcher.
@@ -27,6 +28,19 @@ powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%LLAMA_PS1%" %*
 set "LLAMA_RC=%ERRORLEVEL%"
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "[Console]::CursorVisible=$true" >nul 2>&1
 del /f /q "%LLAMA_PS1%" >nul 2>&1
+if "%LLAMA_RC%"=="10" (
+    copy /y "%LLAMA_NEW%" "%LLAMA_BAT%" >nul 2>&1 && (
+        del /f /q "%LLAMA_NEW%" >nul 2>&1
+        set "LLAMA_UPDATED=1"
+        call "%LLAMA_BAT%" %*
+        exit /b
+    )
+    del /f /q "%LLAMA_NEW%" >nul 2>&1
+    echo.
+    echo [ERRO] Não foi possível aplicar a atualização.
+    pause
+    exit /b 1
+)
 if not "%LLAMA_RC%"=="0" (
     echo.
     echo O launcher terminou com erro ^(código %LLAMA_RC%^).
@@ -53,6 +67,11 @@ $script:LastClick = [datetime]::MinValue
 $script:Bench = @{}
 $script:BenchRunning = $false
 $script:BenchText = ''
+$script:UpdateUrl = 'https://raw.githubusercontent.com/OFraNath/llama-launcher/HEAD/iniciar_llama.bat'
+$script:UpdateExitCode = 10
+$script:UpdateAvailable = $false
+$script:UpdateBytes = $null
+$script:ExitCode = 0
 
 # ---------------------------------------------------------------------------
 # Console helpers
@@ -123,7 +142,7 @@ function Write-Row {
 function Write-Footer {
     param([string]$Text)
     $parts = (Cut-Text $Text ((Get-UIWidth) - 1)) -split '   '
-    $map = @{ 'Enter' = 'Enter'; 'Esc' = 'Escape'; '←→' = 'RightArrow'; 'L' = 'L'; 'E' = 'E'; 'R' = 'R'; 'Q' = 'Q' }
+    $map = @{ 'Enter' = 'Enter'; 'Esc' = 'Escape'; '←→' = 'RightArrow'; 'L' = 'L'; 'E' = 'E'; 'R' = 'R'; 'A' = 'A'; 'Q' = 'Q' }
     $y = [int][Console]::CursorTop
     $x = 0
     $hits = @()
@@ -3844,6 +3863,140 @@ function Show-Choice {
 }
 
 # ---------------------------------------------------------------------------
+# Auto update
+# ---------------------------------------------------------------------------
+function Get-ContentHash {
+    param([byte[]]$Bytes)
+    $text = [System.Text.Encoding]::UTF8.GetString($Bytes).TrimStart([char]0xFEFF).Replace("`r", '').TrimEnd()
+    $data = [System.Text.Encoding]::UTF8.GetBytes($text)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { return [BitConverter]::ToString($sha.ComputeHash($data)) } finally { $sha.Dispose() }
+}
+
+function Get-RemoteLauncher {
+    try {
+        try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
+        $req = [System.Net.HttpWebRequest]::Create($script:UpdateUrl)
+        $req.Timeout = 6000
+        $req.ReadWriteTimeout = 6000
+        $req.UserAgent = 'llama-launcher-updater'
+        $req.CachePolicy = New-Object System.Net.Cache.RequestCachePolicy -ArgumentList ([System.Net.Cache.RequestCacheLevel]::NoCacheNoStore)
+        $resp = $req.GetResponse()
+        try {
+            $ms = New-Object System.IO.MemoryStream
+            $resp.GetResponseStream().CopyTo($ms)
+            $bytes = $ms.ToArray()
+        } finally {
+            $resp.Close()
+        }
+        $text = [System.Text.Encoding]::UTF8.GetString($bytes)
+        if ($text -notmatch '(?m)^#===PS1===\r?$') { return $null }
+        if ($text -notmatch '^\uFEFF?@echo off') { return $null }
+        return ,$bytes
+    } catch {
+        return $null
+    }
+}
+
+function Test-UpdateAvailable {
+    $script:UpdateAvailable = $false
+    $script:UpdateBytes = $null
+    if ($env:LLAMA_UPDATED -eq '1') { return $false }
+    $self = $env:LLAMA_BAT
+    if ([string]::IsNullOrWhiteSpace($self) -or -not (Test-Path -LiteralPath $self)) { return $false }
+    Write-Host '  Verificando atualizações...' -ForegroundColor DarkGray
+    $remote = Get-RemoteLauncher
+    if ($null -eq $remote) { return $false }
+    try { $local = [System.IO.File]::ReadAllBytes($self) } catch { return $false }
+    if ((Get-ContentHash $remote) -eq (Get-ContentHash $local)) { return $false }
+    $script:UpdateBytes = $remote
+    $script:UpdateAvailable = $true
+    return $true
+}
+
+function Save-UpdateFile {
+    $target = $env:LLAMA_NEW
+    if ([string]::IsNullOrWhiteSpace($target) -or $null -eq $script:UpdateBytes) { return $false }
+    try {
+        [System.IO.File]::WriteAllBytes($target, $script:UpdateBytes)
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Get-UpdateFooter {
+    if ($script:UpdateAvailable) { return '   A atualizar' }
+    return ''
+}
+
+function Install-LauncherUpdate {
+    if (Save-UpdateFile) { return $true }
+    Clear-Screen
+    Write-Host ''
+    Write-Host '  Não foi possível preparar a atualização.' -ForegroundColor Red
+    Write-Host ''
+    Write-Host '  Pressione qualquer tecla para continuar.' -ForegroundColor DarkGray
+    [void](Read-Key)
+    return $false
+}
+
+function Show-UpdatePrompt {
+    $message = 'Uma atualização do Llama Launcher está disponível.'
+    $buttons = @(
+        [pscustomobject]@{ Key = 'A'; Text = ' A  Atualizar ' },
+        [pscustomobject]@{ Key = 'D'; Text = ' D  Dispensar ' }
+    )
+    $gap = 4
+    $sel = 0
+    while ($true) {
+        Clear-Screen
+        $w = Get-UIWidth
+        $h = 24
+        try { $h = [Console]::WindowHeight } catch { }
+        $top = [Math]::Max(1, [int][Math]::Floor(($h - 4) / 2))
+        for ($i = 0; $i -lt $top; $i++) { Write-Host '' }
+        $pad = [Math]::Max(0, [int][Math]::Floor(($w - $message.Length) / 2))
+        Write-Host ((' ' * $pad) + $message) -ForegroundColor White
+        Write-Host ''
+
+        $total = $gap * ($buttons.Count - 1)
+        foreach ($b in $buttons) { $total += $b.Text.Length }
+        $x = [Math]::Max(0, [int][Math]::Floor(($w - $total) / 2))
+        $y = [int][Console]::CursorTop
+        $hits = @()
+        Write-Host (' ' * $x) -NoNewline
+        for ($i = 0; $i -lt $buttons.Count; $i++) {
+            $b = $buttons[$i]
+            if ($i -gt 0) {
+                Write-Host (' ' * $gap) -NoNewline
+                $x += $gap
+            }
+            if ($i -eq $sel) {
+                Write-Host $b.Text -NoNewline -ForegroundColor Black -BackgroundColor Cyan
+            } else {
+                Write-Host $b.Text -NoNewline -ForegroundColor Gray -BackgroundColor DarkGray
+            }
+            $hits += [pscustomobject]@{ Y = $y; X1 = $x; X2 = ($x + $b.Text.Length - 1); Key = $b.Key }
+            $x += $b.Text.Length
+        }
+        Write-Host ''
+        $script:FootHit = $hits
+
+        $key = Read-Key
+        switch ([string]$key.Key) {
+            'A'          { return $true }
+            'D'          { return $false }
+            'Escape'     { return $false }
+            'Enter'      { return ($sel -eq 0) }
+            'LeftArrow'  { $sel = 0 }
+            'RightArrow' { $sel = 1 }
+            'Tab'        { $sel = 1 - $sel }
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Model picker
 # ---------------------------------------------------------------------------
 function Show-ModelPicker {
@@ -3890,9 +4043,10 @@ function Show-ModelPicker {
             Write-Host ''
             Write-Host '  Coloque os arquivos .gguf em subpastas de Modelos e pressione R.' -ForegroundColor Gray
             Write-Host ''
-            Write-Footer '  R atualizar   Q sair'
+            Write-Footer ('  R recarregar' + (Get-UpdateFooter) + '   Q sair')
             $key = Read-Key
             if ($key.Key -eq 'Q') { return [pscustomobject]@{ Action = 'exit' } }
+            if ($key.Key -eq 'A' -and $script:UpdateAvailable) { return [pscustomobject]@{ Action = 'update' } }
             if ($key.Key -eq 'R' -or $key.Key -eq 'F5') { Update-Hardware; Refresh-Models; $rebuild = $true }
             continue
         }
@@ -3936,7 +4090,7 @@ function Show-ModelPicker {
         }
 
         Write-Host ''
-        $footer = '  ↑↓ navegar   Enter abrir   L última   E editar última   R atualizar   Q sair'
+        $footer = '  ↑↓ navegar   Enter abrir   L última   E editar última   R recarregar' + (Get-UpdateFooter) + '   Q sair'
         Write-Footer $footer
 
         $key = Read-Key
@@ -3959,6 +4113,9 @@ function Show-ModelPicker {
                 Update-Hardware
                 Refresh-Models
                 $rebuild = $true
+            }
+            'A' {
+                if ($script:UpdateAvailable) { return [pscustomobject]@{ Action = 'update' } }
             }
             'L' {
                 if ($script:LastCfg) { return [pscustomobject]@{ Action = 'last' } }
@@ -5172,12 +5329,21 @@ if ($args -contains '--selftest') {
     exit 0
 }
 
+Initialize-Console
+Initialize-Mouse
+if (Test-UpdateAvailable) {
+    try { [Console]::CursorVisible = $false } catch { }
+    if ((Show-UpdatePrompt) -and (Install-LauncherUpdate)) {
+        Disable-Mouse
+        try { [Console]::CursorVisible = $true } catch { }
+        exit $script:UpdateExitCode
+    }
+}
+
 $script:Gpu = Get-GpuInfo
 $script:Mem = Get-MemInfo
 Initialize-State
 Refresh-Models
-Initialize-Console
-Initialize-Mouse
 
 $exitAll = $false
 try {
@@ -5186,6 +5352,14 @@ try {
     while (-not $exitAll) {
         $pick = Show-ModelPicker -CurrentPath $currentPath
         if ($pick.Action -eq 'exit') { break }
+
+        if ($pick.Action -eq 'update') {
+            if (Install-LauncherUpdate) {
+                $script:ExitCode = $script:UpdateExitCode
+                break
+            }
+            continue
+        }
 
         if ($pick.Action -eq 'last') {
             if (-not $script:LastCfg) { continue }
@@ -5241,4 +5415,5 @@ try {
     try { [Console]::CursorVisible = $true } catch { }
     try { $Host.UI.RawUI.WindowTitle = 'Llama Launcher' } catch { }
 }
+exit $script:ExitCode
 # === END ===
