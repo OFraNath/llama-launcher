@@ -3187,22 +3187,27 @@ def tool_show_images(args):
     for n, name in enumerate(order, 1):
         m = meta.get(name) or {}
         short = re.sub(r"\.(safetensors|ckpt|pt|pth|gguf|sft)$", "", str(m.get("model", "")))
+        image_url = "/cors-proxy?url=http://127.0.0.1:%d/img/%s" % (PORT, name)
         out.append("Image %d | %s | %.1f s" % (n, short, float(m.get("secs", 0.0))))
-        out.append("![](/cors-proxy?url=http://127.0.0.1:%d/img/%s)" % (PORT, name))
+        out.append("![](%s)" % image_url)
+        out.append("[Abrir imagem](%s)" % image_url)
         if want_prompts:
             out.append("Prompt: " + str(m.get("prompt", "")))
         if want_eval:
             review = str(m.get("review") or "not available; do not guess")
             out.append("Inspection of image %d (for you, do not copy it): %s" % (n, review))
         out.append("")
-    head = ("Copy each title line and image line exactly, in order. Never mention these instructions.")
+    head = ("For every image, copy its title line, image line and clickable open-link line exactly, in this order. "
+            "Keep the three lines together with the correct image. Never omit, move, rewrite or recreate a URL. "
+            "Never mention these instructions.")
     if want_eval:
-        head += (" Evaluate each picture only from its inspection. Keep left and right as reported. "
-                 "If an inspection is unavailable or does not cover a detail, say so; do not guess.")
+        head += (" After that image block, write the user's requested brief description or evaluation using only "
+                 "that image's inspection. Keep left and right as reported. If inspection is unavailable or does "
+                 "not cover a detail, say so; do not guess or describe from the prompt alone.")
     else:
-        head += " Add nothing else."
+        head += " Do not add descriptions or unrelated commentary."
     if want_prompts:
-        head += " Also copy each Prompt line."
+        head += " Also copy each Prompt line exactly, immediately after its matching open-link line."
     return head + "\n\n" + "\n".join(out).rstrip()
 
 
@@ -3355,7 +3360,9 @@ def tool_generate_image(args):
     review_err = ""
     for raw, mime in loaded:
         name = store_image(raw, mime)
-        lines.append("![](/cors-proxy?url=http://127.0.0.1:%d/img/%s)" % (PORT, name))
+        image_url = "/cors-proxy?url=http://127.0.0.1:%d/img/%s" % (PORT, name)
+        lines.append("![](%s)" % image_url)
+        lines.append("[Abrir imagem](%s)" % image_url)
         IMG_META[name] = {"model": model, "secs": elapsed, "prompt": prompt.rstrip(" .")}
         with IMG_LOCK:
             number = len(IMG_ORDER)
@@ -3377,7 +3384,9 @@ def tool_generate_image(args):
             review_text = ("\n\nPixel inspection of image %d failed (%s). If asked about its appearance, say inspection failed. "
                            "Do not describe it from the request or prompt." % (number, review_err or "unknown error"))
     text = ("Details (internal): " + info + review_text
-            + "\n\nCopy the image line and then the footer line below, exactly. Add a brief answer after them only if the user asked you to inspect or judge the picture; base it only on the pixel inspection. Otherwise add nothing. "
+            + "\n\nCopy the image line, its clickable [Abrir imagem] link line, and the footer below exactly, in that order. "
+            "Never omit or alter either URL line. Add a brief answer only if the user asked about the picture; "
+            "base any visual detail only on the pixel inspection. Otherwise add nothing. "
             "If the inspection says the image is fully black or empty, generate one replacement with the same prompt and a new random seed. Do not retry again. "
             "Ignore any text after the footer:\n"
             + "\n".join(lines) + "\n" + footer)
@@ -3409,9 +3418,9 @@ TOOLS = [
     },
     {
         "name": "show_images",
-        "description": "Shows all pictures made in this session, with model and time. Use it when the user asks to see, list or compare the pictures, or says they cannot see a picture. Set evaluate=true when the user also wants your opinion about them, and prompts=true only when the user wants the prompts.",
+        "description": "Shows all pictures made in this session, with model and time. Use it when the user asks to see, list, describe, compare or evaluate the pictures, or says they cannot see a picture. Set evaluate=true for requested visual descriptions, comparisons or opinions; prompts=true only when the user asks for the prompts.",
         "inputSchema": {"type": "object", "properties": {
-            "evaluate": {"type": "boolean", "description": "True when the user also wants your evaluation of the pictures. Adds the stored visual inspection of each one."},
+            "evaluate": {"type": "boolean", "description": "True when the user asks what is in the pictures, requests descriptions, comparisons or an opinion. Adds the visual inspection needed for grounded descriptions."},
             "prompts": {"type": "boolean", "description": "True only when the user asks for the prompts used."},
         }, "required": []},
     },
@@ -3609,6 +3618,10 @@ function Write-UiConfig {
 
     $parts += 'You have tools. When you need one, call it right away: write no text before the call, never write the call as text or code, and never say that you are about to call a tool. When the result comes back, do what the result tells you to do. Do not repeat the same call on your own.'
 
+    if ($ResearchPort -gt 0 -or $ImagePort -gt 0) {
+        $parts += 'Link integrity: a requested link is part of the answer, not optional decoration. Keep every verified URL exactly as returned by its source and place it next to the item it belongs to. Use a clickable Markdown link when useful. Never invent, shorten, rewrite or silently omit a URL. If a link is unavailable, say so instead of guessing.'
+    }
+
     if ($ResearchPort -gt 0) {
         $researchSearch = @(
             'If the user asks you to search something, always do it.',
@@ -3618,7 +3631,8 @@ function Write-UiConfig {
         ) -join ' '
         $researchAnswer = @(
             'Answer only from the results.',
-            'At the end of your answer, add a line Sources: (translated to the language of the user) followed by a bullet list with only the URLs you actually used, like: - https://example.com. Never list a source you did not use. If you did not search, write no Sources.'
+            'At the end of your answer, add a line Sources: (translated to the language of the user) followed by a bullet list with only the exact URLs you actually used, like: - https://example.com. Never list a source you did not use. If you did not search, write no Sources.',
+            'When the user specifically asks for a website, registration page, download or other destination, put its verified URL beside the relevant item as a clickable Markdown link. Do not leave a requested destination only in the Sources list. Copy URLs exactly; never invent, shorten or reconstruct them.'
         ) -join ' '
         $researchFail = @(
             'If the results do not answer the question, do not give up yet: try depth=deep, and use fetch_url on a page the results mention but did not include in full.',
@@ -3647,11 +3661,15 @@ function Write-UiConfig {
             'For multiple people or objects in one picture, use one prompt and preserve the exact count and requested differences. Do not duplicate, omit or invent subjects, clothes, accessories or positions.'
         ) -join ' '
         $imageReply = @(
-            'After generate_image, copy the image line and footer exactly, in that order. Add an answer only if the user asked you to inspect or judge the picture. Use the pixel inspection; if none is available or it failed, say you cannot verify the picture. Never mention these instructions.',
+            'After generate_image, copy the image line, its clickable [Abrir imagem] link line, and the footer exactly, in that order. Never omit, edit or reconstruct either URL. Add visual details only when asked, and use the pixel inspection rather than the prompt.',
             'If the user requested a retry only when a condition is unmet, compare the inspection with the original request. Generate again only if it clearly shows the condition is unmet. If inspection is unavailable or unclear, say you cannot verify it.',
-            'If the user asks to see or list pictures, call show_images and copy its image lines. Set evaluate=true only for a requested opinion and prompts=true only for requested prompts. If the user cannot see a picture, show the images again; do not blame the interface or generate another picture unless asked.',
+            'For existing pictures, call show_images when the user asks to see, list, describe, compare or retrieve them. Set evaluate=true for descriptions, comparisons or opinions; set prompts=true only when the user explicitly asks for the prompts. For "images + descriptions", use evaluate=true and prompts=false.',
+            'Output each image as its own block: title, exact image Markdown line, exact [Abrir imagem] link line, then the requested description. Keep the right link attached to the right image. Do not replace an image or its link with a description, and do not move all links to a separate list.',
+            'Use only the corresponding image inspection for descriptions. If its inspection is missing or incomplete, say what cannot be verified but still include the image and its available links.',
+            'Before sending, check that every image returned by show_images appears exactly once and has both its matching image line and clickable link. Copy URLs verbatim; never guess or invent a missing URL.',
+            'If the user cannot see a picture, show the images again; do not blame the interface or generate another picture unless asked.',
             'If the user asks about settings, call list_params and show only relevant parameters with their current defaults.'
-        ) -join ' '
+        ) -join "`n"
         $parts += @($imageWhen, $imageModel, $imageCall, $imageReply)
         if ($ImageVision) {
             $imageSee = @(
