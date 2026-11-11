@@ -2716,6 +2716,7 @@ SWARM = (sys.argv[3] if len(sys.argv) > 3 else "http://127.0.0.1:7801").rstrip("
 SWARM_PID = int(sys.argv[4]) if len(sys.argv) > 4 else 0
 LLAMA_PORT = int(sys.argv[5]) if len(sys.argv) > 5 else 0
 IMAGE_DIR = (sys.argv[6] if len(sys.argv) > 6 else "").strip()
+VISION = (sys.argv[7] if len(sys.argv) > 7 else "0").strip() == "1"
 
 IMG_MAX = 40
 DEFAULT_NEGATIVE = "(worst quality, low quality, normal quality:1.3), lowres, jpeg artifacts, blurry, (bad anatomy, bad proportions:1.2), extra limbs, missing limbs, fused fingers, (bad hands:1.3), extra fingers, fewer fingers, missing fingers, mutated hands, (bad feet, extra digits:1.1), (asymmetrical eyes:1.2), cross-eyed, mismatched pupils, empty eyes, (asymmetrical face:1.2), deformed face, distorted mouth, (messy hair, hair through clothes:1.1), floating hair strands, (cluttered clothing, excessive frills, over-detailed outfit:1.3), asymmetrical clothing, ribbons everywhere, random straps, fabric errors, wrinkled fabric artifacts, cropped, out of frame, worst crop, text, signature, watermark, logo, artist name, username"
@@ -2816,9 +2817,9 @@ def tool_list_models(args):
         return "No image models were found in SwarmUI. Add one in the SwarmUI Models tab first."
     lines.append("")
     if want_details:
-        lines.append("NOW: answer what the user asked about these image models, then ask which one to use, and stop. Do not call generate_image in this turn.")
+        lines.append("NOW: answer the user's question using the details above, then ask which model to use. Stop. Do not generate an image.")
     else:
-        lines.append("NOW: ask the user which image model to use (in the language of the user), listing ONLY the names above, one per line, with no extra details, and stop. Wait for the answer. Do not call generate_image in this turn.")
+        lines.append("NOW: list only the model names above, one per line. Ask which model to use and stop. Do not generate an image.")
     return "\n".join(lines)
 
 
@@ -2955,7 +2956,8 @@ def resolve_model(name):
     close = difflib.get_close_matches(target, list(norm.keys()), n=2, cutoff=0.8)
     if len(close) == 1 or (len(close) == 2 and norm[close[0]] == norm[close[1]]):
         return norm[close[0]]
-    raise ValueError("Model not found: %s. Available image models: %s. Ask the user which one to use, then call set_image_model with the exact name." % (name, "; ".join(names[:40])))
+    shown = [re.sub(r"\.(safetensors|ckpt|pt|pth|gguf|sft)$", "", n) for n in names[:40]]
+    raise ValueError("Model not found: %s. Available image models: %s. Ask the user to choose one and stop. Do not generate an image." % (name, "; ".join(shown)))
 
 
 def _number(args, key, default, low, high, integer=False, warnings=None):
@@ -3048,13 +3050,80 @@ def get_stored_image(name):
     return raw
 
 
-TRANSLATE_SYSTEM = (
-    "You are a literal translator. Translate into English the text that appears after the line Text to translate. "
-    "Keep exactly the same meaning and the same level of detail. Do not add, remove or interpret anything. "
-    "Write short descriptive phrases separated by commas. "
-    "If the text is already in English, return it unchanged. "
-    "Reply with the translation only. No quotes, no notes, no explanations."
+VISION_RULES = (
+    "Describe only what is visible in the image. Do not guess or use the prompt as visual evidence. "
+    "Say 'unclear' when a detail cannot be seen. Left and right mean the viewer's left and right. "
+    "Count visible subjects before describing them. Be brief."
 )
+VISION_PROMPT = "Request for comparison only; it is not evidence of what appears in the image:\n%s\n\n"
+VISION_REVIEW = (
+    VISION_PROMPT +
+    "Inspect the pixels first. Then compare them with the request. Answer in English with exactly these sections:\n"
+    "SCENE: visible setting, composition, lighting, colors, style and text.\n"
+    "SUBJECTS: actual number of people and other main subjects. Describe each person separately: position, pose, "
+    "facing direction only if clear, hair, clothing and accessories. Say when subjects appear duplicated.\n"
+    "MATCH: list every missing, extra, duplicated, wrong or unclear requested detail. Check the requested subject count. "
+    "Do not say 'all present' unless you checked every detail.\n"
+    "DEFECTS: check duplication, anatomy, merged parts, clothing or object glitches, artifacts, blur, cropping, "
+    "unwanted text and watermarks. Write 'none seen' only after checking all of them."
+)
+
+
+def vision_ask(raw, mime, question, max_tokens=700):
+    if LLAMA_PORT <= 0:
+        return "", "llama-server port not provided"
+    mime = str(mime or "").lower()
+    if mime not in IMG_EXT:
+        mime = IMG_MIME.get(IMG_EXT.get(sniff_type(raw), "png"), "image/png")
+    url = "data:%s;base64,%s" % (mime, base64.b64encode(raw).decode("ascii"))
+    body = {
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": VISION_RULES + "\n\n" + question},
+                {"type": "image_url", "image_url": {"url": url}},
+            ]},
+        ],
+        "max_tokens": max_tokens,
+        "temperature": 0.2,
+        "stream": False,
+        "chat_template_kwargs": {"enable_thinking": False, "reasoning_effort": "low"},
+    }
+    try:
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request("http://127.0.0.1:%d/v1/chat/completions" % LLAMA_PORT, data=data,
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=240) as resp:
+            obj = json.loads(resp.read().decode("utf-8"))
+        out = str(obj["choices"][0]["message"]["content"] or "")
+        out = re.sub(r"<think>.*?</think>", "", out, flags=re.S).strip()
+        out = re.sub(r"\n{3,}", "\n\n", out)
+        if out:
+            return out, ""
+        return "", "empty reply from llama-server"
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode("utf-8", "replace")
+        except Exception:
+            detail = ""
+        return "", ((("HTTP %s " % e.code) + " ".join(detail.split()))[:200])
+    except Exception as e:
+        return "", str(e)[:160]
+
+
+TRANSLATE_SYSTEM = (
+    "Translate the text below into English for an image model. Preserve every detail, count, action, relation, "
+    "clothing item and requested style. Do not add, omit, soften or guess. Keep ambiguity when the original is unclear. "
+    "Return only the translation."
+)
+
+
+PT_WORDS = re.compile(r"\b(um|uma|com|para|sem|dos|das|nos|nas|garota|garotas|mulher|mulheres|homem|vestido|fundo|cabelo|cabelos|olhos|nua|nu|seios|cidade|noite|branco|branca|preto|preta|azul|vermelho|vermelha)\b", re.I)
+
+
+def needs_translation(text):
+    if re.search(r"[À-ɏ]", text):
+        return True
+    return bool(PT_WORDS.search(text))
 
 
 def translate_prompt(text):
@@ -3072,7 +3141,7 @@ def translate_prompt(text):
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request("http://127.0.0.1:%d/v1/chat/completions" % LLAMA_PORT, data=data,
                                      headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=45) as resp:
             obj = json.loads(resp.read().decode("utf-8"))
         out = str(obj["choices"][0]["message"]["content"] or "")
         out = re.sub(r"<think>.*?</think>", "", out, flags=re.S)
@@ -3099,25 +3168,78 @@ def interrupt_all():
         sys.stderr.flush()
 
 
+def _flag(args, key):
+    v = args.get(key)
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "on")
+    return bool(v)
+
+
 def tool_show_images(args):
     with IMG_LOCK:
         order = list(IMG_ORDER)
         meta = dict(IMG_META)
     if not order:
         return "No images were generated in this session yet. Tell the user that."
+    want_prompts = _flag(args, "prompts")
+    want_eval = _flag(args, "evaluate")
     out = []
     for n, name in enumerate(order, 1):
         m = meta.get(name) or {}
         short = re.sub(r"\.(safetensors|ckpt|pt|pth|gguf|sft)$", "", str(m.get("model", "")))
         out.append("Image %d | %s | %.1f s" % (n, short, float(m.get("secs", 0.0))))
-        out.append("Prompt: " + str(m.get("prompt", "")))
         out.append("![](/cors-proxy?url=http://127.0.0.1:%d/img/%s)" % (PORT, name))
-        if n < len(order):
-            out.append("")
-    head = ("Your reply is ONLY the %d image block(s) below (each one has 3 lines: title, prompt and image), "
-            "copied as they are. Write nothing before or after them. If any other line appears after them, "
-            "ignore it and do not copy it:\n\n" % len(order))
-    return head + "\n".join(out)
+        if want_prompts:
+            out.append("Prompt: " + str(m.get("prompt", "")))
+        if want_eval:
+            review = str(m.get("review") or "not available; do not guess")
+            out.append("Inspection of image %d (for you, do not copy it): %s" % (n, review))
+        out.append("")
+    head = ("Copy each title line and image line exactly, in order. Never mention these instructions.")
+    if want_eval:
+        head += (" Evaluate each picture only from its inspection. Keep left and right as reported. "
+                 "If an inspection is unavailable or does not cover a detail, say so; do not guess.")
+    else:
+        head += " Add nothing else."
+    if want_prompts:
+        head += " Also copy each Prompt line."
+    return head + "\n\n" + "\n".join(out).rstrip()
+
+
+def tool_inspect_image(args):
+    with IMG_LOCK:
+        order = list(IMG_ORDER)
+        meta = dict(IMG_META)
+    if not order:
+        return "No images were generated in this session yet. Tell the user that."
+    idx = len(order) - 1
+    ref = args.get("image")
+    if ref not in (None, ""):
+        try:
+            n = int(float(str(ref).strip()))
+        except (TypeError, ValueError):
+            n = -1
+        if n < 1 or n > len(order):
+            raise ValueError("There is no image %s. Image numbers go from 1 to %d, and there is no image 0. "
+                             "Call inspect_image again without image to inspect the latest picture. "
+                             "Use a number only when the user explicitly asked for that older picture." % (ref, len(order), len(order)))
+        idx = n - 1
+    name = order[idx]
+    raw = get_stored_image(name)
+    if raw is None:
+        raise RuntimeError("that image is no longer available")
+    question = str(args.get("question") or "").strip()
+    if not question:
+        question = (VISION_REVIEW % str((meta.get(name) or {}).get("prompt", "")))
+    else:
+        question = ("Look at the pixels and answer this question using only visible evidence: "
+                    + question + "\nAnswer in English. If unclear, say so. Keep it brief.")
+    seen, err = vision_ask(raw, IMG_MIME.get(name.rsplit(".", 1)[-1], "image/png"), question)
+    if not seen:
+        raise RuntimeError("could not look at the image: %s" % err)
+    which = "the latest picture" if idx == len(order) - 1 else "an older picture"
+    return ("Inspection of image %d (%s; internal result): use only these findings when answering. "
+            "Do not add details or change left/right. If the inspection is unclear, say so.\n%s" % (idx + 1, which, seen))
 
 
 def tool_set_image_model(args):
@@ -3126,9 +3248,8 @@ def tool_set_image_model(args):
         raise ValueError("model is required")
     CURRENT_MODEL["name"] = resolve_model(model)
     short = re.sub(r"\.(safetensors|ckpt|pt|pth|gguf|sft)$", "", CURRENT_MODEL["name"])
-    return ("Image model set to %s. If the user also asked for a picture, call generate_image now with that request. "
-            "If the user only asked to load or change the model, confirm it in one short sentence and wait for the next request. "
-            "Do not call set_image_model again." % short)
+    return ("Image model set to %s. If the user also requested a picture, call generate_image now. "
+            "Otherwise, confirm the change briefly and stop. Do not select the model again." % short)
 
 
 def tool_generate_image(args):
@@ -3139,7 +3260,9 @@ def tool_generate_image(args):
     if not model:
         raise ValueError("No image model chosen yet. Call list_models, ask the user which one to use, then call set_image_model.")
     interrupt_all()
-    prompt, translate_err = translate_prompt(prompt)
+    translate_err = ""
+    if needs_translation(prompt):
+        prompt, translate_err = translate_prompt(prompt)
     warnings = []
     width = _number(args, "width", DEFAULTS["width"], 64, 2048, True, warnings)
     height = _number(args, "height", DEFAULTS["height"], 64, 2048, True, warnings)
@@ -3202,31 +3325,61 @@ def tool_generate_image(args):
     sid = new_session()
     req["session_id"] = sid
     t0 = time.time()
-    obj = swarm_call("/API/GenerateText2Image", req, timeout=900)
+    retried = False
+    for attempt in range(2):
+        obj = swarm_call("/API/GenerateText2Image", req, timeout=900)
+        urls = obj.get("images") or []
+        if not urls:
+            raise RuntimeError("SwarmUI returned no image")
+        first = load_image(urls[0])
+        if attempt == 1 or len(first[0]) >= 10000 or width * height < 262144:
+            break
+        import random
+        req["seed"] = random.randint(0, 2147483647)
+        retried = True
     elapsed = time.time() - t0
-    urls = obj.get("images") or []
-    if not urls:
-        raise RuntimeError("SwarmUI returned no image")
+    loaded = [first] + [load_image(u) for u in urls[1:]]
     info = "Generated image with model %s (%sx%s, steps=%s, CFG=%s, sampler=%s, scheduler=%s, seed=%s)." % (
         model, width, height, req["steps"], req["cfgscale"], req["sampler"], req["scheduler"], req["seed"])
     if warnings:
         info += " Adjustments: " + "; ".join(warnings) + "."
     info += " Generation time: %.1f seconds." % elapsed
+    if retried:
+        info += " The first attempt came out black, so it was generated again with a new seed."
     info += " Prompt sent to the image model: %s." % prompt.rstrip(" .")
     if translate_err:
-        info += " Translation failed (%s), so the original prompt was used." % translate_err
+        sys.stderr.write("translation failed: %s\n" % translate_err)
+        sys.stderr.flush()
     lines = []
-    for url in urls:
-        raw, mime = load_image(url)
+    reviews = []
+    review_err = ""
+    for raw, mime in loaded:
         name = store_image(raw, mime)
         lines.append("![](/cors-proxy?url=http://127.0.0.1:%d/img/%s)" % (PORT, name))
         IMG_META[name] = {"model": model, "secs": elapsed, "prompt": prompt.rstrip(" .")}
+        with IMG_LOCK:
+            number = len(IMG_ORDER)
+        if VISION:
+            seen, verr = vision_ask(raw, mime, VISION_REVIEW % prompt.rstrip(" ."))
+            if seen:
+                reviews.append(seen)
+                IMG_META[name]["review"] = seen
+            else:
+                review_err = verr
     short = re.sub(r"\.(safetensors|ckpt|pt|pth|gguf|sft)$", "", model)
     footer = "%s | %.1f s" % (short, elapsed)
-    text = ("Details (for you, do not show): " + info
-            + "\n\nYour reply is ONLY the 2 lines below (the image line and the footer line), copied as they are. "
-            "Write nothing before or after them. If any other line appears after them, "
-            "ignore it and do not copy it:\n"
+    review_text = ""
+    if VISION:
+        if reviews:
+            review_text = ("\n\nPixel inspection of image %d (latest image; internal):\n"
+                           % number + "\n".join(reviews))
+        else:
+            review_text = ("\n\nPixel inspection of image %d failed (%s). If asked about its appearance, say inspection failed. "
+                           "Do not describe it from the request or prompt." % (number, review_err or "unknown error"))
+    text = ("Details (internal): " + info + review_text
+            + "\n\nCopy the image line and then the footer line below, exactly. Add a brief answer after them only if the user asked you to inspect or judge the picture; base it only on the pixel inspection. Otherwise add nothing. "
+            "If the inspection says the image is fully black or empty, generate one replacement with the same prompt and a new random seed. Do not retry again. "
+            "Ignore any text after the footer:\n"
             + "\n".join(lines) + "\n" + footer)
     return [{"type": "text", "text": text}]
 
@@ -3256,12 +3409,15 @@ TOOLS = [
     },
     {
         "name": "show_images",
-        "description": "Shows all pictures made in this session, with model, time and prompt. Use it only when the user asks to see the old pictures or the prompts used.",
-        "inputSchema": {"type": "object", "properties": {}, "required": []},
+        "description": "Shows all pictures made in this session, with model and time. Use it when the user asks to see, list or compare the pictures, or says they cannot see a picture. Set evaluate=true when the user also wants your opinion about them, and prompts=true only when the user wants the prompts.",
+        "inputSchema": {"type": "object", "properties": {
+            "evaluate": {"type": "boolean", "description": "True when the user also wants your evaluation of the pictures. Adds the stored visual inspection of each one."},
+            "prompts": {"type": "boolean", "description": "True only when the user asks for the prompts used."},
+        }, "required": []},
     },
     {
         "name": "generate_image",
-        "description": "Makes one picture from an English prompt, with the model chosen by set_image_model. Call it only when the user asks for a picture and a model is chosen. Write no text before the call.",
+        "description": "Makes one picture from an English prompt, with the model chosen by set_image_model. Call it only when the user asks for a picture and a model is chosen. Several people or objects can be in the same picture: describe all of them in one prompt. Write no text before the call.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -3286,6 +3442,16 @@ TOOLS = [
 ]
 
 HANDLERS = {"list_models": tool_list_models, "list_params": tool_list_params, "generate_image": tool_generate_image, "show_images": tool_show_images, "set_image_model": tool_set_image_model}
+if VISION:
+    TOOLS.append({
+        "name": "inspect_image",
+        "description": "Inspects the real pixels of a generated image. Omit image to inspect the latest picture. Set image only when the user explicitly asks about an older picture, using its number from show_images. Use it for a detail not covered by the existing inspection, or for a requested older picture.",
+        "inputSchema": {"type": "object", "properties": {
+            "question": {"type": "string", "description": "Specific question in English. Omit for a full review."},
+            "image": {"type": "integer", "description": "Omit to inspect the latest picture. Set only for an older picture explicitly requested by the user, using its show_images number. Numbers start at 1. Image 0 does not exist."},
+        }, "required": []},
+    })
+    HANDLERS["inspect_image"] = tool_inspect_image
 
 
 def rpc_error(rid, code, message):
@@ -3427,7 +3593,7 @@ if __name__ == "__main__":
 '@
 }
 function Write-UiConfig {
-    param([int]$ResearchPort = 0, [int]$ImagePort = 0)
+    param([int]$ResearchPort = 0, [int]$ImagePort = 0, [bool]$ImageVision = $false)
     $date = (Get-Date).ToString('yyyy-MM-dd (dddd)', [System.Globalization.CultureInfo]::InvariantCulture)
     $servers = @()
     if ($ResearchPort -gt 0) {
@@ -3463,28 +3629,42 @@ function Write-UiConfig {
 
     if ($ImagePort -gt 0) {
         $imageWhen = @(
-            'Use the image tools only when the user clearly wants to obtain a picture, never for a casual mention. If the user only sends a picture or talks about pictures, just answer with text.',
-            'Never ask about size, style or details. The only question you may ask is which model to use.',
-            'When you call generate_image, call it right away with no text before it.'
+            'Use image tools only when the user asks you to create or edit a picture. A casual mention or an image upload alone is not a request to generate one.',
+            'Do not ask about size, style or details. The only question you may ask is which image model to use.',
+            'Call generate_image immediately, with no text before the call.'
         ) -join ' '
         $imageModel = @(
-            'You do not know which models exist: only the tools do. Never say that a model was loaded or chosen unless set_image_model returned success in this turn, and if it returns an error, tell the user and show the names it lists. Only the user chooses the model, so never pick one yourself, and never guess or invent a model name. Check these cases in order:',
-            '1. If you already called set_image_model successfully earlier in this conversation, or the user asked you not to ask again, call generate_image directly.',
-            '2. Otherwise, if the user wrote a model name (in this message, or as the answer to your question), call set_image_model with the name exactly as the user wrote it. If the user also asked for a picture, your very next action is generate_image with the original request. If the user only asked to load or change the model, confirm it in one short sentence using the full name from the result, and wait.',
-            '3. Otherwise, the user has not chosen a model yet: your first and only action is list_models. Do not call set_image_model. Then write only the model names (no file extension, no details) one per line, ask which one to use, and end the turn without calling generate_image.'
+            'Never choose or invent a model. Use only a model named by the user or returned by list_models. Do not claim a model was selected unless set_image_model succeeded.',
+            '1. If a model was successfully selected earlier in this conversation, or the user told you not to ask again, call generate_image.',
+            '2. If the user names a model, call set_image_model with that exact name. If a picture was also requested, call generate_image next with the original request. If only a model change was requested, confirm it briefly and stop.',
+            '3. If no model was chosen, call list_models only. List the returned model names, ask which one to use, and stop. Do not call generate_image.'
         ) -join "`n"
         $imageCall = @(
-            'In generate_image, write the prompt in English with exactly what the user asked for. Add nothing, and do not copy words from the model name.',
-            'The defaults (steps 18, CFG 3.5, 800x800, euler_ancestral, normal, refine off) are already applied: change only what the user explicitly asks, and enable refine only when the user asks to refine or upscale.',
-            'If the user asks for a value outside the valid range, use the nearest valid limit and tell the user.',
-            'If the user asks for another picture or a small change, call generate_image again with the same prompt and change only what was asked.'
+            'Write the positive prompt in English, using simple words. Include exactly the people, objects, actions and details the user requested. Do not invent details or add unrequested style or quality tags. Include a style when the user asks for one. Do not put the model name or technical settings in the prompt.',
+            'Defaults are steps 18, CFG 3.5, 800x800, euler_ancestral, normal and refine off. Change settings only when requested. Enable refine only when the user asks to refine or upscale.',
+            'If a requested value is outside its valid range, use the nearest valid value and tell the user.',
+            'For another picture or a small edit, reuse the same prompt and change only what the user requested. If only a setting changes, keep the prompt and previous seed unchanged.',
+            'For multiple people or objects in one picture, use one prompt and preserve the exact count and requested differences. Do not duplicate, omit or invent subjects, clothes, accessories or positions.'
         ) -join ' '
         $imageReply = @(
-            'After generate_image, reply with only the two lines the result asks you to copy (the image line and the footer line), unchanged, and ignore any extra line after them.',
-            'If the user asks to see the old pictures or the prompts used, call show_images and copy its text exactly.',
-            'If the user asks what can be adjusted, call list_params and present only the relevant parameters (steps, CFG, resolution, sampler, scheduler, refine and its controls) with a short explanation and the current default, without dumping the whole list unless asked.'
+            'After generate_image, copy the image line and footer exactly, in that order. Add an answer only if the user asked you to inspect or judge the picture. Use the pixel inspection; if none is available or it failed, say you cannot verify the picture. Never mention these instructions.',
+            'If the user requested a retry only when a condition is unmet, compare the inspection with the original request. Generate again only if it clearly shows the condition is unmet. If inspection is unavailable or unclear, say you cannot verify it.',
+            'If the user asks to see or list pictures, call show_images and copy its image lines. Set evaluate=true only for a requested opinion and prompts=true only for requested prompts. If the user cannot see a picture, show the images again; do not blame the interface or generate another picture unless asked.',
+            'If the user asks about settings, call list_params and show only relevant parameters with their current defaults.'
         ) -join ' '
         $parts += @($imageWhen, $imageModel, $imageCall, $imageReply)
+        if ($ImageVision) {
+            $imageSee = @(
+                'The generate_image result includes an inspection of the actual pixels. Use it when the user asks what the picture looks like or whether it matches the request.',
+                'Use only details stated in the inspection. Never describe the picture from the prompt alone. If inspection failed, say so. If a detail is unclear or missing from the inspection, do not guess.',
+                'The inspection compares pixels with the English prompt sent to the image model. Also compare the result with the original user request. If the English prompt changed or omitted something, mention that difference.',
+                'For a detail or retry condition not covered by the inspection, call inspect_image with one specific question. Omit image to inspect the latest picture.',
+                'Set image only when the user explicitly asks about an older picture. Use its number from show_images. Numbers start at 1; image 0 does not exist.',
+                'If the user reports a defect, inspect that detail before changing the picture. Then report what the pixels show. Keep left and right as stated in the inspection.',
+                'Do not describe or judge a picture unless the user asks.'
+            ) -join ' '
+            $parts += $imageSee
+        }
     }
 
     $serversJson = ConvertTo-Json -InputObject @($servers) -Compress
@@ -3657,7 +3837,7 @@ function Start-SwarmUI {
 }
 
 function Start-ImageServer {
-    param([string]$LogPath, [string]$BatPath, [int]$LlamaPort = 0)
+    param([string]$LogPath, [string]$BatPath, [int]$LlamaPort = 0, [bool]$Vision = $false)
     $port = Get-NextFreePort 6000
     $result = [pscustomobject]@{ Ok = $false; Error = ''; Port = $port; Proc = $null; Files = @(); ErrLog = ''; Swarm = $null; Url = '' }
     $uv = Get-UvPath
@@ -3693,7 +3873,7 @@ function Start-ImageServer {
         [System.IO.File]::WriteAllText($pyPath, ((Get-ImageServerSource) -replace "`r`n", "`n"), $enc)
         $swarmPid = 0
         if ($swarm.Proc) { $swarmPid = [int]$swarm.Proc.Id }
-        $uvArgs = @('run', '--no-project', 'python', ('"' + $pyPath + '"'), [string]$port, [string]$PID, [string]$swarm.Url, [string]$swarmPid, [string]$LlamaPort, ('"' + $imageSaveDir + '"'))
+        $uvArgs = @('run', '--no-project', 'python', ('"' + $pyPath + '"'), [string]$port, [string]$PID, [string]$swarm.Url, [string]$swarmPid, [string]$LlamaPort, ('"' + $imageSaveDir + '"'), [string]([int][bool]$Vision))
         $proc = Start-Process -FilePath $uv -ArgumentList $uvArgs -WorkingDirectory $env:TEMP -WindowStyle Hidden -PassThru -RedirectStandardOutput $outPath -RedirectStandardError $errPath
         $result.Proc = $proc
         $started = Get-Date
@@ -5175,6 +5355,7 @@ function Start-LlamaServer {
             $script:Research = Start-ResearchServer $logPath ([int]$Cfg.Ctx)
         }
 
+        $imageVision = ([string]$Cfg.Vision -ne 'off') -and [bool]$Cfg.Model.Mmproj
         if ([string]$Cfg.Image -eq 'on') {
             $imageIssue = Get-ImageIssue $Cfg
             if ($imageIssue) {
@@ -5184,7 +5365,7 @@ function Start-LlamaServer {
                 Show-Header 'Preparando geração de imagem'
                 Write-Host ''
                 Write-Host '  Iniciando o SwarmUI e o servidor de imagem (na primeira vez o SwarmUI pode demorar)...' -ForegroundColor Gray
-                $script:Image = Start-ImageServer $logPath ([string]$Cfg.ImagePath) ([int]$Cfg.Port)
+                $script:Image = Start-ImageServer $logPath ([string]$Cfg.ImagePath) ([int]$Cfg.Port) ([bool]$imageVision)
             }
         }
 
@@ -5194,7 +5375,7 @@ function Start-LlamaServer {
         if ($script:Research -and $script:Research.Ok) { $researchPort = [int]$script:Research.Port }
         if ($script:Image -and $script:Image.Ok) { $imagePort = [int]$script:Image.Port }
         if ($researchPort -gt 0 -or $imagePort -gt 0) {
-            $uiConfigPath = Write-UiConfig -ResearchPort $researchPort -ImagePort $imagePort
+            $uiConfigPath = Write-UiConfig -ResearchPort $researchPort -ImagePort $imagePort -ImageVision ([bool]$imageVision)
         }
         $serverArgs = Build-ServerArgs $Cfg $logPath $uiConfigPath
         Show-StartSummary $Cfg $logPath $script:Research $script:Image
