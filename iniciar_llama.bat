@@ -45,6 +45,126 @@ $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 $OutputEncoding = [System.Text.Encoding]::UTF8
 
+if (-not ('LlamaLauncherJob' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Threading;
+
+public static class LlamaLauncherJob
+{
+    [StructLayout(LayoutKind.Sequential)]
+    struct BASIC_LIMIT_INFORMATION
+    {
+        public long PerProcessUserTimeLimit;
+        public long PerJobUserTimeLimit;
+        public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize;
+        public UIntPtr MaximumWorkingSetSize;
+        public uint ActiveProcessLimit;
+        public UIntPtr Affinity;
+        public uint PriorityClass;
+        public uint SchedulingClass;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct IO_COUNTERS
+    {
+        public ulong ReadOperationCount;
+        public ulong WriteOperationCount;
+        public ulong OtherOperationCount;
+        public ulong ReadTransferCount;
+        public ulong WriteTransferCount;
+        public ulong OtherTransferCount;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct EXTENDED_LIMIT_INFORMATION
+    {
+        public BASIC_LIMIT_INFORMATION BasicLimitInformation;
+        public IO_COUNTERS IoInfo;
+        public UIntPtr ProcessMemoryLimit;
+        public UIntPtr JobMemoryLimit;
+        public UIntPtr PeakProcessMemoryUsed;
+        public UIntPtr PeakJobMemoryUsed;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern IntPtr CreateJobObject(IntPtr attributes, string name);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool SetInformationJobObject(IntPtr job, int infoClass, IntPtr info, uint length);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern IntPtr OpenProcess(uint access, bool inherit, int processId);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool CloseHandle(IntPtr handle);
+    [DllImport("kernel32.dll")]
+    static extern IntPtr GetCurrentProcess();
+
+    public static bool Start(int parentProcessId)
+    {
+        IntPtr job = CreateJobObject(IntPtr.Zero, null);
+        if (job == IntPtr.Zero) return false;
+
+        EXTENDED_LIMIT_INFORMATION limits = new EXTENDED_LIMIT_INFORMATION();
+        limits.BasicLimitInformation.LimitFlags = 0x00002000;
+        int size = Marshal.SizeOf(typeof(EXTENDED_LIMIT_INFORMATION));
+        IntPtr memory = Marshal.AllocHGlobal(size);
+        try
+        {
+            Marshal.StructureToPtr(limits, memory, false);
+            if (!SetInformationJobObject(job, 9, memory, (uint)size))
+            {
+                CloseHandle(job);
+                return false;
+            }
+        }
+        finally { Marshal.FreeHGlobal(memory); }
+
+        IntPtr parent = OpenProcess(0x00100101, false, parentProcessId);
+        if (parent == IntPtr.Zero)
+        {
+            CloseHandle(job);
+            return false;
+        }
+        AssignProcessToJobObject(job, parent);
+        if (!AssignProcessToJobObject(job, GetCurrentProcess()))
+        {
+            CloseHandle(parent);
+            CloseHandle(job);
+            return false;
+        }
+
+        if (parent != IntPtr.Zero)
+        {
+            IntPtr capturedJob = job;
+            IntPtr capturedParent = parent;
+            Thread watcher = new Thread(delegate()
+            {
+                WaitForSingleObject(capturedParent, 0xFFFFFFFF);
+                CloseHandle(capturedJob);
+                CloseHandle(capturedParent);
+            });
+            watcher.IsBackground = true;
+            watcher.Start();
+        }
+        return true;
+    }
+}
+'@
+}
+try {
+    $parentInfo = Get-CimInstance Win32_Process -Filter ('ProcessId={0}' -f $PID) -ErrorAction Stop
+    $parentPid = [int]$parentInfo.ParentProcessId
+    if (-not [LlamaLauncherJob]::Start($parentPid)) { throw 'Não foi possível ativar o encerramento automático dos processos.' }
+} catch {
+    Write-Host ('Falha ao configurar o encerramento automático: ' + $_.Exception.Message) -ForegroundColor Red
+    exit 1
+}
+
 $script:Root = $env:LLAMA_ROOT
 if ([string]::IsNullOrWhiteSpace($script:Root)) { $script:Root = Split-Path -Parent $PSCommandPath }
 $script:Root = $script:Root.TrimEnd('\')
@@ -4182,11 +4302,7 @@ function Stop-ResearchServer {
     param($Research)
     if (-not $Research) { return }
     if ($Research.Proc) {
-        try {
-            if (-not $Research.Proc.HasExited) {
-                Start-Process -FilePath 'taskkill.exe' -ArgumentList @('/PID', [string]$Research.Proc.Id, '/T', '/F') -WindowStyle Hidden -Wait | Out-Null
-            }
-        } catch { }
+        Stop-ProcessTree $Research.Proc
         $Research.Proc = $null
     }
     foreach ($f in @($Research.Files)) {
@@ -4198,13 +4314,48 @@ function Stop-ResearchServer {
     }
 }
 
+function Stop-ProcessTreeById {
+    param([int]$ProcessId)
+    if ($ProcessId -le 0) { return }
+
+    try {
+        $all = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+        $byParent = @{}
+        foreach ($item in $all) {
+            $parent = [int]$item.ParentProcessId
+            if (-not $byParent.ContainsKey($parent)) { $byParent[$parent] = New-Object System.Collections.ArrayList }
+            [void]$byParent[$parent].Add([int]$item.ProcessId)
+        }
+
+        $ordered = New-Object System.Collections.ArrayList
+        $seen = @{}
+        $visit = {
+            param([int]$id)
+            if ($seen.ContainsKey($id)) { return }
+            $seen[$id] = $true
+            if ($byParent.ContainsKey($id)) {
+                foreach ($child in @($byParent[$id])) { & $visit ([int]$child) }
+            }
+            [void]$ordered.Add($id)
+        }
+        & $visit $ProcessId
+
+        foreach ($id in $ordered) {
+            try { Stop-Process -Id ([int]$id) -Force -ErrorAction SilentlyContinue } catch { }
+        }
+    } catch {
+        try {
+            Start-Process -FilePath 'taskkill.exe' -ArgumentList @('/PID', [string]$ProcessId, '/T', '/F') -WindowStyle Hidden -Wait | Out-Null
+        } catch { }
+    }
+}
+
 function Stop-ProcessTree {
     param($Proc)
     if (-not $Proc) { return }
     try {
-        if (-not $Proc.HasExited) {
-            Start-Process -FilePath 'taskkill.exe' -ArgumentList @('/PID', [string]$Proc.Id, '/T', '/F') -WindowStyle Hidden -Wait | Out-Null
-        }
+        $id = [int]$Proc.Id
+        if ($id -gt 0) { Stop-ProcessTreeById -ProcessId $id }
     } catch { }
 }
 
@@ -4416,10 +4567,12 @@ function Get-NextFreePort {
 function Stop-LlamaPort {
     param([int]$Port)
     try {
-        $conn = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($conn -and $conn.OwningProcess) {
-            Stop-Process -Id ([int]$conn.OwningProcess) -Force -ErrorAction Stop
-            return $true
+        $listeners = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty OwningProcess -Unique)
+        if ($listeners.Count -gt 0) {
+            foreach ($processId in $listeners) { Stop-ProcessTreeById -ProcessId ([int]$processId) }
+            for ($i = 0; $i -lt 20 -and -not (Test-PortFree $Port); $i++) { Start-Sleep -Milliseconds 250 }
+            return (Test-PortFree $Port)
         }
     } catch { }
     return $false
