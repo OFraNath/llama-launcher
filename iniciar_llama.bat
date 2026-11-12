@@ -65,6 +65,14 @@ $script:CachePath = Join-Path $script:Root 'llama_launcher_cache.json'
 $script:LogDir = Join-Path $script:Root 'logs'
 $script:Hit = @{}
 $script:FootHit = @()
+$script:FrameOpen = $false
+$script:FrameExtent = -1
+$script:FramePrev = 0
+$script:LastTitle = $null
+$script:FxOk = $false
+$script:FxRec = $false
+$script:FxBlank = [System.ConsoleColor]::Black
+$script:StatusRow = -1
 $script:MouseOk = $false
 $script:LastClick = [datetime]::MinValue
 $script:Bench = @{}
@@ -133,10 +141,271 @@ function Fit-Text {
     return $t
 }
 
+function Initialize-Fx {
+    $script:FxOk = $false
+    $script:FxRec = $false
+    if ($env:LLAMA_NOFX -eq '1') { return }
+    $src = @'
+
+using System;
+using System.Runtime.InteropServices;
+using System.Threading;
+public static class LlamaFx {
+    [StructLayout(LayoutKind.Sequential)] struct COORD { public short X; public short Y; }
+    [StructLayout(LayoutKind.Sequential)] struct SMALL_RECT { public short Left; public short Top; public short Right; public short Bottom; }
+    [StructLayout(LayoutKind.Sequential)] struct CHAR_INFO { public ushort Ch; public ushort Attr; }
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr GetStdHandle(int n);
+    [DllImport("kernel32.dll", EntryPoint = "ReadConsoleOutputW", SetLastError = true)]
+    static extern bool ReadConsoleOutput(IntPtr h, [Out] CHAR_INFO[] buf, COORD size, COORD coord, ref SMALL_RECT rect);
+    [DllImport("kernel32.dll", EntryPoint = "WriteConsoleOutputW", SetLastError = true)]
+    static extern bool WriteConsoleOutput(IntPtr h, [In] CHAR_INFO[] buf, COORD size, COORD coord, ref SMALL_RECT rect);
+
+    static int W, H, Top;
+    static ushort[] rec;
+    static ushort BlankAttr = 7;
+    static readonly byte[] DimMap = new byte[] { 0, 0, 0, 8, 0, 0, 0, 8, 0, 1, 2, 3, 4, 5, 6, 7 };
+
+    static bool ReadRegion(int top, int w, int h, out CHAR_INFO[] buf) {
+        buf = new CHAR_INFO[w * h];
+        SMALL_RECT r = new SMALL_RECT();
+        r.Left = 0; r.Top = (short)top; r.Right = (short)(w - 1); r.Bottom = (short)(top + h - 1);
+        COORD size = new COORD(); size.X = (short)w; size.Y = (short)h;
+        COORD org = new COORD();
+        return ReadConsoleOutput(GetStdHandle(-11), buf, size, org, ref r);
+    }
+    static void WriteRows(CHAR_INFO[] buf, int y0, int y1) {
+        if (y0 < 0) y0 = 0;
+        if (y1 > H - 1) y1 = H - 1;
+        if (y1 < y0) return;
+        SMALL_RECT r = new SMALL_RECT();
+        r.Left = 0; r.Top = (short)(Top + y0); r.Right = (short)(W - 1); r.Bottom = (short)(Top + y1);
+        COORD size = new COORD(); size.X = (short)W; size.Y = (short)H;
+        COORD org = new COORD(); org.X = 0; org.Y = (short)y0;
+        WriteConsoleOutput(GetStdHandle(-11), buf, size, org, ref r);
+    }
+    static CHAR_INFO[] Dim(CHAR_INFO[] src) {
+        CHAR_INFO[] d = new CHAR_INFO[src.Length];
+        for (int i = 0; i < src.Length; i++) {
+            ushort a = src[i].Attr;
+            int fg = DimMap[a & 15];
+            int bg = DimMap[(a >> 4) & 15];
+            d[i].Ch = src[i].Ch;
+            d[i].Attr = (ushort)((a & 0xFF00) | (bg << 4) | fg);
+        }
+        return d;
+    }
+    static void FillRow(CHAR_INFO[] buf, int row, ushort ch, ushort attr) {
+        for (int x = 0; x < W; x++) { buf[row * W + x].Ch = ch; buf[row * W + x].Attr = attr; }
+    }
+    static void CopyRow(CHAR_INFO[] src, CHAR_INFO[] dst, int row) {
+        Array.Copy(src, row * W, dst, row * W, W);
+    }
+
+    // Fade-out: escurece o quadro atual e apaga com uma linha de varredura descendo.
+    public static void Out(int top, int w, int h, int blankAttr) {
+        Top = top; W = w; H = h;
+        CHAR_INFO[] cur;
+        if (!ReadRegion(top, w, h, out cur)) return;
+        ushort blank = (ushort)(blankAttr & 0xFF);
+        CHAR_INFO last = cur[cur.Length - 1];
+        if (last.Ch == 32) blank = (ushort)(last.Attr & 0xFF);
+        BlankAttr = blank;
+        CHAR_INFO[] dim = Dim(cur);
+        WriteRows(dim, 0, H - 1);
+        Thread.Sleep(14);
+        int step = Math.Max(2, (H + 9) / 10);
+        ushort bar = (ushort)(15 | (blank & 0xF0));
+        int prev = 0;
+        for (int y = 0; y < H; y += step) {
+            for (int r = prev; r < y; r++) FillRow(dim, r, 32, blank);
+            WriteRows(dim, prev, y - 1);
+            prev = y;
+            FillRow(dim, y, 0x2550, bar);
+            WriteRows(dim, y, y);
+            Thread.Sleep(5);
+        }
+        for (int r = prev; r < H; r++) FillRow(dim, r, 32, blank);
+        WriteRows(dim, prev, H - 1);
+    }
+
+    // Prepara o registro das cores reais do proximo quadro (o texto e escrito "invisivel").
+    public static void BeginRec(int top, int w, int h) {
+        Top = top; W = w; H = h;
+        rec = new ushort[w * h];
+        for (int i = 0; i < rec.Length; i++) rec[i] = 0xFFFF;
+        CHAR_INFO[] cur;
+        if (ReadRegion(top, w, h, out cur)) {
+            CHAR_INFO c = cur[cur.Length - 1];
+            if (c.Ch == 32) BlankAttr = (ushort)(c.Attr & 0xFF);
+        } else {
+            rec = null;
+        }
+    }
+    public static int BlankBg() { return (BlankAttr >> 4) & 15; }
+    public static bool Rec(int x, int y, int len, int fg, int bg) {
+        if (rec == null) return false;
+        int ry = y - Top;
+        if (ry < 0 || ry >= H) return false;
+        if (x < 0 || x + len > W) return false;
+        ushort a = (ushort)((fg & 15) | ((bg & 15) << 4));
+        for (int i = 0; i < len; i++) rec[ry * W + x + i] = a;
+        return true;
+    }
+
+    // Fade-in: revela o quadro de cima para baixo, com a linha de varredura na frente.
+    public static void In() {
+        if (rec == null) return;
+        CHAR_INFO[] fin;
+        if (!ReadRegion(Top, W, H, out fin)) { rec = null; return; }
+        for (int i = 0; i < fin.Length; i++) {
+            if (rec[i] != 0xFFFF) fin[i].Attr = (ushort)((fin[i].Attr & 0xFF00) | rec[i]);
+        }
+        rec = null;
+        int lastRow = 0;
+        for (int y = H - 1; y >= 0; y--) {
+            bool any = false;
+            for (int x = 0; x < W; x++) { if (fin[y * W + x].Ch != 32) { any = true; break; } }
+            if (any) { lastRow = y; break; }
+        }
+        CHAR_INFO[] dim = Dim(fin);
+        CHAR_INFO[] work = (CHAR_INFO[])fin.Clone();
+        int rows = Math.Min(H, lastRow + 2);
+        int step = Math.Max(2, (rows + 9) / 10);
+        ushort bar = (ushort)(15 | (BlankAttr & 0xF0));
+        for (int y = 0; y < rows; y += step) {
+            int a0 = Math.Max(0, y - 2 * step);
+            for (int r = a0; r < y - step; r++) CopyRow(fin, work, r);
+            for (int r = Math.Max(0, y - step); r < y; r++) CopyRow(dim, work, r);
+            FillRow(work, y, 0x2550, bar);
+            WriteRows(work, a0, y);
+            Thread.Sleep(5);
+        }
+        WriteRows(fin, 0, H - 1);
+    }
+}
+
+'@
+    try {
+        if (-not ('LlamaFx' -as [type])) {
+            Add-Type -TypeDefinition $src -Language CSharp -ErrorAction Stop
+        }
+        $script:FxOk = $true
+    } catch { $script:FxOk = $false }
+}
+
+function Start-FxTransition {
+    param([bool]$FadeOut = $true)
+    try {
+        $w = [Math]::Min([int][Console]::WindowWidth, 116)
+        $h = [Math]::Min([int][Console]::WindowHeight, 60)
+        $top = [int]$Host.UI.RawUI.WindowPosition.Y
+        if ($FadeOut) {
+            $bl = [int]$Host.UI.RawUI.ForegroundColor -bor ([int]$Host.UI.RawUI.BackgroundColor -shl 4)
+            [LlamaFx]::Out($top, $w, $h, $bl)
+        }
+        [LlamaFx]::BeginRec($top, $w, $h)
+        $script:FxBlank = [System.ConsoleColor]([LlamaFx]::BlankBg())
+        $script:FxRec = $true
+    } catch {
+        $script:FxRec = $false
+    }
+}
+
+# Quadro sem piscar: o conteudo antigo fica na tela e e sobrescrito no lugar;
+# o que sobra (fim de linha e linhas abaixo) e apagado em Complete-Frame.
 function Clear-Screen {
+    if ($script:FrameOpen) { Complete-Frame }
     $script:Hit = @{}
     $script:FootHit = @()
-    try { [Console]::Clear() } catch { Clear-Host }
+    try {
+        if ([int]$script:FrameExtent -lt 0) {
+            [Console]::Clear()
+            $script:FrameExtent = 0
+            $script:FramePrev = 0
+        } else {
+            $script:FramePrev = [Math]::Max([int]$script:FrameExtent, [int][Console]::CursorTop)
+            try { $Host.UI.RawUI.WindowPosition = New-Object System.Management.Automation.Host.Coordinates -ArgumentList 0, 0 } catch { }
+            [Console]::SetCursorPosition(0, 0)
+        }
+        $script:FrameOpen = $true
+    } catch {
+        $script:FrameOpen = $false
+        Clear-Host
+    }
+}
+
+function Complete-Frame {
+    if (-not $script:FrameOpen) { return }
+    $script:FrameOpen = $false
+    try {
+        $pw = [Math]::Min([int][Console]::BufferWidth, [int][Console]::WindowWidth) - 1
+        $cl = [int][Console]::CursorLeft
+        $ct = [int][Console]::CursorTop
+        $last = [Math]::Max([int]$script:FramePrev, $ct)
+        $maxRow = [int][Console]::BufferHeight - 1
+        if ($last -gt $maxRow) { $last = $maxRow }
+        $y = $ct
+        if ($cl -gt 0) {
+            if ($cl -lt $pw) { [Console]::Write(' ' * ($pw - $cl)) }
+            $y = $ct + 1
+        }
+        while ($y -le $last) {
+            [Console]::SetCursorPosition(0, $y)
+            [Console]::Write(' ' * $pw)
+            $y++
+        }
+        [Console]::SetCursorPosition($cl, $ct)
+        $script:FrameExtent = $ct
+    } catch { }
+    if ($script:FxRec) {
+        $script:FxRec = $false
+        try { [LlamaFx]::In() } catch { }
+    }
+}
+
+# Durante um quadro, Write-Host limpa o resto da linha (evita sobras do quadro anterior)
+# e, em troca de tela, escreve o texto invisivel registrando as cores para o fade-in.
+function Write-Host {
+    [CmdletBinding()]
+    param(
+        [Parameter(Position = 0, ValueFromRemainingArguments = $true)]
+        [object[]]$Object,
+        [switch]$NoNewline,
+        [object]$Separator = ' ',
+        [System.ConsoleColor]$ForegroundColor,
+        [System.ConsoleColor]$BackgroundColor
+    )
+    if (-not $script:FrameOpen) {
+        Microsoft.PowerShell.Utility\Write-Host @PSBoundParameters
+        return
+    }
+    $text = ((@($Object) | ForEach-Object { [string]$_ }) -join [string]$Separator)
+    $invisible = $false
+    if ($script:FxRec) {
+        $fg = [Console]::ForegroundColor
+        $bg = [Console]::BackgroundColor
+        if ($PSBoundParameters.ContainsKey('ForegroundColor')) { $fg = $ForegroundColor }
+        if ($PSBoundParameters.ContainsKey('BackgroundColor')) { $bg = $BackgroundColor }
+        try {
+            $invisible = [bool][LlamaFx]::Rec([int][Console]::CursorLeft, [int][Console]::CursorTop, $text.Length, [int]$fg, [int]$bg)
+        } catch { $invisible = $false }
+    }
+    if ($invisible) {
+        Microsoft.PowerShell.Utility\Write-Host $text -NoNewline -ForegroundColor $script:FxBlank -BackgroundColor $script:FxBlank
+    } else {
+        $p = @{}
+        if ($PSBoundParameters.ContainsKey('ForegroundColor')) { $p['ForegroundColor'] = $ForegroundColor }
+        if ($PSBoundParameters.ContainsKey('BackgroundColor')) { $p['BackgroundColor'] = $BackgroundColor }
+        Microsoft.PowerShell.Utility\Write-Host $text -NoNewline @p
+    }
+    if (-not $NoNewline) {
+        try {
+            $pw = [Math]::Min([int][Console]::BufferWidth, [int][Console]::WindowWidth) - 1
+            $cl = [int][Console]::CursorLeft
+            if ($cl -lt $pw) { [Console]::Write(' ' * ($pw - $cl)) }
+        } catch { }
+        [Console]::WriteLine()
+    }
 }
 
 function Register-Hit {
@@ -146,6 +415,12 @@ function Register-Hit {
 
 function Show-Header {
     param([string]$Title = '')
+    $firstFrame = ($null -eq $script:LastTitle)
+    $isNew = $firstFrame -or ($Title -ne [string]$script:LastTitle)
+    $script:LastTitle = $Title
+    if ($isNew -and $script:FxOk -and $script:FrameOpen -and -not $script:FxRec) {
+        Start-FxTransition (-not $firstFrame)
+    }
     $w = Get-UIWidth
     Write-Host ('=' * $w) -ForegroundColor DarkCyan
     Write-Host '  LLAMA LAUNCHER' -NoNewline -ForegroundColor Cyan
@@ -353,6 +628,7 @@ function New-KeyObj {
 }
 
 function Read-Key {
+    Complete-Frame
     if (-not $script:MouseOk) {
         $k = [Console]::ReadKey($true)
         return (New-KeyObj ([string]$k.Key) $k.KeyChar)
@@ -4473,6 +4749,7 @@ function Render-SetupScreen {
     }
     Write-Host ''
     if (-not $NoFooter) { Write-Footer '  Instalações locais   Modelos não incluídos' }
+    Complete-Frame
 }
 
 function Show-SetupMenu {
@@ -5729,6 +6006,7 @@ function Show-Settings {
         Write-Host ''
         $footer = '  ↑↓ navegar   ←→ alterar   Enter editar/iniciar   Esc voltar   Q sair'
         Write-Footer $footer
+        Complete-Frame
 
         if ($autoBench) {
             $autoBench = $false
@@ -5998,62 +6276,85 @@ function Remove-OldLogs {
     } catch { }
 }
 
+function Write-InfoLine {
+    param([string]$Label, [string]$Value, [string]$Color = 'Gray')
+    $w = Get-UIWidth
+    $prefix = ('  ' + $Label).PadRight(13)
+    $room = $w - 14
+    $lines = @(Wrap-Text $Value $room)
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($i -eq 0) {
+            Write-Host $prefix -NoNewline -ForegroundColor DarkGray
+        } else {
+            Write-Host (' ' * 13) -NoNewline
+        }
+        Write-Host $lines[$i] -ForegroundColor $Color
+    }
+}
+
 function Show-StartSummary {
     param($Cfg, [string]$LogPath, $Research = $null, $Image = $null)
     $w = Get-UIWidth
     Clear-Screen
-    Show-Header 'Iniciando servidor'
+    Show-Header 'Servidor'
     Write-Host ''
-    Write-Host ('  Modelo:     ' + $Cfg.Model.Display) -ForegroundColor White
-    Write-Host ('  Contexto:   {0} tokens   |   KV: {1} / {2}   |   Batch: {3}' -f $Cfg.Ctx, $Cfg.Ctk, $Cfg.Ctv, (Get-BatchLabel $Cfg.Batch)) -ForegroundColor Gray
-    Write-Host ('  GPU:        {0}   |   Visão: {1}   |   Raciocínio: {2}' -f (Get-NglLabel $Cfg.Ngl $Cfg.Model), (Get-VisionLabel $Cfg), $Cfg.Reasoning) -ForegroundColor Gray
-    Write-Host ('  Porta:      {0}   |   Navegador: {1}' -f $Cfg.Port, (Get-BrowserLabel $Cfg.Browser)) -ForegroundColor Gray
-    Write-Host ('  Template:   ' + (Get-TemplateLabel $Cfg.Template)) -ForegroundColor Gray
-    Write-Host ('  CPU:        Threads {0}   |   Cache de prompt: {1}' -f (Get-ThreadsLabel $Cfg.Threads), (Get-CacheRamLabel $Cfg)) -ForegroundColor Gray
-    Write-Host ('  Rede:       ' + (Get-HostLabel $Cfg.Host)) -ForegroundColor Gray
-    if ([string]$Cfg.Agent -eq 'on') {
-        if (Test-AgentSupported) {
-            Write-Host '  Agente:     ligado (ler/gravar arquivos e executar comandos)' -ForegroundColor Gray
-            Write-Host ('  Pasta base: ' + $script:Root) -ForegroundColor Gray
-        } else {
-            Write-Host '  Agente:     indisponível (llama-server.exe antigo, --agent ignorado)' -ForegroundColor Red
-        }
+    Write-InfoLine 'Modelo' ([string]$Cfg.Model.Display) 'White'
+    Write-InfoLine 'Contexto' ('{0} tokens  |  KV {1}/{2}  |  Batch {3}' -f $Cfg.Ctx, $Cfg.Ctk, $Cfg.Ctv, (Get-BatchLabel $Cfg.Batch))
+    Write-InfoLine 'Hardware' ('GPU {0}  |  Threads {1}  |  Cache de prompt {2}' -f (Get-NglLabel $Cfg.Ngl $Cfg.Model), (Get-ThreadsLabel $Cfg.Threads), (Get-CacheRamLabel $Cfg))
+
+    $feat = @()
+    $feat += ('Visão ' + (Get-VisionLabel $Cfg))
+    $feat += ('Raciocínio ' + [string]$Cfg.Reasoning)
+    $tpl = Get-TemplateLabel $Cfg.Template
+    if ($tpl) { $feat += ('Template ' + $tpl) }
+    if ([string]$Cfg.Agent -eq 'on' -and (Test-AgentSupported)) { $feat += 'Agente ligado' }
+    if ([string]$Cfg.Research -eq 'on' -and $Research -and $Research.Ok) { $feat += ('Pesquisa :' + $Research.Port) }
+    if ([string]$Cfg.Image -eq 'on' -and $Image -and $Image.Ok) { $feat += ('Imagem :' + $Image.Port + ' (SwarmUI :' + $Image.Swarm.Port + ')') }
+    Write-InfoLine 'Recursos' ($feat -join '  |  ')
+
+    # Avisos e falhas em vermelho, uma linha cada
+    if ([string]$Cfg.Agent -eq 'on' -and -not (Test-AgentSupported)) {
+        Write-InfoLine 'Agente' 'indisponível (llama-server.exe antigo, --agent ignorado)' 'Red'
     }
     if ([string]$Cfg.Research -eq 'on') {
-        if ($Research -and $Research.Ok) {
-            Write-Host ('  Pesquisa:   ligada (servidor local na porta {0})' -f $Research.Port) -ForegroundColor Cyan
-        } elseif ($Research) {
-            Write-Host ('  Pesquisa:   falhou (' + $Research.Error + ')') -ForegroundColor Red
-        } elseif (-not (Test-ResearchSupported)) {
-            Write-Host '  Pesquisa:   indisponível (llama-server.exe antigo, sem --ui-mcp-proxy)' -ForegroundColor Red
+        if ($Research -and -not $Research.Ok) {
+            Write-InfoLine 'Pesquisa' ('falhou (' + $Research.Error + ')') 'Red'
+        } elseif (-not $Research -and -not (Test-ResearchSupported)) {
+            Write-InfoLine 'Pesquisa' 'indisponível (llama-server.exe antigo, sem --ui-mcp-proxy)' 'Red'
         }
     }
     if ([string]$Cfg.Image -eq 'on') {
-        if ($Image -and $Image.Ok) {
-            Write-Host ('  Imagem:     ligada (SwarmUI na porta {0}, MCP na porta {1})' -f $Image.Swarm.Port, $Image.Port) -ForegroundColor Cyan
-            Write-Host ('  SwarmUI:    ' + [string]$Cfg.ImagePath) -ForegroundColor DarkGray
-        } elseif ($Image) {
-            Write-Host ('  Imagem:     falhou (' + $Image.Error + ')') -ForegroundColor Red
-        } elseif (-not (Test-ResearchSupported)) {
-            Write-Host '  Imagem:     indisponível (llama-server.exe antigo, sem --ui-mcp-proxy)' -ForegroundColor Red
-        } elseif ([string]::IsNullOrWhiteSpace([string]$Cfg.ImagePath)) {
-            Write-Host '  Imagem:     desativada (sem caminho)' -ForegroundColor Red
-        } else {
-            Write-Host ('  Imagem:     indisponível (' + (Get-ImageIssue $Cfg) + ')') -ForegroundColor Red
+        if ($Image -and -not $Image.Ok) {
+            Write-InfoLine 'Imagem' ('falhou (' + $Image.Error + ')') 'Red'
+        } elseif (-not $Image) {
+            if (-not (Test-ResearchSupported)) {
+                Write-InfoLine 'Imagem' 'indisponível (llama-server.exe antigo, sem --ui-mcp-proxy)' 'Red'
+            } elseif ([string]::IsNullOrWhiteSpace([string]$Cfg.ImagePath)) {
+                Write-InfoLine 'Imagem' 'desativada (sem caminho)' 'Red'
+            } else {
+                Write-InfoLine 'Imagem' ('indisponível (' + (Get-ImageIssue $Cfg) + ')') 'Red'
+            }
         }
     }
+
     $accessUrl = Get-ServerAccessUrl $Cfg.Host ([int]$Cfg.Port)
     if ($accessUrl) {
-        Write-Host ('  Acesso:     ' + $accessUrl) -ForegroundColor Cyan
+        Write-InfoLine 'Acesso' ($accessUrl + '   (' + (Get-HostLabel $Cfg.Host) + ')') 'Cyan'
     } elseif ($Cfg.Host -eq 'tailscale') {
-        Write-Host '  Acesso:     Tailscale não detectado' -ForegroundColor Yellow
+        Write-InfoLine 'Acesso' 'Tailscale não detectado' 'Yellow'
+    } else {
+        Write-InfoLine 'Acesso' ('http://127.0.0.1:{0}   ({1})' -f $Cfg.Port, (Get-HostLabel $Cfg.Host)) 'Cyan'
     }
+    if ($LogPath) { Write-InfoLine 'Log' $LogPath 'DarkGray' }
 
-    if ($LogPath) { Write-Host ('  Log:        ' + $LogPath) -ForegroundColor DarkGray }
+    Write-Host ('  ' + ('-' * [Math]::Max(10, $w - 4))) -ForegroundColor DarkGray
+    $script:StatusRow = -1
+    try { $script:StatusRow = [int][Console]::CursorTop } catch { }
+    Write-Host '  Status     Iniciando...' -ForegroundColor Cyan
     Write-Host ''
-    Write-Host '  Carregando o modelo...' -ForegroundColor Cyan
-    Write-Host '  Ctrl+C encerra o servidor; Esc duas vezes encerra e volta ao menu.' -ForegroundColor DarkGray
+    Write-Host '  Ctrl+C encerra o servidor   |   Esc duas vezes encerra e volta ao menu' -ForegroundColor DarkGray
     Write-Host ''
+    Complete-Frame
 }
 
 function Start-EscWatcher {
@@ -6100,40 +6401,48 @@ function Stop-EscWatcher {
 }
 
 function Start-LoadProgress {
-    param([int]$Port, [double]$TotalBytes)
+    param([int]$Port, [double]$TotalBytes, [int]$StatusRow = -1)
     $state = [hashtable]::Synchronized(@{ Stop = $false })
     $ps = $null
     $handle = $null
     try {
         $ps = [powershell]::Create()
         [void]$ps.AddScript({
-            param($State, $ServerPid, $Port, $Total)
+            param($State, $ServerPid, $Port, $Total, $StatusRow)
             if ($Total -le 0) { $Total = 1 }
             $sw = [System.Diagnostics.Stopwatch]::StartNew()
             $childPid = 0
-            $row = -1
+            $row = $StatusRow
+            $loadedAt = -1.0
+            $read = 0.0
+            $pct = 0
             while (-not $State.Stop) {
-                $loaded = $false
-                try {
-                    $resp = Invoke-WebRequest -Uri ('http://127.0.0.1:{0}/health' -f $Port) -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
-                    if ([int]$resp.StatusCode -eq 200) { $loaded = $true }
-                } catch { }
-                if ($childPid -eq 0) {
-                    foreach ($r in @(Get-CimInstance Win32_Process -Filter ("Name='llama-server.exe' AND ParentProcessId={0}" -f $ServerPid))) { $childPid = [int]$r.ProcessId }
+                if ($loadedAt -lt 0) {
+                    $loaded = $false
+                    try {
+                        $resp = Invoke-WebRequest -Uri ('http://127.0.0.1:{0}/health' -f $Port) -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
+                        if ([int]$resp.StatusCode -eq 200) { $loaded = $true }
+                    } catch { }
+                    if ($loaded) { $loadedAt = $sw.Elapsed.TotalSeconds }
+                    if ($childPid -eq 0) {
+                        foreach ($r in @(Get-CimInstance Win32_Process -Filter ("Name='llama-server.exe' AND ParentProcessId={0}" -f $ServerPid))) { $childPid = [int]$r.ProcessId }
+                    }
+                    if ($childPid -ne 0) {
+                        $p = Get-CimInstance Win32_Process -Filter ("ProcessId={0}" -f $childPid)
+                        if ($p) { $read = [double]$p.ReadTransferCount } else { $childPid = 0 }
+                    }
+                    $pct = [int][Math]::Min(99, [Math]::Floor(100.0 * $read / $Total))
                 }
-                $read = 0.0
-                if ($childPid -ne 0) {
-                    $p = Get-CimInstance Win32_Process -Filter ("ProcessId={0}" -f $childPid)
-                    if ($p) { $read = [double]$p.ReadTransferCount } else { $childPid = 0 }
-                }
-                $pct = [int][Math]::Min(99, [Math]::Floor(100.0 * $read / $Total))
-                if ($loaded) {
-                    $text = ('  Modelo carregado em {0:0}s.' -f $sw.Elapsed.TotalSeconds)
+                $color = 'Cyan'
+                if ($loadedAt -ge 0) {
+                    $up = [TimeSpan]::FromSeconds([Math]::Max(0.0, $sw.Elapsed.TotalSeconds - $loadedAt))
+                    $text = ('  Status     Pronto  |  carregado em {0:0}s  |  ativo há {1:00}:{2:00}:{3:00}' -f $loadedAt, [int][Math]::Floor($up.TotalHours), $up.Minutes, $up.Seconds)
+                    $color = 'Green'
                 } else {
-                    $text = ('  Carregando modelo... {0}%  ({1:0}s)' -f $pct, $sw.Elapsed.TotalSeconds)
+                    $text = ('  Status     Carregando modelo... {0}%  ({1:0}s)' -f $pct, $sw.Elapsed.TotalSeconds)
                 }
                 if ($row -lt 0) {
-                    if ($loaded -or $read -gt ($Total * 0.03)) {
+                    if ($loadedAt -ge 0 -or $read -gt ($Total * 0.03)) {
                         $row = [Console]::CursorTop
                         [Console]::WriteLine($text)
                     }
@@ -6141,13 +6450,14 @@ function Start-LoadProgress {
                     $l = [Console]::CursorLeft
                     $t = [Console]::CursorTop
                     [Console]::SetCursorPosition(0, $row)
-                    [Console]::Write($text.PadRight(48))
+                    [Console]::ForegroundColor = $color
+                    [Console]::Write($text.PadRight(80))
+                    [Console]::ResetColor()
                     [Console]::SetCursorPosition($l, $t)
                 }
-                if ($loaded) { break }
-                Start-Sleep -Milliseconds 500
+                if ($loadedAt -ge 0) { Start-Sleep -Milliseconds 1000 } else { Start-Sleep -Milliseconds 500 }
             }
-        }).AddArgument($state).AddArgument($PID).AddArgument($Port).AddArgument($TotalBytes)
+        }).AddArgument($state).AddArgument($PID).AddArgument($Port).AddArgument($TotalBytes).AddArgument($StatusRow)
         $handle = $ps.BeginInvoke()
     } catch { }
     return [pscustomobject]@{ Ps = $ps; Handle = $handle; State = $state }
@@ -6158,6 +6468,43 @@ function Stop-LoadProgress {
     $Watcher.State.Stop = $true
     try { if ($Watcher.Handle) { [void]$Watcher.Handle.AsyncWaitHandle.WaitOne(2000) } } catch { }
     try { if ($Watcher.Ps) { $Watcher.Ps.Dispose() } } catch { }
+}
+
+function Format-ProcessArgs {
+    param([string[]]$ArgList)
+    $parts = New-Object System.Collections.Generic.List[string]
+    foreach ($x in $ArgList) {
+        $s = [string]$x
+        if ($s.Length -eq 0) { $parts.Add('""'); continue }
+        if ($s -notmatch '[\s"]') { $parts.Add($s); continue }
+        $s = [regex]::Replace($s, '(\\*)"', '$1$1\"')
+        $s = [regex]::Replace($s, '(\\+)$', '$1$1')
+        $parts.Add('"' + $s + '"')
+    }
+    return ($parts -join ' ')
+}
+
+# Executa o llama-server sem despejar o log no console (tudo continua indo para --log-file).
+function Invoke-LlamaServerQuiet {
+    param([string]$Exe, [string[]]$ServerArgs)
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $Exe
+    $psi.Arguments = Format-ProcessArgs $ServerArgs
+    $psi.WorkingDirectory = $script:Root
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $null = $proc.StandardOutput.BaseStream.CopyToAsync([System.IO.Stream]::Null)
+    $null = $proc.StandardError.BaseStream.CopyToAsync([System.IO.Stream]::Null)
+    try {
+        while (-not $proc.WaitForExit(250)) { }
+        return [int]$proc.ExitCode
+    } finally {
+        try { if (-not $proc.HasExited) { & taskkill.exe /PID $proc.Id /T /F 2>&1 | Out-Null } } catch { }
+        try { $proc.Dispose() } catch { }
+    }
 }
 
 function Start-LlamaServer {
@@ -6253,6 +6600,7 @@ function Start-LlamaServer {
             Show-Header 'Preparando pesquisa'
             Write-Host ''
             Write-Host '  Iniciando o servidor de pesquisa (na primeira vez baixa as dependências; pode demorar)...' -ForegroundColor Gray
+            Complete-Frame
             $script:Research = Start-ResearchServer $logPath ([int]$Cfg.Ctx)
         }
 
@@ -6266,6 +6614,7 @@ function Start-LlamaServer {
                 Show-Header 'Preparando geração de imagem'
                 Write-Host ''
                 Write-Host '  Iniciando o SwarmUI e o servidor de imagem (na primeira vez o SwarmUI pode demorar)...' -ForegroundColor Gray
+                Complete-Frame
                 $script:Image = Start-ImageServer $logPath ([string]$Cfg.ImagePath) ([int]$Cfg.Port) ([bool]$imageVision)
             }
         }
@@ -6294,12 +6643,17 @@ function Start-LlamaServer {
 
         Disable-Mouse
         $esc = Start-EscWatcher
-        $progress = Start-LoadProgress ([int]$Cfg.Port) ([double]$Cfg.Model.Size)
+        $progress = Start-LoadProgress ([int]$Cfg.Port) ([double]$Cfg.Model.Size) ([int]$script:StatusRow)
         $code = 0
         try {
             Push-Location $script:Root
-            & $script:ServerExe @serverArgs
-            if ($null -ne $LASTEXITCODE) { $code = [int]$LASTEXITCODE }
+            if ($logPath) {
+                $code = Invoke-LlamaServerQuiet $script:ServerExe $serverArgs
+            } else {
+                $script:FrameExtent = -1
+                & $script:ServerExe @serverArgs
+                if ($null -ne $LASTEXITCODE) { $code = [int]$LASTEXITCODE }
+            }
         } catch {
             Write-Host ''
             Write-Host ('  [ERRO] ' + $_.Exception.Message) -ForegroundColor Red
@@ -6328,7 +6682,13 @@ function Start-LlamaServer {
         Update-Hardware
         if ($esc.State.Quit) { return 'menu' }
         $msg = ('Servidor encerrado (código {0}).' -f $code)
-        if ($logPath) { $msg += ("`n`nLog: " + $logPath) }
+        if ($logPath) {
+            if ($code -ne 0) {
+                $tail = Get-LogTail $logPath 4
+                if ($tail) { $msg += ("`n`nÚltimas linhas do log:`n" + $tail) }
+            }
+            $msg += ("`n`nLog: " + $logPath)
+        }
         $choice = Show-Choice -Title 'Servidor encerrado' -Message $msg `
             -Options @('Voltar ao menu', 'Iniciar novamente', 'Sair') -Default 0
         if ($choice -eq 1) { continue }
@@ -6413,6 +6773,7 @@ if ($args -contains '--selftest') {
 
 Initialize-Console
 Initialize-Mouse
+Initialize-Fx
 if (Test-UpdateAvailable) {
     try { [Console]::CursorVisible = $false } catch { }
     if ((Show-UpdatePrompt) -and (Install-LauncherUpdate)) {
@@ -6501,6 +6862,7 @@ try {
         }
     }
 } finally {
+    Complete-Frame
     Stop-ImageServer $script:Image
     Stop-ResearchServer $script:Research
     Clear-SetupDebris
