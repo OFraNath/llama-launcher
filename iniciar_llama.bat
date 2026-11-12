@@ -100,7 +100,6 @@ function Get-UIWidth {
     return $w
 }
 
-# Cut-Text apenas para colunas de largura fixa; use Wrap-Text em mensagens e erros.
 function Cut-Text {
     param([string]$Text, [int]$Width)
     if ($null -eq $Text) { $Text = '' }
@@ -201,7 +200,6 @@ public static class LlamaFx {
         Array.Copy(src, row * W, dst, row * W, W);
     }
 
-    // Fade-out: escurece o quadro atual e apaga com uma linha de varredura descendo.
     public static void Out(int top, int w, int h, int blankAttr) {
         Top = top; W = w; H = h;
         CHAR_INFO[] cur;
@@ -228,7 +226,6 @@ public static class LlamaFx {
         WriteRows(dim, prev, H - 1);
     }
 
-    // Prepara o registro das cores reais do proximo quadro (o texto e escrito "invisivel").
     public static void BeginRec(int top, int w, int h) {
         Top = top; W = w; H = h;
         rec = new ushort[w * h];
@@ -252,7 +249,6 @@ public static class LlamaFx {
         return true;
     }
 
-    // Fade-in: revela o quadro de cima para baixo, com a linha de varredura na frente.
     public static void In() {
         if (rec == null) return;
         CHAR_INFO[] fin;
@@ -311,8 +307,6 @@ function Start-FxTransition {
     }
 }
 
-# Quadro sem piscar: o conteudo antigo fica na tela e e sobrescrito no lugar;
-# o que sobra (fim de linha e linhas abaixo) e apagado em Complete-Frame.
 function Clear-Screen {
     if ($script:FrameOpen) { Complete-Frame }
     $script:Hit = @{}
@@ -363,8 +357,6 @@ function Complete-Frame {
     }
 }
 
-# Durante um quadro, Write-Host limpa o resto da linha (evita sobras do quadro anterior)
-# e, em troca de tela, escreve o texto invisivel registrando as cores para o fade-in.
 function Write-Host {
     [CmdletBinding()]
     param(
@@ -557,7 +549,6 @@ public static class LlamaConsole {
         uint m;
         if (!GetConsoleMode(hIn, out m)) return false;
         if (!haveOrig) { origMode = m; haveOrig = true; }
-        // ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS, sem QUICK_EDIT
         uint n = (m | 0x0010u | 0x0080u) & ~0x0040u;
         return SetConsoleMode(hIn, n);
     }
@@ -4910,8 +4901,6 @@ function Start-SetupDownload {
 function Get-LlamaReleaseAssets {
     param([ValidateSet('cpu','cuda')][string]$Backend)
     if ($script:SetupArch -eq 'x86') { throw 'O llama.cpp pré-compilado não oferece pacote Windows de 32 bits. Use Windows 10/11 de 64 bits ou mantenha um servidor compatível já instalado.' }
-    # llama.cpp publica builds frequentes como pré-lançamentos; testar o build mais recente
-    # disponível e validar suas opções é mais seguro do que cair silenciosamente em um build antigo.
     $releases = @(Get-GitHubJson 'https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=30' | Where-Object { -not $_.draft })
     $archToken = if ($script:SetupArch -eq 'arm64') { 'arm64' } else { 'x64' }
     if ($Backend -eq 'cpu') {
@@ -5157,7 +5146,6 @@ function Install-PythonDependencies {
 }
 
 function Test-PythonDependencies {
-    # Verifica no cache local do UV (sem rede) se ddgs e trafilatura já estão disponíveis.
     param([string]$Uv)
     $p = $null
     try {
@@ -5250,7 +5238,6 @@ function Get-SetupDiagnostics {
 }
 
 function Clear-SetupDebris {
-    # Remove downloads, extrações e backups deixados pela instalação.
     try {
         if (Test-Path -LiteralPath $script:SetupDir) {
             Remove-Item -LiteralPath $script:SetupDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -5263,8 +5250,6 @@ function Clear-SetupDebris {
 }
 
 function Clear-LauncherTemp {
-    # Remove restos do launcher na pasta TEMP (execuções interrompidas, janela fechada, falhas).
-    # Arquivos com menos de 1 hora são mantidos para não afetar outra instância em uso.
     try {
         $limit = (Get-Date).AddHours(-1)
         $patterns = @('llama_webui_*.json', 'llama_research_*', 'llama_swarm_*', 'llama_image_*', 'llama_bench_*', 'llama_launcher_*.ps1', 'llama_launcher_new_*.bat')
@@ -5288,7 +5273,6 @@ function Invoke-InitialSetup {
 
     $toRun = @($pending | Where-Object { $_.Id -ne 'deps' -or (Get-SetupPythonInfo).Ok })
     if (-not (Get-SetupPythonInfo).Ok -and (@($pending | Where-Object { $_.Id -eq 'python' }).Count -gt 0)) {
-        # Python is installed first; dependency preparation is picked up immediately afterwards.
     }
     foreach ($t in $toRun) {
         $currentTask = Get-SetupTask $t.Id
@@ -6011,7 +5995,7 @@ function Show-Settings {
         }
 
         Write-Host ''
-        $footer = '  ↑↓ navegar   ←→ alterar   Enter editar/iniciar   Esc voltar   Q sair'
+        $footer = '  ↑↓ navegar   ←→ alterar   Enter alternar/confirmar   Esc voltar   Q sair'
         Write-Footer $footer
         Complete-Frame
 
@@ -6230,7 +6214,6 @@ function Start-BrowserJob {
             }
         }
 
-        # /health só responde 200 depois que o modelo termina de carregar.
         $serverOk = $false
         $deadline = (Get-Date).AddSeconds(1800)
         while ((Get-Date) -lt $deadline) {
@@ -6319,7 +6302,6 @@ function Show-StartSummary {
     if ([string]$Cfg.Image -eq 'on' -and $Image -and $Image.Ok) { $feat += ('Imagem :' + $Image.Port + ' (SwarmUI :' + $Image.Swarm.Port + ')') }
     Write-InfoLine 'Recursos' ($feat -join '  |  ')
 
-    # Avisos e falhas em vermelho, uma linha cada
     if ([string]$Cfg.Agent -eq 'on' -and -not (Test-AgentSupported)) {
         Write-InfoLine 'Agente' 'indisponível (llama-server.exe antigo, --agent ignorado)' 'Red'
     }
@@ -6491,7 +6473,6 @@ function Format-ProcessArgs {
     return ($parts -join ' ')
 }
 
-# Executa o llama-server sem despejar o log no console (tudo continua indo para --log-file).
 function Invoke-LlamaServerQuiet {
     param([string]$Exe, [string[]]$ServerArgs)
     $psi = New-Object System.Diagnostics.ProcessStartInfo
