@@ -1625,9 +1625,57 @@ function ConvertTo-ImagePath {
 function Get-ImageLabel {
     param($Cfg)
     $path = [string]$Cfg.ImagePath
-    if ([string]::IsNullOrWhiteSpace($path)) { return 'desligada · digite o caminho do launch-windows.bat' }
+    if ([string]::IsNullOrWhiteSpace($path)) { return 'desligada · Enter para escolher o launch-windows.bat do SwarmUI' }
     if ([string]$Cfg.Image -eq 'on') { return ('ligada · ' + $path) }
     return ('desligada · ' + $path)
+}
+
+function Select-SwarmLauncher {
+    param([string]$Current = '')
+    $initDir = ''
+    if (-not [string]::IsNullOrWhiteSpace($Current)) {
+        try {
+            $d = Split-Path -Parent $Current
+            if ($d -and (Test-Path -LiteralPath $d -PathType Container)) { $initDir = $d }
+        } catch { }
+    }
+    $picked = ''
+    $rs = $null
+    $ps = $null
+    try {
+        $rs = [runspacefactory]::CreateRunspace()
+        $rs.ApartmentState = [System.Threading.ApartmentState]::STA
+        $rs.ThreadOptions = [System.Management.Automation.Runspaces.PSThreadOptions]::UseNewThread
+        $rs.Open()
+        $ps = [powershell]::Create()
+        $ps.Runspace = $rs
+        [void]$ps.AddScript({
+            param($InitDir)
+            Add-Type -AssemblyName System.Windows.Forms
+            $owner = New-Object System.Windows.Forms.Form
+            $owner.TopMost = $true
+            $dlg = New-Object System.Windows.Forms.OpenFileDialog
+            $dlg.Title = 'Escolha o launch-windows.bat do SwarmUI (versão recomendada: 0.9.8.1)'
+            $dlg.Filter = 'SwarmUI (launch-windows.bat)|launch-windows.bat|Scripts .bat (*.bat)|*.bat'
+            $dlg.CheckFileExists = $true
+            $dlg.Multiselect = $false
+            if ($InitDir) { $dlg.InitialDirectory = $InitDir }
+            $res = $dlg.ShowDialog($owner)
+            $name = ''
+            if ($res -eq [System.Windows.Forms.DialogResult]::OK) { $name = [string]$dlg.FileName }
+            $dlg.Dispose()
+            $owner.Dispose()
+            return $name
+        }).AddArgument($initDir)
+        $out = @($ps.Invoke())
+        if ($out.Count -gt 0) { $picked = [string]$out[-1] }
+    } catch {
+        $picked = ''
+    } finally {
+        if ($ps) { try { $ps.Dispose() } catch { } }
+        if ($rs) { try { $rs.Dispose() } catch { } }
+    }
+    return $picked
 }
 
 function Get-HostLabel {
@@ -1768,7 +1816,6 @@ function Test-ResearchSupported {
 function Test-ResearchWanted {
     param($Cfg)
     if ([string]$Cfg.Research -ne 'on') { return $false }
-    if ([string]$Cfg.Agent -eq 'on' -and (Test-AgentSupported)) { return $false }
     return (Test-ResearchSupported)
 }
 
@@ -4394,6 +4441,7 @@ function Render-SetupScreen {
     Write-Host ''
     Write-Host '  Preparando os componentes do Llama Launcher.' -ForegroundColor White
     Write-Host '  Modelos GGUF, configurações e dados existentes não serão alterados.' -ForegroundColor DarkGray
+    Write-Host '  O SwarmUI (geração de imagem) não é instalado por aqui; use a versão 0.9.8.1.' -ForegroundColor DarkGray
     Write-Host ''
     foreach ($t in $script:InstallTasks) {
         $stateColor = 'Gray'
@@ -5213,7 +5261,7 @@ function Get-SettingsRows {
     if (-not [string]::IsNullOrWhiteSpace([string]$Cfg.ImagePath) -and -not (Test-Path -LiteralPath ([string]$Cfg.ImagePath) -PathType Leaf)) { $imageColor = 'Red' }
     $rows += [pscustomobject]@{ Key = 'image'; Label = 'Geração de Imagem'; Value = (Get-ImageLabel $Cfg); Color = $imageColor }
     $agentColor = 'White'
-    if ($Cfg.Agent -eq 'on') { $agentColor = 'Yellow' }
+    if ($Cfg.Agent -eq 'on') { $agentColor = 'Cyan' }
     $rows += [pscustomobject]@{ Key = 'agent'; Label = 'Agente'; Value = (Get-AgentLabel $Cfg.Agent); Color = $agentColor }
     $researchColor = 'White'
     if ($Cfg.Research -eq 'on') { $researchColor = 'Cyan' }
@@ -5635,10 +5683,6 @@ function Show-Settings {
             if ($Cfg.Ngl -eq 'auto') { $hint = 'Reduza o contexto/KV.' }
             Write-Host ('      ' + $hint) -ForegroundColor DarkYellow
         }
-        $wGB = $Cfg.Model.Size / 1GB
-        if ($wGB -gt ($mi.FreeRam - 2.0)) {
-            Write-Host '      Fixar na RAM pode travar o Windows.' -ForegroundColor Yellow
-        }
         if (-not (Test-PortFree ([int]$Cfg.Port))) {
             Write-Host ('      Porta {0} em uso.' -f $Cfg.Port) -ForegroundColor Yellow
         }
@@ -5646,30 +5690,18 @@ function Show-Settings {
         if ($Cfg.Host -eq 'tailscale' -and -not $accessUrl) {
             Write-Host '      Tailscale não detectado.' -ForegroundColor Yellow
         } elseif ($accessUrl) {
-            Write-Host ('      Acesso: {0}' -f $accessUrl) -ForegroundColor DarkCyan
+            $accessNote = ''
+            if ($Cfg.Host -ne '127.0.0.1') { $accessNote = '  ·  sem senha' }
+            Write-Host ('      Acesso: {0}{1}' -f $accessUrl, $accessNote) -ForegroundColor DarkCyan
         }
-        if ($Cfg.Host -ne '127.0.0.1') {
-            Write-Host '      Rede aberta, sem senha: use só em redes confiáveis.' -ForegroundColor Yellow
-        }
-        if ($Cfg.Agent -eq 'on') {
-            if (Test-AgentSupported) {
-                Write-Host '      Agente: o modelo poderá ler/gravar arquivos e executar comandos neste PC.' -ForegroundColor Yellow
-                if ($Cfg.Host -ne '127.0.0.1') {
-                    Write-Host '      PERIGO: rede aberta + agente. Use Rede = local.' -ForegroundColor Red
-                }
-            } else {
-                Write-Host '      Agente: llama-server.exe sem --agent; opção ignorada.' -ForegroundColor Red
-            }
+        if ($Cfg.Agent -eq 'on' -and -not (Test-AgentSupported)) {
+            Write-Host '      Agente: llama-server.exe sem --agent; opção ignorada.' -ForegroundColor Red
         }
         if ($Cfg.Research -eq 'on') {
             if (-not (Test-ResearchSupported)) {
                 Write-Host '      Pesquisa: llama-server.exe sem --ui-mcp-proxy; opção ignorada.' -ForegroundColor Red
-            } elseif ($Cfg.Agent -eq 'on' -and (Test-AgentSupported)) {
-                Write-Host '      Pesquisa: desativada com o Agente ligado.' -ForegroundColor Red
             } elseif (-not (Get-UvPath)) {
                 Write-Host '      Pesquisa: uv não encontrado no PATH.' -ForegroundColor Red
-            } else {
-                Write-Host '      Pesquisa: o modelo poderá buscar na web (requer internet).' -ForegroundColor Yellow
             }
         }
         if (-not [string]::IsNullOrWhiteSpace([string]$Cfg.ImagePath) -and -not (Test-Path -LiteralPath ([string]$Cfg.ImagePath) -PathType Leaf)) {
@@ -5679,15 +5711,20 @@ function Show-Settings {
             $issue = Get-ImageIssue $Cfg
             if ($issue) {
                 Write-Host ('      Geração de Imagem: ' + $issue + ' (ignorada ao iniciar).') -ForegroundColor Red
-            } else {
-                Write-Host '      Geração de Imagem: o modelo poderá criar imagens pelo SwarmUI.' -ForegroundColor Yellow
             }
         }
         if ($rows[$sel].Key -eq 'image') {
+            $imgHints = @()
             if ([string]::IsNullOrWhiteSpace([string]$Cfg.ImagePath)) {
-                Write-Host '      Digite o caminho completo do launch-windows.bat do SwarmUI (ex.: D:/SwarmUI/launch-windows.bat).' -ForegroundColor Cyan
+                $imgHints += 'Enter: escolher o launch-windows.bat do SwarmUI no Explorer.'
             } else {
-                Write-Host '      Digite para trocar o caminho; Enter confirma.' -ForegroundColor DarkGray
+                $imgHints += 'Enter: trocar o arquivo   ←→: ligar/desligar   Backspace/Del: limpar.'
+            }
+            $imgHints += 'Funciona somente com o SwarmUI, que não é instalado pelo launcher (instale à parte). Versão recomendada: 0.9.8.1.'
+            foreach ($h in $imgHints) {
+                foreach ($line in @(Wrap-Text $h ($w - 8))) {
+                    Write-Host ('      ' + $line) -ForegroundColor Cyan
+                }
             }
         }
 
@@ -5711,20 +5748,7 @@ function Show-Settings {
         }
         $typKey = [string]$rows[$sel].Key
         $nglTyping = (@('ngl', 'threads', 'batch') -contains $typKey) -and (([string]$key.KeyChar -match '^\d$') -or ($key.Key -eq 'Backspace'))
-        $imgChar = ($typKey -eq 'image') -and (-not [char]::IsControl($key.KeyChar))
-        $imgBack = ($typKey -eq 'image') -and ($kn -eq 'Backspace')
         if (-not $nglTyping) { $nglBuf = '' }
-        if ($imgChar -or $imgBack) {
-            $p = [string]$Cfg.ImagePath
-            if ($imgBack) {
-                if ($p.Length -gt 0) { $p = $p.Substring(0, $p.Length - 1) }
-            } elseif ($p.Length -lt 260) {
-                $p += [string]$key.KeyChar
-            }
-            $Cfg.ImagePath = $p
-            if ([string]::IsNullOrWhiteSpace($p)) { $Cfg.Image = 'off' } else { $Cfg.Image = 'on' }
-            continue
-        }
         switch ($kn) {
             'UpArrow'   { if ($sel -gt 0) { $sel-- } }
             'DownArrow' { if ($sel -lt ($rows.Count - 1)) { $sel++ } }
@@ -5743,15 +5767,24 @@ function Show-Settings {
             'Enter' {
                 $k = $rows[$sel].Key
                 if ($k -eq 'start') { return [pscustomobject]@{ Action = 'start' } }
-                if ($k -eq 'image' -and $clicked) {
-                    Change-CfgSetting $Cfg 'image' 1
-                } elseif ($k -eq 'image') {
-                    $Cfg.ImagePath = ConvertTo-ImagePath ([string]$Cfg.ImagePath)
-                    if ([string]::IsNullOrWhiteSpace([string]$Cfg.ImagePath)) {
-                        $Cfg.ImagePath = ''
-                        $Cfg.Image = 'off'
-                    } else {
-                        $Cfg.Image = 'on'
+                if ($k -eq 'image') {
+                    Disable-Mouse
+                    $picked = ''
+                    try { $picked = Select-SwarmLauncher ([string]$Cfg.ImagePath) } finally { Enable-Mouse }
+                    try { while ([Console]::KeyAvailable) { [void][Console]::ReadKey($true) } } catch { }
+                    $picked = ConvertTo-ImagePath $picked
+                    if (-not [string]::IsNullOrWhiteSpace($picked)) {
+                        $accept = $true
+                        if ([System.IO.Path]::GetFileName($picked) -ine 'launch-windows.bat') {
+                            $ans = Show-Choice -Title 'Arquivo diferente do esperado' `
+                                -Message ("O arquivo escolhido não se chama launch-windows.bat:`n" + $picked + "`n`nSó o launch-windows.bat do SwarmUI (versão recomendada 0.9.8.1) é suportado. Usar mesmo assim?") `
+                                -Options @('Usar mesmo assim', 'Cancelar') -Default 1
+                            if ($ans -ne 0) { $accept = $false }
+                        }
+                        if ($accept) {
+                            $Cfg.ImagePath = $picked
+                            $Cfg.Image = 'on'
+                        }
                     }
                 } elseif ($k -eq 'model') {
                     $pick = Show-ModelPicker -CurrentPath $Cfg.Model.Path
@@ -5777,8 +5810,17 @@ function Show-Settings {
                 }
                 $autoBench = $true
             }
+            'Delete' {
+                if ($typKey -eq 'image') {
+                    $Cfg.ImagePath = ''
+                    $Cfg.Image = 'off'
+                }
+            }
             'Backspace' {
-                if ($nglTyping) {
+                if ($typKey -eq 'image') {
+                    $Cfg.ImagePath = ''
+                    $Cfg.Image = 'off'
+                } elseif ($nglTyping) {
                     $prop = 'Ngl'
                     if ($typKey -eq 'threads') { $prop = 'Threads' } elseif ($typKey -eq 'batch') { $prop = 'Batch' }
                     if ($nglBuf.Length -gt 0) { $nglBuf = $nglBuf.Substring(0, $nglBuf.Length - 1) }
@@ -5973,11 +6015,8 @@ function Show-StartSummary {
     Write-Host ('  Rede:       ' + (Get-HostLabel $Cfg.Host)) -ForegroundColor Gray
     if ([string]$Cfg.Agent -eq 'on') {
         if (Test-AgentSupported) {
-            Write-Host '  Agente:     ligado (ler/gravar arquivos e executar comandos)' -ForegroundColor Yellow
-            Write-Host ('  Pasta base: ' + $script:Root) -ForegroundColor Yellow
-            if ($Cfg.Host -ne '127.0.0.1') {
-                Write-Host '  PERIGO:     rede aberta + agente: qualquer aparelho na rede pode executar comandos aqui.' -ForegroundColor Red
-            }
+            Write-Host '  Agente:     ligado (ler/gravar arquivos e executar comandos)' -ForegroundColor Gray
+            Write-Host ('  Pasta base: ' + $script:Root) -ForegroundColor Gray
         } else {
             Write-Host '  Agente:     indisponível (llama-server.exe antigo, --agent ignorado)' -ForegroundColor Red
         }
@@ -5989,8 +6028,6 @@ function Show-StartSummary {
             Write-Host ('  Pesquisa:   falhou (' + $Research.Error + ')') -ForegroundColor Red
         } elseif (-not (Test-ResearchSupported)) {
             Write-Host '  Pesquisa:   indisponível (llama-server.exe antigo, sem --ui-mcp-proxy)' -ForegroundColor Red
-        } else {
-            Write-Host '  Pesquisa:   desativada (Agente ligado)' -ForegroundColor Red
         }
     }
     if ([string]$Cfg.Image -eq 'on') {
