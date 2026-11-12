@@ -7,13 +7,6 @@ title Llama Launcher
 set "LLAMA_ROOT=%~dp0"
 set "LLAMA_BAT=%~f0"
 
-if not exist "%~dp0llama-server.exe" (
-    echo [ERRO] llama-server.exe não encontrado em "%~dp0".
-    echo.
-    pause
-    exit /b 1
-)
-
 set "LLAMA_PS1=%TEMP%\llama_launcher_%RANDOM%%RANDOM%.ps1"
 set "LLAMA_NEW=%TEMP%\llama_launcher_new_%RANDOM%%RANDOM%.bat"
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$b=$env:LLAMA_BAT; $t=$env:LLAMA_PS1; try { $l=Get-Content -LiteralPath $b -Encoding UTF8; $i=[Array]::IndexOf($l,'#===PS1==='); if($i -lt 0){exit 2}; $l[($i+1)..($l.Count-1)] | Set-Content -LiteralPath $t -Encoding UTF8; exit 0 } catch { exit 3 }"
@@ -55,7 +48,17 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 $script:Root = $env:LLAMA_ROOT
 if ([string]::IsNullOrWhiteSpace($script:Root)) { $script:Root = Split-Path -Parent $PSCommandPath }
 $script:Root = $script:Root.TrimEnd('\')
+$script:RuntimeDir = Join-Path $script:Root 'runtime'
+$script:RuntimeServerDir = Join-Path $script:RuntimeDir 'llama-server'
+$script:UvDir = Join-Path $script:RuntimeDir 'uv'
+$script:PythonDir = Join-Path $script:RuntimeDir 'python'
+$script:UvCacheDir = Join-Path $script:RuntimeDir 'uv-cache'
+$script:SetupDir = Join-Path $script:RuntimeDir 'setup'
 $script:ServerExe = Join-Path $script:Root 'llama-server.exe'
+if (-not (Test-Path -LiteralPath $script:ServerExe)) {
+    $runtimeServer = Join-Path $script:RuntimeServerDir 'llama-server.exe'
+    if (Test-Path -LiteralPath $runtimeServer) { $script:ServerExe = $runtimeServer }
+}
 $script:ModelsDir = Join-Path $script:Root 'Modelos'
 $script:StatePath = Join-Path $script:Root 'llama_launcher.json'
 $script:CachePath = Join-Path $script:Root 'llama_launcher_cache.json'
@@ -72,6 +75,11 @@ $script:UpdateExitCode = 10
 $script:UpdateAvailable = $false
 $script:UpdateBytes = $null
 $script:ExitCode = 0
+$script:InstallTasks = @()
+$script:SetupArch = 'x64'
+$env:UV_PYTHON_INSTALL_DIR = $script:PythonDir
+$env:UV_CACHE_DIR = $script:UvCacheDir
+if ($env:PATH -notlike ($script:UvDir + ';*')) { $env:PATH = $script:UvDir + ';' + $env:PATH }
 
 # ---------------------------------------------------------------------------
 # Console helpers
@@ -84,6 +92,7 @@ function Get-UIWidth {
     return $w
 }
 
+# Cut-Text apenas para colunas de largura fixa; use Wrap-Text em mensagens e erros.
 function Cut-Text {
     param([string]$Text, [int]$Width)
     if ($null -eq $Text) { $Text = '' }
@@ -91,6 +100,30 @@ function Cut-Text {
     if ($Text.Length -le $Width) { return $Text }
     if ($Width -le 1) { return $Text.Substring(0, $Width) }
     return $Text.Substring(0, $Width - 1) + [char]0x2026
+}
+
+function Wrap-Text {
+    param([string]$Text, [int]$Width)
+    if ($null -eq $Text) { return @('') }
+    if ($Width -lt 1) { return @('') }
+    $lines = New-Object System.Collections.ArrayList
+    foreach ($rawLine in ($Text -split "`r?`n")) {
+        $line = $rawLine.TrimEnd()
+        if ($line.Length -eq 0) {
+            [void]$lines.Add('')
+            continue
+        }
+        while ($line.Length -gt $Width) {
+            $limit = [Math]::Min($Width, $line.Length - 1)
+            $cut = $line.LastIndexOf([char]' ', $limit)
+            $minCut = [Math]::Max(1, [int][Math]::Floor($Width / 2))
+            if ($cut -lt $minCut) { $cut = $Width }
+            [void]$lines.Add($line.Substring(0, $cut).TrimEnd())
+            $line = $line.Substring($cut).TrimStart()
+        }
+        [void]$lines.Add($line)
+    }
+    return @($lines)
 }
 
 function Fit-Text {
@@ -124,7 +157,9 @@ function Show-Header {
     if ($script:Mem) {
         $sys += ('  |  {0:0.0} GB RAM livre' -f ($script:Mem.FreeMB / 1024.0))
     }
-    Write-Host ('  ' + (Cut-Text $sys ($w - 3))) -ForegroundColor DarkGray
+    foreach ($line in @(Wrap-Text $sys ($w - 3))) {
+        Write-Host ('  ' + $line) -ForegroundColor DarkGray
+    }
     Write-Host ('=' * $w) -ForegroundColor DarkCyan
 }
 
@@ -141,18 +176,51 @@ function Write-Row {
 
 function Write-Footer {
     param([string]$Text)
-    $parts = (Cut-Text $Text ((Get-UIWidth) - 1)) -split '   '
     $map = @{ 'Enter' = 'Enter'; 'Esc' = 'Escape'; '←→' = 'RightArrow'; 'L' = 'L'; 'E' = 'E'; 'R' = 'R'; 'A' = 'A'; 'Q' = 'Q' }
+    $w = Get-UIWidth
+    $parts = @($Text -split '   ')
+    $sum = 0
+    foreach ($part in $parts) {
+        $len = $part.Length
+        if ($part -match '^(\s*)(\S+)(.*)$' -and $map.ContainsKey($Matches[2])) { $len += 2 }
+        $sum += $len
+    }
+    $sep = 3
+    if (($sum + (($parts.Count - 1) * 3)) -gt $w -and ($sum + (($parts.Count - 1) * 1)) -le $w) { $sep = 1 }
     $y = [int][Console]::CursorTop
     $x = 0
     $hits = @()
     for ($i = 0; $i -lt $parts.Count; $i++) {
-        if ($i -gt 0) { Write-Host '   ' -NoNewline -ForegroundColor DarkGray; $x += 3 }
-        if ($parts[$i] -match '^(\s*)(\S+)(.*)$') {
+        $part = $parts[$i]
+        $lead = ''; $tok = ''; $rest = ''
+        $isBtn = $false
+        if ($part -match '^(\s*)(\S+)(.*)$') {
             $lead = $Matches[1]; $tok = $Matches[2]; $rest = $Matches[3]
+            $isBtn = $map.ContainsKey($tok)
+        }
+        $rendered = $part.Length
+        if ($isBtn) { $rendered += 2 }
+        if ($i -gt 0) {
+            if (($x + $sep + $rendered) -gt $w) {
+                Write-Host ''
+                $y++
+                $x = 0
+            } else {
+                Write-Host (' ' * $sep) -NoNewline -ForegroundColor DarkGray
+                $x += $sep
+            }
+        }
+        if ($rendered -gt $w) {
+            $fixed = $lead.Length + $tok.Length
+            if ($isBtn) { $fixed += 2 }
+            $room = [Math]::Max(0, $w - $fixed)
+            $rest = Cut-Text $rest $room
+            $part = $lead + $tok + $rest
+        }
+        if ($tok) {
             Write-Host $lead -NoNewline -ForegroundColor DarkGray
             $x += $lead.Length
-            if ($map.ContainsKey($tok)) {
+            if ($isBtn) {
                 $btn = ' ' + $tok + ' '
                 $x1 = $x
                 Write-Host $btn -NoNewline -ForegroundColor Black -BackgroundColor Cyan
@@ -166,8 +234,8 @@ function Write-Footer {
                 $x += $tok.Length + $rest.Length
             }
         } else {
-            Write-Host $parts[$i] -NoNewline -ForegroundColor DarkGray
-            $x += $parts[$i].Length
+            Write-Host $part -NoNewline -ForegroundColor DarkGray
+            $x += $part.Length
         }
     }
     Write-Host ''
@@ -322,7 +390,7 @@ function Read-Key {
 
 function Initialize-Console {
     $wantW = 100
-    $wantH = 46
+    $wantH = 50
     try {
         $raw = $Host.UI.RawUI
         $ws = $raw.WindowSize
@@ -344,17 +412,45 @@ function Initialize-Console {
 # ---------------------------------------------------------------------------
 # Hardware / environment
 # ---------------------------------------------------------------------------
+function Get-NvidiaSmiPath {
+    $cmd = Get-Command 'nvidia-smi.exe' -ErrorAction SilentlyContinue
+    if (-not $cmd) { $cmd = Get-Command 'nvidia-smi' -ErrorAction SilentlyContinue }
+    if ($cmd) {
+        if ($cmd.Source) { return [string]$cmd.Source }
+        if ($cmd.Path) { return [string]$cmd.Path }
+    }
+    $programFiles = [Environment]::GetFolderPath('ProgramFiles')
+    if ($programFiles) {
+        $candidate = Join-Path $programFiles 'NVIDIA Corporation\NVSMI\nvidia-smi.exe'
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+    }
+    $programFiles86 = [Environment]::GetEnvironmentVariable('ProgramFiles(x86)')
+    if ($programFiles86) {
+        $candidate = Join-Path $programFiles86 'NVIDIA Corporation\NVSMI\nvidia-smi.exe'
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+    }
+    return ''
+}
+
 function Get-GpuInfo {
-    $r = [ordered]@{ Name = 'GPU não detectada'; TotalMB = 0; FreeMB = 0; Ok = $false }
+    $r = [ordered]@{ Name = 'GPU não detectada'; TotalMB = 0; FreeMB = 0; ComputeCap = 0.0; Ok = $false }
+    $nvidiaSmi = Get-NvidiaSmiPath
+    if (-not $nvidiaSmi) { return [pscustomobject]$r }
     try {
-        $out = & nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv,noheader,nounits 2>$null
+        $out = & $nvidiaSmi --query-gpu=name,memory.total,memory.free,compute_cap --format=csv,noheader,nounits 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $out) {
+            $out = & $nvidiaSmi --query-gpu=name,memory.total,memory.free --format=csv,noheader,nounits 2>$null
+        }
         if ($LASTEXITCODE -eq 0 -and $out) {
             $line = @($out)[0]
             $p = $line -split ','
             if ($p.Count -ge 3) {
                 $r.Name = $p[0].Trim()
-                $r.TotalMB = [int]([double]$p[1].Trim())
-                $r.FreeMB = [int]([double]$p[2].Trim())
+                $r.TotalMB = [int]([double]::Parse($p[1].Trim(), [Globalization.CultureInfo]::InvariantCulture))
+                $r.FreeMB = [int]([double]::Parse($p[2].Trim(), [Globalization.CultureInfo]::InvariantCulture))
+                if ($p.Count -ge 4 -and $p[3].Trim() -match '^\d+\.\d+$') {
+                    $r.ComputeCap = [double]::Parse($p[3].Trim(), [Globalization.CultureInfo]::InvariantCulture)
+                }
                 $r.Ok = $true
             }
         }
@@ -1644,6 +1740,8 @@ function Build-ServerArgs {
 }
 
 function Get-UvPath {
+    $localUv = Join-Path $script:UvDir 'uv.exe'
+    if (Test-Path -LiteralPath $localUv -PathType Leaf) { return $localUv }
     $c = Get-Command uv.exe -ErrorAction SilentlyContinue
     if (-not $c) { $c = Get-Command uv -ErrorAction SilentlyContinue }
     if ($c) { return [string]$c.Source }
@@ -4030,8 +4128,8 @@ function Show-Choice {
         Show-Header $Title
         Write-Host ''
         if ($Message) {
-            foreach ($line in ($Message -split "`n")) {
-                Write-Host ('  ' + (Cut-Text $line ((Get-UIWidth) - 3))) -ForegroundColor Gray
+            foreach ($line in @(Wrap-Text $Message ((Get-UIWidth) - 3))) {
+                Write-Host ('  ' + $line) -ForegroundColor Gray
             }
             Write-Host ''
         }
@@ -4090,6 +4188,8 @@ function Get-RemoteLauncher {
         $text = [System.Text.Encoding]::UTF8.GetString($bytes)
         if ($text -notmatch '(?m)^#===PS1===\r?$') { return $null }
         if ($text -notmatch '^\uFEFF?@echo off') { return $null }
+        if ($text -notmatch '(?m)^function Invoke-InitialSetup\s*\{') { return $null }
+        if ($text -notmatch '(?m)^function Install-LlamaServer\s*\{') { return $null }
         return ,$bytes
     } catch {
         return $null
@@ -4192,6 +4292,752 @@ function Show-UpdatePrompt {
             'Tab'        { $sel = 1 - $sel }
         }
     }
+}
+
+# ---------------------------------------------------------------------------
+# First-run diagnostics and portable component installer
+# ---------------------------------------------------------------------------
+function Get-NvidiaDriverVersion {
+    $nvidiaSmi = Get-NvidiaSmiPath
+    if (-not $nvidiaSmi) { return $null }
+    try {
+        $out = & $nvidiaSmi --query-gpu=driver_version --format=csv,noheader 2>$null
+        if ($LASTEXITCODE -eq 0 -and $out) {
+            $v = ([string]@($out)[0]).Trim()
+            if ($v -match '^\d+\.\d+') { return [version]$Matches[0] }
+        }
+    } catch { }
+    return $null
+}
+
+function Test-ServerExecutable {
+    param([string]$Path)
+    $r = [pscustomobject]@{ Ok = $false; Help = ''; Version = ''; Error = '' }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        $r.Error = 'Executável não encontrado.'
+        return $r
+    }
+    $prevEap = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $v = (& $Path --version 2>&1 | Out-String).Trim()
+        $h = (& $Path --help 2>&1 | Out-String)
+        $r.Version = $v
+        $r.Help = $h
+        if ([string]::IsNullOrWhiteSpace($h)) { throw 'O executável não respondeu ao comando --help.' }
+        $required = @('--ctx-size', '--cache-type-k', '--cache-type-v', '--flash-attn', '--cache-ram', '--fit', '--n-gpu-layers', '--mmproj', '--ubatch-size', '--jinja', '--parallel', '--host', '--port', '--log-file')
+        $missing = @($required | Where-Object { $h -notmatch [regex]::Escape($_) })
+        if ($missing.Count -gt 0) {
+            $r.Error = 'Versão incompatível; opções ausentes: ' + ($missing -join ', ')
+            return $r
+        }
+        $r.Ok = $true
+    } catch {
+        $r.Error = $_.Exception.Message
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
+    return $r
+}
+
+function Test-CudaBundle {
+    param([string]$ServerPath)
+    if ([string]::IsNullOrWhiteSpace($ServerPath)) { return $false }
+    $dir = Split-Path -Parent $ServerPath
+    $hasBackend = Test-Path -LiteralPath (Join-Path $dir 'ggml-cuda.dll')
+    $hasBlas = @(Get-ChildItem -LiteralPath $dir -Filter 'cublas64_*.dll' -File -ErrorAction SilentlyContinue).Count -gt 0
+    $hasBlasLt = @(Get-ChildItem -LiteralPath $dir -Filter 'cublasLt64_*.dll' -File -ErrorAction SilentlyContinue).Count -gt 0
+    $hasRuntime = @(Get-ChildItem -LiteralPath $dir -Filter 'cudart64_*.dll' -File -ErrorAction SilentlyContinue).Count -gt 0
+    return ($hasBackend -and $hasBlas -and $hasBlasLt -and $hasRuntime)
+}
+
+function Get-SetupPythonInfo {
+    $uv = Get-UvPath
+    if (-not $uv) { return [pscustomobject]@{ Uv = ''; Python = ''; Ok = $false } }
+    $python = ''
+    $prevEap = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $out = & $uv python find 3.11 2>$null
+        if ($LASTEXITCODE -eq 0 -and $out) {
+            $candidate = ([string]@($out)[-1]).Trim().Trim('"')
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) { $python = $candidate }
+        }
+    } catch { } finally { $ErrorActionPreference = $prevEap }
+    return [pscustomobject]@{ Uv = $uv; Python = $python; Ok = [bool]$python }
+}
+
+function New-SetupTask {
+    param([string]$Id, [string]$Name, [string]$Description, [string]$State = 'Aguardando instalação', [int]$Percent = 0, [string]$Error = '')
+    return [pscustomobject]@{ Id = $Id; Name = $Name; Description = $Description; State = $State; Percent = $Percent; Error = $Error }
+}
+
+function Get-SetupTask {
+    param([string]$Id)
+    return ($script:InstallTasks | Where-Object { $_.Id -eq $Id } | Select-Object -First 1)
+}
+
+function Set-SetupTask {
+    param([string]$Id, [string]$State, [int]$Percent = -1, [string]$Description = '', [string]$Error = '')
+    $t = Get-SetupTask $Id
+    if (-not $t) { return }
+    $t.State = $State
+    if ($Percent -ge 0) { $t.Percent = [Math]::Min(100, [Math]::Max(0, $Percent)) }
+    if ($Description) { $t.Description = $Description }
+    $t.Error = $Error
+}
+
+function Render-SetupScreen {
+    param([switch]$NoFooter)
+    Clear-Screen
+    Show-Header 'Instalação e configuração'
+    Write-Host ''
+    Write-Host '  Preparando os componentes do Llama Launcher.' -ForegroundColor White
+    Write-Host '  Modelos GGUF, configurações e dados existentes não serão alterados.' -ForegroundColor DarkGray
+    Write-Host ''
+    foreach ($t in $script:InstallTasks) {
+        $stateColor = 'Gray'
+        switch ($t.State) {
+            'Concluído' { $stateColor = 'Green' }
+            'Falha na instalação' { $stateColor = 'Red' }
+            'Baixando' { $stateColor = 'Cyan' }
+            'Instalando' { $stateColor = 'Cyan' }
+            'Configurando' { $stateColor = 'Cyan' }
+            'Verificando funcionamento' { $stateColor = 'Yellow' }
+            'Verificando' { $stateColor = 'Yellow' }
+        }
+        Write-Host ('  ' + $t.Name) -ForegroundColor White
+        Write-Host ('    ' + $t.State) -ForegroundColor $stateColor -NoNewline
+        Write-Host ('  |  {0,3}%' -f [int]$t.Percent) -ForegroundColor DarkGray
+        $barWidth = [Math]::Max(12, [Math]::Min(48, (Get-UIWidth) - 28))
+        $filled = [int][Math]::Floor($barWidth * ([int]$t.Percent / 100.0))
+        $bar = ('#' * $filled) + ('-' * ($barWidth - $filled))
+        Write-Host ('    [' + $bar + ']') -ForegroundColor $(if ($t.State -eq 'Falha na instalação') { 'Red' } elseif ($t.State -eq 'Concluído') { 'Green' } else { 'Cyan' })
+        foreach ($line in @(Wrap-Text $t.Description ((Get-UIWidth) - 5))) {
+            Write-Host ('    ' + $line) -ForegroundColor DarkGray
+        }
+        if ($t.Error) {
+            foreach ($line in @(Wrap-Text $t.Error ((Get-UIWidth) - 5))) {
+                Write-Host ('    ' + $line) -ForegroundColor Red
+            }
+        }
+        Write-Host ''
+    }
+    Write-Host ''
+    if (-not $NoFooter) { Write-Footer '  Instalações locais   Modelos não incluídos' }
+}
+
+function Show-SetupMenu {
+    param([string]$Message, [string[]]$Options, [int]$Default = 0)
+    $sel = $Default
+    if ($sel -lt 0 -or $sel -ge $Options.Count) { $sel = 0 }
+    while ($true) {
+        Render-SetupScreen -NoFooter
+        if ($Message) {
+            Write-Host ''
+            foreach ($line in @(Wrap-Text $Message ((Get-UIWidth) - 3))) {
+                Write-Host ('  ' + $line) -ForegroundColor Gray
+            }
+        }
+        Write-Host ''
+        Write-Host '  O que deseja fazer?' -ForegroundColor White
+        for ($i = 0; $i -lt $Options.Count; $i++) {
+            $txt = '   ' + $Options[$i]
+            if ($i -eq $sel) { $txt = ' > ' + $Options[$i] }
+            Register-Hit $i
+            Write-Row $txt ($i -eq $sel)
+        }
+        Write-Host ''
+        Write-Footer '  ↑↓ navegar   Enter confirmar   Esc continuar'
+        $key = Read-Key
+        if ($key.Key -eq 'MouseLeft') {
+            if ($key.Index -ge 0 -and $key.Index -lt $Options.Count) { return $key.Index }
+            continue
+        }
+        if ($key.Key -eq 'MouseRight') { return -1 }
+        switch ($key.Key) {
+            'UpArrow'   { if ($sel -gt 0) { $sel-- } }
+            'DownArrow' { if ($sel -lt ($Options.Count - 1)) { $sel++ } }
+            'Home'      { $sel = 0 }
+            'End'       { $sel = $Options.Count - 1 }
+            'Enter'     { return $sel }
+            'Escape'    { return -1 }
+        }
+    }
+}
+
+function Get-GitHubJson {
+    param([string]$Uri)
+    try {
+        try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
+        $resp = Invoke-WebRequest -Uri $Uri -UseBasicParsing -Headers @{ 'User-Agent' = 'Llama-Launcher-Setup'; 'Accept' = 'application/vnd.github+json' } -TimeoutSec 25
+        Add-Type -AssemblyName System.Web.Extensions
+        $serializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+        $serializer.MaxJsonLength = [int]::MaxValue
+        $serializer.RecursionLimit = 100
+        return $serializer.DeserializeObject([string]$resp.Content)
+    } catch { throw ('Não foi possível consultar os downloads oficiais: ' + $_.Exception.Message) }
+}
+
+function Get-AssetDigest {
+    param($Asset)
+    if ($Asset -and $Asset.digest -and ([string]$Asset.digest -match '^sha256:([0-9a-fA-F]{64})$')) { return $Matches[1].ToLowerInvariant() }
+    return ''
+}
+
+function Start-SetupDownload {
+    param($Asset, [string]$Destination, $Task, [int]$FromPercent = 5, [int]$ToPercent = 75)
+    if (-not $Asset -or [string]::IsNullOrWhiteSpace([string]$Asset.browser_download_url)) { throw 'Arquivo de download oficial não encontrado.' }
+    $progressPath = $Destination + '.progress.json'
+    $partPath = $Destination + '.part'
+    foreach ($f in @($Destination, $progressPath, $partPath)) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
+    $digest = Get-AssetDigest $Asset
+    $assetSize = 0
+    try { $assetSize = [int64]$Asset.size } catch { $assetSize = 0 }
+    $scriptBlock = {
+        param($Url, $Target, $ProgressFile, $ExpectedHash, $ExpectedSize)
+        $ErrorActionPreference = 'Stop'
+        $part = $Target + '.part'
+        $response = $null; $inputStream = $null; $outputStream = $null
+        function Write-StateFile($pct, $status, $received, $total) {
+            $o = [pscustomobject]@{ Percent = [int]$pct; State = [string]$status; Received = [int64]$received; Total = [int64]$total }
+            [IO.File]::WriteAllText($ProgressFile, ($o | ConvertTo-Json -Compress), [Text.Encoding]::UTF8)
+        }
+        try {
+            try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
+            $req = [Net.HttpWebRequest]::Create($Url)
+            $req.UserAgent = 'Llama-Launcher-Setup'
+            $req.Timeout = 30000
+            $req.ReadWriteTimeout = 30000
+            $req.AllowAutoRedirect = $true
+            $response = $req.GetResponse()
+            $total = [int64]$response.ContentLength
+            $inputStream = $response.GetResponseStream()
+            $outputStream = New-Object IO.FileStream($part, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            $buffer = New-Object byte[] (1024 * 512)
+            $received = [int64]0; $lastUpdate = [datetime]::MinValue
+            Write-StateFile 0 'Baixando' 0 $total
+            while (($read = $inputStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                $outputStream.Write($buffer, 0, $read)
+                $received += $read
+                if ($total -gt 0) { $pct = [int][Math]::Min(100, [Math]::Floor(100.0 * $received / $total)) } else { $pct = 0 }
+                if (((Get-Date) - $lastUpdate).TotalMilliseconds -ge 300) {
+                    Write-StateFile $pct 'Baixando' $received $total
+                    $lastUpdate = Get-Date
+                }
+            }
+            $outputStream.Flush(); $outputStream.Dispose(); $outputStream = $null
+            $inputStream.Dispose(); $inputStream = $null
+            $response.Close(); $response = $null
+            if (-not (Test-Path -LiteralPath $part) -or (Get-Item -LiteralPath $part).Length -lt 1024) { throw 'Download vazio ou incompleto.' }
+            if ($total -gt 0 -and $received -ne $total) { throw 'Download interrompido: o tamanho recebido difere do Content-Length.' }
+            if ($ExpectedSize -gt 0 -and $received -ne [int64]$ExpectedSize) { throw 'Download incompleto: o tamanho recebido difere do tamanho publicado no GitHub.' }
+            $sha = (Get-FileHash -LiteralPath $part -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($ExpectedHash -and $sha -ne $ExpectedHash) { throw 'A validação SHA-256 do download falhou.' }
+            Move-Item -LiteralPath $part -Destination $Target -Force
+            Write-StateFile 100 'Concluído' $received $total
+            [pscustomobject]@{ Ok = $true; Hash = $sha } | ConvertTo-Json -Compress
+        } catch {
+            if ($outputStream) { try { $outputStream.Dispose() } catch { } }
+            if ($inputStream) { try { $inputStream.Dispose() } catch { } }
+            if ($response) { try { $response.Close() } catch { } }
+            Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
+            Write-StateFile 0 'Falha' 0 0
+            throw $_
+        }
+    }
+    $lastError = ''
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+        $job = Start-Job -ScriptBlock $scriptBlock -ArgumentList ([string]$Asset.browser_download_url), $Destination, $progressPath, $digest, $assetSize
+        while ($job.State -in @('Running', 'NotStarted')) {
+            try {
+                if (Test-Path -LiteralPath $progressPath) {
+                    $pr = Get-Content -LiteralPath $progressPath -Raw -Encoding UTF8 | ConvertFrom-Json
+                    $pct = [int]$pr.Percent
+                    $mapped = $FromPercent + [int][Math]::Floor(($ToPercent - $FromPercent) * ($pct / 100.0))
+                    Set-SetupTask $Task.Id 'Baixando' $mapped ('Baixando {0} ({1})' -f $Asset.name, $(if ($pr.Total -gt 0) { '{0:0.0} / {1:0.0} MB' -f ($pr.Received / 1MB), ($pr.Total / 1MB) } else { '{0:0.0} MB' -f ($pr.Received / 1MB) }))
+                } else {
+                    Set-SetupTask $Task.Id 'Baixando' $FromPercent ('Conectando ao servidor oficial: ' + [string]$Asset.name)
+                }
+            } catch { }
+            Render-SetupScreen
+            Start-Sleep -Milliseconds 350
+            $job = Get-Job -Id $job.Id
+        }
+        $jobOutput = @(Receive-Job -Job $job -ErrorAction SilentlyContinue)
+        if ($job.State -eq 'Completed' -and (Test-Path -LiteralPath $Destination)) {
+            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $progressPath -Force -ErrorAction SilentlyContinue
+            Set-SetupTask $Task.Id 'Verificando funcionamento' $ToPercent ('Download recebido; validando arquivo ' + [string]$Asset.name)
+            Render-SetupScreen
+            return $true
+        }
+        try { if ($job.ChildJobs[0].JobStateInfo.Reason) { $lastError = $job.ChildJobs[0].JobStateInfo.Reason.Message } } catch { }
+        if (-not $lastError -and $jobOutput.Count -gt 0) { $lastError = [string]$jobOutput[-1] }
+        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $progressPath -Force -ErrorAction SilentlyContinue
+        if ($attempt -lt 2) { Start-Sleep -Seconds 1 }
+    }
+    throw ('Falha no download após duas tentativas: ' + $lastError)
+}
+
+function Get-LlamaReleaseAssets {
+    param([ValidateSet('cpu','cuda')][string]$Backend)
+    if ($script:SetupArch -eq 'x86') { throw 'O llama.cpp pré-compilado não oferece pacote Windows de 32 bits. Use Windows 10/11 de 64 bits ou mantenha um servidor compatível já instalado.' }
+    # llama.cpp publica builds frequentes como pré-lançamentos; testar o build mais recente
+    # disponível e validar suas opções é mais seguro do que cair silenciosamente em um build antigo.
+    $releases = @(Get-GitHubJson 'https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=30' | Where-Object { -not $_.draft })
+    $archToken = if ($script:SetupArch -eq 'arm64') { 'arm64' } else { 'x64' }
+    if ($Backend -eq 'cpu') {
+        foreach ($rel in $releases) {
+            $tag = [string]$rel.tag_name
+            $pattern = '^llama-' + [regex]::Escape($tag) + '-bin-win-cpu-' + [regex]::Escape($archToken) + '\.zip$'
+            $asset = @($rel.assets | Where-Object { $_.name -match $pattern } | Select-Object -First 1)
+            if ($asset.Count -gt 0) { return [pscustomobject]@{ Release = $rel; Server = $asset[0]; Runtime = $null; Backend = 'cpu'; CudaVersion = '' } }
+        }
+        throw 'Nenhum pacote oficial do llama.cpp para esta arquitetura foi encontrado.'
+    }
+
+    $driver = Get-NvidiaDriverVersion
+    $gpu = Get-GpuInfo
+    if (-not $driver -or -not $gpu.Ok -or $script:SetupArch -ne 'x64') { throw 'GPU NVIDIA ou driver compatível não detectado.' }
+    if ($gpu.ComputeCap -gt 0 -and $gpu.ComputeCap -lt 5.0) { throw ('A GPU ' + $gpu.Name + ' possui compute capability ' + $gpu.ComputeCap + '; o backend CUDA atual do llama.cpp requer 5.0 ou superior. O modo CPU continua disponível.') }
+    $cudaVersions = @()
+    if ($driver -ge [version]'620.00' -and $gpu.ComputeCap -ge 7.5) { $cudaVersions += '13.5' }
+    if ($driver -ge [version]'551.61' -and ($gpu.ComputeCap -eq 0 -or $gpu.ComputeCap -ge 5.0)) { $cudaVersions += '12.4' }
+    foreach ($cv in $cudaVersions) {
+        foreach ($rel in $releases) {
+            $tag = [string]$rel.tag_name
+            $pattern = '^llama-' + [regex]::Escape($tag) + '-bin-win-cuda-' + [regex]::Escape($cv) + '-x64\.zip$'
+            $server = @($rel.assets | Where-Object { $_.name -match $pattern } | Select-Object -First 1)
+            if ($server.Count -eq 0) { continue }
+            $runtimeName = 'cudart-llama-bin-win-cuda-' + $cv + '-x64.zip'
+            $runtime = @($rel.assets | Where-Object { $_.name -eq $runtimeName } | Select-Object -First 1)
+            if ($runtime.Count -eq 0) {
+                foreach ($r2 in $releases) {
+                    $runtime = @($r2.assets | Where-Object { $_.name -eq $runtimeName } | Select-Object -First 1)
+                    if ($runtime.Count -gt 0) { break }
+                }
+            }
+            if ($runtime.Count -gt 0) { return [pscustomobject]@{ Release = $rel; Server = $server[0]; Runtime = $runtime[0]; Backend = 'cuda'; CudaVersion = $cv } }
+        }
+    }
+    throw 'Não foi encontrado um pacote CUDA compatível com o driver instalado. O modo CPU continua disponível.'
+}
+
+function Expand-SetupZip {
+    param([string]$Archive, [string]$Destination)
+    if (-not (Test-Path -LiteralPath $Archive -PathType Leaf)) { throw 'Arquivo ZIP ausente.' }
+    try { Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue } catch { }
+    if (Test-Path -LiteralPath $Destination) { Remove-Item -LiteralPath $Destination -Recurse -Force }
+    New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+    try {
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($Archive, $Destination)
+    } catch {
+        throw ('O pacote baixado não passou na validação ZIP: ' + $_.Exception.Message)
+    }
+}
+
+function Install-LlamaServer {
+    param([ValidateSet('auto','cpu','cuda')][string]$Backend = 'auto', $Task)
+    New-Item -ItemType Directory -Path $script:RuntimeDir,$script:SetupDir -Force | Out-Null
+    $work = Join-Path $script:RuntimeDir ('setup\llama_' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $work -Force | Out-Null
+    $requestedBackend = $Backend
+    $cudaFallback = $false
+    try {
+        $chosen = $Backend
+        if ($chosen -eq 'auto') {
+            $gpu = Get-GpuInfo
+            $drv = Get-NvidiaDriverVersion
+            if ($gpu.Ok -and $drv -and $script:SetupArch -eq 'x64' -and $drv -ge [version]'551.61' -and ($gpu.ComputeCap -eq 0 -or $gpu.ComputeCap -ge 5.0)) { $chosen = 'cuda' } else { $chosen = 'cpu' }
+        }
+        try {
+            $assets = Get-LlamaReleaseAssets $chosen
+        } catch {
+            if ($Backend -eq 'auto' -and $chosen -eq 'cuda') {
+                Set-SetupTask $Task.Id 'Configurando' 4 'CUDA não disponível; preparando a versão CPU.'
+                Render-SetupScreen
+                $cudaFallback = $true
+                $chosen = 'cpu'
+                $assets = Get-LlamaReleaseAssets 'cpu'
+            } else { throw }
+        }
+        $serverZip = Join-Path $work ([string]$assets.Server.name)
+        Set-SetupTask $Task.Id 'Baixando' 3 ('Obtendo llama.cpp ' + [string]$assets.Release.tag_name + ' (' + $chosen.ToUpperInvariant() + ').')
+        Render-SetupScreen
+        Start-SetupDownload $assets.Server $serverZip $Task 4 58 | Out-Null
+        $mainExtract = Join-Path $work 'main'
+        Set-SetupTask $Task.Id 'Instalando' 60 'Validando e extraindo os arquivos do servidor.'
+        Render-SetupScreen
+        Expand-SetupZip $serverZip $mainExtract
+        $serverFile = Get-ChildItem -LiteralPath $mainExtract -Filter 'llama-server.exe' -File -Recurse | Select-Object -First 1
+        if (-not $serverFile) { throw 'O pacote não contém llama-server.exe.' }
+        $payload = Join-Path $work 'payload'
+        New-Item -ItemType Directory -Path $payload -Force | Out-Null
+        Get-ChildItem -LiteralPath $serverFile.DirectoryName -File -Force | Copy-Item -Destination $payload -Force
+        if ($chosen -eq 'cuda') {
+            $runtimeZip = Join-Path $work ([string]$assets.Runtime.name)
+            Set-SetupTask $Task.Id 'Baixando' 62 ('Baixando CUDA Runtime ' + $assets.CudaVersion + '.')
+            Render-SetupScreen
+            Start-SetupDownload $assets.Runtime $runtimeZip $Task 62 82 | Out-Null
+            $runtimeExtract = Join-Path $work 'cuda-runtime'
+            Set-SetupTask $Task.Id 'Instalando' 84 'Integrando bibliotecas CUDA portáteis.'
+            Render-SetupScreen
+            Expand-SetupZip $runtimeZip $runtimeExtract
+            $dlls = @(Get-ChildItem -LiteralPath $runtimeExtract -Filter '*.dll' -File -Recurse -ErrorAction SilentlyContinue)
+            foreach ($dll in $dlls) { Copy-Item -LiteralPath $dll.FullName -Destination (Join-Path $payload $dll.Name) -Force }
+            if (-not (Test-CudaBundle (Join-Path $payload 'llama-server.exe'))) { throw 'O pacote CUDA não contém todas as DLLs de runtime esperadas.' }
+        }
+        Set-SetupTask $Task.Id 'Verificando funcionamento' 88 'Testando o executável e as opções usadas pelo launcher.'
+        Render-SetupScreen
+        $test = Test-ServerExecutable (Join-Path $payload 'llama-server.exe')
+        if (-not $test.Ok) { throw ('Servidor baixado incompatível: ' + $test.Error) }
+
+        $target = $script:RuntimeServerDir
+        $backup = Join-Path $script:RuntimeDir ('llama-server-backup-' + (Get-Date -Format 'yyyyMMdd_HHmmss'))
+        if (Test-Path -LiteralPath $target) { Move-Item -LiteralPath $target -Destination $backup -Force }
+        try {
+            Move-Item -LiteralPath $payload -Destination $target -Force
+        } catch {
+            if (Test-Path -LiteralPath $backup) { Move-Item -LiteralPath $backup -Destination $target -Force }
+            throw
+        }
+        $script:ServerExe = Join-Path $target 'llama-server.exe'
+        if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction SilentlyContinue }
+        Set-SetupTask $Task.Id 'Concluído' 100 ('llama.cpp ' + [string]$assets.Release.tag_name + ' instalado localmente (' + $chosen.ToUpperInvariant() + ').')
+        if ($chosen -eq 'cuda') {
+            Set-SetupTask 'cuda' 'Concluído' 100 ('CUDA Runtime ' + $assets.CudaVersion + ' instalado junto ao servidor; driver NVIDIA detectado.')
+        } elseif ($requestedBackend -eq 'auto' -and $cudaFallback) {
+            Set-SetupTask 'cuda' 'Concluído' 100 'CUDA incompatível ou indisponível; backend CPU configurado automaticamente.'
+        }
+        if ($Task.Id -ne 'server') {
+            Set-SetupTask 'server' 'Concluído' 100 ('llama.cpp ' + [string]$assets.Release.tag_name + ' instalado localmente (' + $chosen.ToUpperInvariant() + ').')
+        }
+        return [pscustomobject]@{ Ok = $true; Backend = $chosen; Error = ''; Version = $assets.Release.tag_name }
+    } catch {
+        $installError = $_.Exception.Message
+        if ($Backend -eq 'auto' -and $chosen -eq 'cuda') {
+            Set-SetupTask $Task.Id 'Configurando' 55 ('A aceleração CUDA não pôde ser preparada. Tentando automaticamente o backend CPU. Detalhe: ' + $installError)
+            Render-SetupScreen
+            $fallbackResult = Install-LlamaServer -Backend 'cpu' -Task $Task
+            if ($fallbackResult.Ok) {
+                Set-SetupTask 'cuda' 'Concluído' 100 'CUDA não pôde ser preparada; backend CPU instalado como alternativa.'
+            }
+            return $fallbackResult
+        }
+        throw
+    } finally {
+        if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Install-UvAndPython {
+    param($Task)
+    New-Item -ItemType Directory -Path $script:UvDir,$script:PythonDir,$script:UvCacheDir,$script:SetupDir -Force | Out-Null
+    $localUv = Join-Path $script:UvDir 'uv.exe'
+    if (-not (Test-Path -LiteralPath $localUv -PathType Leaf) -and -not (Get-UvPath)) {
+        Set-SetupTask $Task.Id 'Verificando' 3 'Consultando a versão oficial do UV.'
+        Render-SetupScreen
+        $rel = Get-GitHubJson 'https://api.github.com/repos/astral-sh/uv/releases/latest'
+        $assetName = switch ($script:SetupArch) {
+            'arm64' { 'uv-aarch64-pc-windows-msvc.zip' }
+            'x86'   { 'uv-i686-pc-windows-msvc.zip' }
+            default { 'uv-x86_64-pc-windows-msvc.zip' }
+        }
+        $asset = @($rel.assets | Where-Object { $_.name -eq $assetName } | Select-Object -First 1)
+        if ($asset.Count -eq 0) { throw ('Pacote UV não encontrado: ' + $assetName) }
+        $zip = Join-Path $script:SetupDir $assetName
+        Start-SetupDownload $asset[0] $zip $Task 5 45 | Out-Null
+        $extract = Join-Path $script:SetupDir ('uv_' + [guid]::NewGuid().ToString('N'))
+        Expand-SetupZip $zip $extract
+        $uvFile = Get-ChildItem -LiteralPath $extract -Filter 'uv.exe' -File -Recurse | Select-Object -First 1
+        if (-not $uvFile) { throw 'O pacote UV não contém uv.exe.' }
+        Copy-Item -LiteralPath $uvFile.FullName -Destination $localUv -Force
+        $uvxFile = Get-ChildItem -LiteralPath $extract -Filter 'uvx.exe' -File -Recurse | Select-Object -First 1
+        if ($uvxFile) { Copy-Item -LiteralPath $uvxFile.FullName -Destination (Join-Path $script:UvDir 'uvx.exe') -Force }
+        Remove-Item -LiteralPath $extract -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
+        if (-not (Test-Path -LiteralPath $localUv)) { throw 'Não foi possível instalar o UV portátil.' }
+        $env:PATH = $script:UvDir + ';' + $env:PATH
+    }
+    $uv = Get-UvPath
+    if (-not $uv) { throw 'UV não está disponível após a instalação.' }
+    $env:UV_PYTHON_INSTALL_DIR = $script:PythonDir
+    $env:UV_CACHE_DIR = $script:UvCacheDir
+    if ($env:PATH -notlike ($script:UvDir + ';*')) { $env:PATH = $script:UvDir + ';' + $env:PATH }
+    Set-SetupTask $Task.Id 'Verificando funcionamento' 52 'Verificando se Python 3.11 está disponível.'
+    Render-SetupScreen
+    $pyInfo = Get-SetupPythonInfo
+    if (-not $pyInfo.Ok) {
+        Invoke-SetupProcess $uv 'python install 3.11' $Task 55 94 1800 | Out-Null
+        $pyInfo = Get-SetupPythonInfo
+    }
+    if (-not $pyInfo.Ok) { throw 'Python 3.11 não pôde ser localizado após a instalação pelo UV.' }
+    Set-SetupTask $Task.Id 'Concluído' 100 ('UV disponível; Python 3.11 validado em ' + $pyInfo.Python)
+    return $true
+}
+
+function Invoke-SetupProcess {
+    param([string]$FilePath, [string]$Arguments, $Task, [int]$FromPercent = 10, [int]$ToPercent = 95, [int]$TimeoutSeconds = 900)
+    $p = New-Object System.Diagnostics.Process
+    $p.StartInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $p.StartInfo.FileName = $FilePath
+    $p.StartInfo.Arguments = $Arguments
+    $p.StartInfo.WorkingDirectory = $script:Root
+    $p.StartInfo.UseShellExecute = $false
+    $p.StartInfo.CreateNoWindow = $true
+    $p.StartInfo.RedirectStandardOutput = $true
+    $p.StartInfo.RedirectStandardError = $true
+    $started = Get-Date
+    try {
+        if (-not $p.Start()) { throw 'Não foi possível iniciar o processo de instalação.' }
+        $outTask = $p.StandardOutput.ReadToEndAsync()
+        $errTask = $p.StandardError.ReadToEndAsync()
+        $pct = $FromPercent
+        while (-not $p.WaitForExit(400)) {
+            if (((Get-Date) - $started).TotalSeconds -gt $TimeoutSeconds) {
+                try { $p.Kill() } catch { }
+                throw 'A instalação excedeu o tempo limite.'
+            }
+            if ($pct -lt ($ToPercent - 1)) { $pct++ }
+            Set-SetupTask $Task.Id 'Instalando' $pct 'Instalando o componente em segundo plano; a interface continuará atualizando.'
+            Render-SetupScreen
+        }
+        $p.WaitForExit()
+        $stdout = $outTask.Result
+        $stderr = $errTask.Result
+        if ($p.ExitCode -ne 0) {
+            $detail = (($stderr + ' ' + $stdout).Trim() -replace '\s+', ' ')
+            throw ('Processo encerrou com código ' + $p.ExitCode + '. ' + $detail)
+        }
+        return [pscustomobject]@{ ExitCode = $p.ExitCode; Output = $stdout; Error = $stderr }
+    } finally {
+        $p.Dispose()
+    }
+}
+
+function Install-PythonDependencies {
+    param($Task)
+    $uv = Get-UvPath
+    if (-not $uv) { throw 'UV não está instalado; tente novamente a etapa Python + UV.' }
+    $pythonInfo = Get-SetupPythonInfo
+    if (-not $pythonInfo.Ok) { throw 'Python 3.11 não está disponível; tente novamente a etapa Python + UV.' }
+    New-Item -ItemType Directory -Path $script:SetupDir -Force | Out-Null
+    Set-SetupTask $Task.Id 'Configurando' 10 'Preparando dependências usadas pelos recursos de pesquisa e integração.'
+    Render-SetupScreen
+    Invoke-SetupProcess $uv 'run --no-project --python 3.11 --with ddgs --with trafilatura python -c "import ddgs, trafilatura; print(1)"' $Task 12 94 1800 | Out-Null
+    Set-SetupTask $Task.Id 'Concluído' 100 'Dependências de pesquisa instaladas no cache local do UV.'
+}
+
+function Test-PythonDependencies {
+    # Verifica no cache local do UV (sem rede) se ddgs e trafilatura já estão disponíveis.
+    param([string]$Uv)
+    $p = $null
+    try {
+        $env:UV_PYTHON_INSTALL_DIR = $script:PythonDir
+        $env:UV_CACHE_DIR = $script:UvCacheDir
+        $p = New-Object System.Diagnostics.Process
+        $p.StartInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $p.StartInfo.FileName = $Uv
+        $p.StartInfo.Arguments = 'run --offline --no-project --python 3.11 --with ddgs --with trafilatura python -c "import ddgs, trafilatura"'
+        $p.StartInfo.WorkingDirectory = $script:Root
+        $p.StartInfo.UseShellExecute = $false
+        $p.StartInfo.CreateNoWindow = $true
+        $p.StartInfo.RedirectStandardOutput = $true
+        $p.StartInfo.RedirectStandardError = $true
+        if (-not $p.Start()) { return $false }
+        $null = $p.StandardOutput.ReadToEndAsync()
+        $null = $p.StandardError.ReadToEndAsync()
+        if (-not $p.WaitForExit(60000)) { try { $p.Kill() } catch { }; return $false }
+        return ($p.ExitCode -eq 0)
+    } catch { return $false } finally { if ($p) { $p.Dispose() } }
+}
+
+function Get-SetupDiagnostics {
+    $script:SetupArch = 'x64'
+    $arch = [string]$env:PROCESSOR_ARCHITECTURE
+    $nativeArch = [string]$env:PROCESSOR_ARCHITEW6432
+    if ($nativeArch) { $arch = $nativeArch }
+    if ($arch -match '(?i)ARM64') { $script:SetupArch = 'arm64' }
+    elseif ($arch -match '(?i)x86' -and -not [Environment]::Is64BitOperatingSystem) { $script:SetupArch = 'x86' }
+    else { $script:SetupArch = 'x64' }
+
+    $script:InstallTasks = @()
+    $platformOk = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT -and [Environment]::OSVersion.Version.Major -ge 10 -and [Environment]::Is64BitOperatingSystem
+    $serverRoot = Join-Path $script:Root 'llama-server.exe'
+    $runtimeServer = Join-Path $script:RuntimeServerDir 'llama-server.exe'
+    $serverPath = ''
+    $serverTest = $null
+    if (Test-Path -LiteralPath $serverRoot) {
+        $serverTest = Test-ServerExecutable $serverRoot
+        if ($serverTest.Ok) { $serverPath = $serverRoot }
+    }
+    if (-not $serverPath -and (Test-Path -LiteralPath $runtimeServer)) {
+        $runtimeTest = Test-ServerExecutable $runtimeServer
+        if ($runtimeTest.Ok) { $serverPath = $runtimeServer; $serverTest = $runtimeTest }
+    }
+    if ($serverPath) { $script:ServerExe = $serverPath }
+    else { $script:ServerExe = $runtimeServer }
+
+    if ($serverPath) {
+        $detail = 'Executável e opções essenciais validados. ' + [string]$serverTest.Version
+        $script:InstallTasks += New-SetupTask 'server' 'Llama Server' $detail 'Concluído' 100
+    } elseif (-not $platformOk -or $script:SetupArch -eq 'x86') {
+        $script:InstallTasks += New-SetupTask 'server' 'Llama Server' 'A instalação automática requer Windows 10/11 de 64 bits.' 'Falha na instalação' 0 'Arquitetura/sistema operacional não suportado.'
+    } else {
+        $why = 'llama-server.exe ausente ou incompatível com as opções usadas pelo launcher.'
+        if ($serverTest -and $serverTest.Error) { $why = $serverTest.Error }
+        $script:InstallTasks += New-SetupTask 'server' 'Llama Server' $why 'Aguardando instalação' 0
+    }
+
+    $gpu = Get-GpuInfo
+    $driver = Get-NvidiaDriverVersion
+    if (-not $gpu.Ok) {
+        $script:InstallTasks += New-SetupTask 'cuda' 'CUDA Runtime' 'GPU NVIDIA não detectada. A execução por CPU permanece disponível.' 'Concluído' 100
+    } elseif ($gpu.ComputeCap -gt 0 -and $gpu.ComputeCap -lt 5.0) {
+        $script:InstallTasks += New-SetupTask 'cuda' 'CUDA Runtime' ('GPU detectada, mas compute capability ' + $gpu.ComputeCap + ' não é compatível com o backend CUDA atual. Será usado CPU.') 'Concluído' 100
+    } elseif (-not $driver -or $driver -lt [version]'551.61' -or $script:SetupArch -ne 'x64') {
+        $drvTxt = if ($driver) { [string]$driver } else { 'não identificado' }
+        $script:InstallTasks += New-SetupTask 'cuda' 'CUDA Runtime' ('Driver NVIDIA ' + $drvTxt + ' sem compatibilidade confirmada com os pacotes CUDA disponíveis. Será usado CPU.') 'Concluído' 100
+    } elseif ($serverPath -and (Test-CudaBundle $serverPath)) {
+        $script:InstallTasks += New-SetupTask 'cuda' 'CUDA Runtime' ('Backend CUDA e bibliotecas locais encontrados. Driver ' + $driver + '.') 'Concluído' 100
+    } else {
+        $script:InstallTasks += New-SetupTask 'cuda' 'CUDA Runtime' ('GPU NVIDIA detectada (' + $gpu.Name + ', CC ' + $(if ($gpu.ComputeCap -gt 0) { [string]$gpu.ComputeCap } else { 'não informado' }) + '); instalar backend e bibliotecas locais para driver ' + $driver + '.') 'Aguardando instalação' 0
+    }
+
+    $uvPath = Get-UvPath
+    $pythonInfo = Get-SetupPythonInfo
+    if ($uvPath -and $pythonInfo.Ok) {
+        $script:InstallTasks += New-SetupTask 'python' 'Python + UV' ('UV e Python 3.11 disponíveis. Python: ' + $pythonInfo.Python) 'Concluído' 100
+    } else {
+        $missing = if (-not $uvPath) { 'UV portátil será instalado' } else { 'Python 3.11 será preparado pelo UV' }
+        $script:InstallTasks += New-SetupTask 'python' 'Python + UV' ($missing + ' sem alterar a instalação global do Windows.') 'Aguardando instalação' 0
+    }
+
+    if ($uvPath -and $pythonInfo.Ok -and (Test-PythonDependencies $uvPath)) {
+        $script:InstallTasks += New-SetupTask 'deps' 'Dependências adicionais' 'ddgs e trafilatura já estão preparados no cache local.' 'Concluído' 100
+    } else {
+        $script:InstallTasks += New-SetupTask 'deps' 'Dependências adicionais' 'Preparar dependências de pesquisa; serão instaladas no cache local quando necessário.' 'Aguardando instalação' 0
+    }
+    return $script:InstallTasks
+}
+
+function Clear-SetupDebris {
+    # Remove downloads, extrações e backups deixados pela instalação.
+    try {
+        if (Test-Path -LiteralPath $script:SetupDir) {
+            Remove-Item -LiteralPath $script:SetupDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        if ((Test-Path -LiteralPath $script:RuntimeServerDir) -and (Test-Path -LiteralPath $script:RuntimeDir)) {
+            Get-ChildItem -LiteralPath $script:RuntimeDir -Directory -Filter 'llama-server-backup-*' -Force -ErrorAction SilentlyContinue |
+                Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    } catch { }
+}
+
+function Clear-LauncherTemp {
+    # Remove restos do launcher na pasta TEMP (execuções interrompidas, janela fechada, falhas).
+    # Arquivos com menos de 1 hora são mantidos para não afetar outra instância em uso.
+    try {
+        $limit = (Get-Date).AddHours(-1)
+        $patterns = @('llama_webui_*.json', 'llama_research_*', 'llama_swarm_*', 'llama_image_*', 'llama_bench_*', 'llama_launcher_*.ps1', 'llama_launcher_new_*.bat')
+        foreach ($pat in $patterns) {
+            Get-ChildItem -LiteralPath $env:TEMP -Filter $pat -Force -ErrorAction SilentlyContinue |
+                Where-Object { $_.LastWriteTime -lt $limit } |
+                Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    } catch { }
+}
+
+function Invoke-InitialSetup {
+    $null = Get-SetupDiagnostics
+    $pending = @($script:InstallTasks | Where-Object { $_.State -eq 'Aguardando instalação' })
+    if ($pending.Count -eq 0) { return 'continue' }
+    $choice = Show-SetupMenu `
+        -Message 'Alguns componentes ainda precisam ser preparados. As instalações serão locais e não incluirão modelos de IA.' `
+        -Options @('Instalar componentes pendentes', 'Continuar para o menu principal', 'Sair') -Default 0
+    if ($choice -eq 2) { return 'exit' }
+    if ($choice -ne 0) { return 'continue' }
+
+    $toRun = @($pending | Where-Object { $_.Id -ne 'deps' -or (Get-SetupPythonInfo).Ok })
+    if (-not (Get-SetupPythonInfo).Ok -and (@($pending | Where-Object { $_.Id -eq 'python' }).Count -gt 0)) {
+        # Python is installed first; dependency preparation is picked up immediately afterwards.
+    }
+    foreach ($t in $toRun) {
+        $currentTask = Get-SetupTask $t.Id
+        if ($currentTask -and $currentTask.State -eq 'Concluído') { continue }
+        if ($t.Id -eq 'deps' -and -not (Get-SetupPythonInfo).Ok) { continue }
+        try {
+            switch ($t.Id) {
+                'server' {
+                    Set-SetupTask 'server' 'Verificando' 1 'Selecionando um pacote oficial compatível com Windows e arquitetura detectada.'
+                    Render-SetupScreen
+                    $null = Install-LlamaServer -Backend 'auto' -Task $t
+                }
+                'cuda' {
+                    Set-SetupTask 'cuda' 'Verificando' 1 'Validando driver NVIDIA e selecionando o backend CUDA apropriado.'
+                    Render-SetupScreen
+                    $result = Install-LlamaServer -Backend 'cuda' -Task $t
+                    if (-not $result.Ok) { throw 'Não foi possível preparar o backend CUDA.' }
+                }
+                'python' {
+                    Set-SetupTask 'python' 'Verificando' 1 'Preparando UV e Python portáteis.'
+                    Render-SetupScreen
+                    Install-UvAndPython $t | Out-Null
+                }
+                'deps' {
+                    Set-SetupTask 'deps' 'Verificando' 1 'Verificando dependências adicionais.'
+                    Render-SetupScreen
+                    Install-PythonDependencies $t
+                }
+            }
+        } catch {
+            Set-SetupTask $t.Id 'Falha na instalação' $t.Percent $t.Description $_.Exception.Message
+            Render-SetupScreen
+        }
+        if ($t.Id -eq 'python' -and $t.State -eq 'Concluído') {
+            $depTask = Get-SetupTask 'deps'
+            if ($depTask -and $depTask.State -ne 'Concluído') {
+                try { Install-PythonDependencies $depTask } catch { Set-SetupTask 'deps' 'Falha na instalação' $depTask.Percent $depTask.Description $_.Exception.Message }
+                Render-SetupScreen
+            }
+        }
+    }
+
+    while ($true) {
+        $failed = @($script:InstallTasks | Where-Object { $_.State -eq 'Falha na instalação' })
+        $pendingNow = @($script:InstallTasks | Where-Object { $_.State -eq 'Aguardando instalação' })
+        if ($failed.Count -eq 0 -and $pendingNow.Count -eq 0) { break }
+        $msg = 'A preparação terminou com itens que não puderam ser concluídos.'
+        if ((Get-SetupTask 'server').State -ne 'Concluído') { $msg += "`nO menu poderá ser aberto, mas o servidor não iniciará até ser instalado." }
+        $choice = Show-SetupMenu -Message $msg -Options @('Tentar novamente itens pendentes/com falha', 'Continuar para o menu principal', 'Sair') -Default 0
+        if ($choice -eq 2) { return 'exit' }
+        if ($choice -ne 0) { break }
+        $retryTasks = @($script:InstallTasks | Where-Object { $_.State -eq 'Falha na instalação' -or $_.State -eq 'Aguardando instalação' })
+        foreach ($t in $retryTasks) {
+            $currentTask = Get-SetupTask $t.Id
+            if ($currentTask -and $currentTask.State -eq 'Concluído') { continue }
+            if ($t.Id -eq 'deps' -and -not (Get-SetupPythonInfo).Ok) { continue }
+            try {
+                Set-SetupTask $t.Id 'Aguardando instalação' 0 $t.Description ''
+                switch ($t.Id) {
+                    'server' { $null = Install-LlamaServer -Backend 'auto' -Task $t }
+                    'cuda' { $null = Install-LlamaServer -Backend 'cuda' -Task $t }
+                    'python' { Install-UvAndPython $t | Out-Null }
+                    'deps' { Install-PythonDependencies $t }
+                }
+            } catch { Set-SetupTask $t.Id 'Falha na instalação' $t.Percent $t.Description $_.Exception.Message }
+        }
+        Render-SetupScreen
+    }
+    $serverTask = Get-SetupTask 'server'
+    if ($serverTask -and $serverTask.State -eq 'Concluído') {
+        $runtimeServer = Join-Path $script:RuntimeServerDir 'llama-server.exe'
+        if (Test-Path -LiteralPath $runtimeServer) { $test = Test-ServerExecutable $runtimeServer; if ($test.Ok -and $script:ServerExe -ne (Join-Path $script:Root 'llama-server.exe')) { $script:ServerExe = $runtimeServer } }
+    }
+    return 'continue'
 }
 
 # ---------------------------------------------------------------------------
@@ -4762,7 +5608,9 @@ function Show-Settings {
         $meta += ('ctx nativo ' + (Format-Tokens (Get-MaxCtx $Cfg.Model)))
         $meta += (Format-GB $Cfg.Model.Size)
         if ($Cfg.Model.HasVision) { $meta += 'visão disponível' }
-        Write-Host ('  ' + (Cut-Text ($meta -join '  ·  ') ($w - 3))) -ForegroundColor DarkGray
+        foreach ($line in @(Wrap-Text ($meta -join '  ·  ') ($w - 3))) {
+            Write-Host ('  ' + $line) -ForegroundColor DarkGray
+        }
         Write-Host ''
 
         for ($i = 0; $i -lt $rows.Count; $i++) {
@@ -5541,6 +6389,16 @@ if (Test-UpdateAvailable) {
 
 $script:Gpu = Get-GpuInfo
 $script:Mem = Get-MemInfo
+Clear-LauncherTemp
+Clear-SetupDebris
+$setupResult = Invoke-InitialSetup
+Clear-SetupDebris
+if ($setupResult -eq 'exit') {
+    Disable-Mouse
+    try { [Console]::CursorVisible = $true } catch { }
+    exit 0
+}
+Update-Hardware
 Initialize-State
 Refresh-Models
 
@@ -5610,6 +6468,8 @@ try {
 } finally {
     Stop-ImageServer $script:Image
     Stop-ResearchServer $script:Research
+    Clear-SetupDebris
+    Clear-LauncherTemp
     Disable-Mouse
     try { [Console]::CursorVisible = $true } catch { }
     try { $Host.UI.RawUI.WindowTitle = 'Llama Launcher' } catch { }

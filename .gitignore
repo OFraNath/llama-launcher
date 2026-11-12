@@ -1,5 +1,6 @@
 # Runtime / logs
 logs/
+/runtime/
 llama_launcher.json
 llama_launcher_cache.json
 llama_presets.ini

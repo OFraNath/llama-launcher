@@ -1,24 +1,20 @@
 # Llama-Launcher
 
-Um launcher conveniente para o llama-server: um único `.bat`, sem instalar nada.
+Um launcher conveniente para o llama-server: um único `.bat`, sem instalação manual.
 
 ## Requisitos
 
 - Windows com PowerShell 5.1 (já vem no Windows)
-- `llama-server.exe` de uma versão recente do [llama.cpp](https://github.com/ggml-org/llama.cpp/releases), na mesma pasta do script
+- Conexão com a internet na primeira execução, para o launcher baixar o llama.cpp, o uv e o Python
 - Modelos `.gguf` dentro da pasta `Modelos`
-- Opcional: GPU NVIDIA (`nvidia-smi`), Tailscale e [uv](https://docs.astral.sh/uv/) (para o Open WebUI)
-
-## Compatibilidade
-
-Testado com o llama.cpp `b12023`. Versões posteriores podem alterar flags do `llama-server` e quebrar o launcher; se isso acontecer, use a versão testada. Para ver a sua: `llama-server.exe --version`.
+- Opcional: GPU NVIDIA (`nvidia-smi`) e Tailscale
 
 ## Uso
 
-1. Coloque o `iniciar_llama.bat` na mesma pasta do `llama-server.exe`.
+1. Coloque o `iniciar_llama.bat` numa pasta própria e execute-o. Na primeira vez ele oferece instalar o que faltar (llama.cpp, CUDA, uv e Python) dentro da subpasta `runtime`, sem alterar o sistema.
 2. Crie `Modelos/<NomeDoModelo>/` (sem espaços; ex.: `Gemma-4`) e coloque o `.gguf` dentro.
 3. Para visão, coloque na mesma pasta o arquivo `mmproj*`.
-4. Execute o `iniciar_llama.bat`. Pressione `Esc` duas vezes para encerrar o servidor e voltar ao menu.
+4. Abra o `iniciar_llama.bat` e escolha o modelo no menu. Pressione `Esc` duas vezes para encerrar o servidor e voltar ao menu.
 
 ## Aviso
 
