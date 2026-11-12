@@ -5557,6 +5557,11 @@ function Get-SettingsRows {
     $rows += [pscustomobject]@{ Key = 'browser'; Label = 'Navegador'; Value = (Get-BrowserLabel $Cfg.Browser); Color = 'White' }
     $rows += (Get-BenchRow $Cfg)
     $rows += [pscustomobject]@{ Key = 'start'; Label = 'INICIAR SERVIDOR'; Value = ''; Color = 'Green' }
+    $lw = 17
+    foreach ($r in $rows) {
+        if ($r.Key -ne 'start' -and ([string]$r.Label).Length + 3 -gt $lw) { $lw = ([string]$r.Label).Length + 3 }
+    }
+    $script:SettingsLabelW = $lw
     return $rows
 }
 
@@ -5644,6 +5649,8 @@ function Change-CfgSetting {
 function Write-SettingRow {
     param($Row, [bool]$Selected)
     $w = Get-UIWidth
+    $lw = 17
+    if ($script:SettingsLabelW) { $lw = [int]$script:SettingsLabelW }
     if ($Row.Key -eq 'start') {
         if ($Selected) { $txt = ' > INICIAR SERVIDOR' } else { $txt = '   INICIAR SERVIDOR' }
         Write-Row $txt $Selected 'Green'
@@ -5652,7 +5659,7 @@ function Write-SettingRow {
     if ($Row.Key -eq 'bench') {
         $prefix = '   '
         if ($Selected) { $prefix = ' > ' }
-        $txt = (Fit-Text ($prefix + $Row.Label) 17) + ' ' + (Cut-Text ([string]$Row.Value) ($w - 18))
+        $txt = (Fit-Text ($prefix + $Row.Label) $lw) + ' ' + (Cut-Text ([string]$Row.Value) ($w - $lw - 1))
         if ($Selected) {
             Write-Row $txt $true
         } else {
@@ -5660,8 +5667,8 @@ function Write-SettingRow {
         }
         return
     }
-    $label = Fit-Text ('  ' + $Row.Label) 17
-    $value = Cut-Text ([string]$Row.Value) ($w - 18)
+    $label = Fit-Text ('  ' + $Row.Label) $lw
+    $value = Cut-Text ([string]$Row.Value) ($w - $lw - 1)
     $txt = $label + ' ' + $value
     if ($Selected) {
         Write-Row $txt $true
