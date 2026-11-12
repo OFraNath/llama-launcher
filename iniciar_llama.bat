@@ -1625,7 +1625,7 @@ function ConvertTo-ImagePath {
 function Get-ImageLabel {
     param($Cfg)
     $path = [string]$Cfg.ImagePath
-    if ([string]::IsNullOrWhiteSpace($path)) { return 'desligada · Enter para escolher o launch-windows.bat do SwarmUI' }
+    if ([string]::IsNullOrWhiteSpace($path)) { return 'desligada' }
     if ([string]$Cfg.Image -eq 'on') { return ('ligada · ' + $path) }
     return ('desligada · ' + $path)
 }
@@ -5690,9 +5690,7 @@ function Show-Settings {
         if ($Cfg.Host -eq 'tailscale' -and -not $accessUrl) {
             Write-Host '      Tailscale não detectado.' -ForegroundColor Yellow
         } elseif ($accessUrl) {
-            $accessNote = ''
-            if ($Cfg.Host -ne '127.0.0.1') { $accessNote = '  ·  sem senha' }
-            Write-Host ('      Acesso: {0}{1}' -f $accessUrl, $accessNote) -ForegroundColor DarkCyan
+            Write-Host ('      Acesso: {0}' -f $accessUrl) -ForegroundColor DarkCyan
         }
         if ($Cfg.Agent -eq 'on' -and -not (Test-AgentSupported)) {
             Write-Host '      Agente: llama-server.exe sem --agent; opção ignorada.' -ForegroundColor Red
@@ -5718,7 +5716,7 @@ function Show-Settings {
             if ([string]::IsNullOrWhiteSpace([string]$Cfg.ImagePath)) {
                 $imgHints += 'Enter: escolher o launch-windows.bat do SwarmUI no Explorer.'
             } else {
-                $imgHints += 'Enter: trocar o arquivo   ←→: ligar/desligar   Backspace/Del: limpar.'
+                $imgHints += 'Enter: trocar o arquivo   ←→ ou botão direito: ligar/desligar   Backspace/Del: limpar.'
             }
             $imgHints += 'Funciona somente com o SwarmUI, que não é instalado pelo launcher (instale à parte). Versão recomendada: 0.9.8.1.'
             foreach ($h in $imgHints) {
