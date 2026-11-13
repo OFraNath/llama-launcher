@@ -104,10 +104,28 @@ public static class LlamaLauncherJob
     [DllImport("kernel32.dll")]
     static extern IntPtr GetCurrentProcess();
 
+    static IntPtr activeJob = IntPtr.Zero;
+
+    public static bool PrepareForUpdate()
+    {
+        if (activeJob == IntPtr.Zero) return false;
+        EXTENDED_LIMIT_INFORMATION limits = new EXTENDED_LIMIT_INFORMATION();
+        limits.BasicLimitInformation.LimitFlags = 0;
+        int size = Marshal.SizeOf(typeof(EXTENDED_LIMIT_INFORMATION));
+        IntPtr memory = Marshal.AllocHGlobal(size);
+        try
+        {
+            Marshal.StructureToPtr(limits, memory, false);
+            return SetInformationJobObject(activeJob, 9, memory, (uint)size);
+        }
+        finally { Marshal.FreeHGlobal(memory); }
+    }
+
     public static bool Start(int parentProcessId)
     {
         IntPtr job = CreateJobObject(IntPtr.Zero, null);
         if (job == IntPtr.Zero) return false;
+        activeJob = job;
 
         EXTENDED_LIMIT_INFORMATION limits = new EXTENDED_LIMIT_INFORMATION();
         limits.BasicLimitInformation.LimitFlags = 0x00002000;
@@ -4683,7 +4701,12 @@ function Save-UpdateFile {
     $target = $env:LLAMA_NEW
     if ([string]::IsNullOrWhiteSpace($target) -or $null -eq $script:UpdateBytes) { return $false }
     try {
-        [System.IO.File]::WriteAllBytes($target, $script:UpdateBytes)
+        $content = [System.Text.Encoding]::UTF8.GetString($script:UpdateBytes).TrimStart([char]0xFEFF)
+        $content = $content -replace "`r`n|`n|`r", "`r`n"
+        if ($content -notmatch '(?m)^#===PS1===\r?$') { return $false }
+        if ($content -notmatch '(?m)^@echo off\r?$') { return $false }
+        $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($content)
+        [System.IO.File]::WriteAllBytes($target, $bytes)
         return $true
     } catch {
         return $false
@@ -4707,58 +4730,8 @@ function Install-LauncherUpdate {
 }
 
 function Show-UpdatePrompt {
-    $message = 'Uma atualização do Llama Launcher está disponível.'
-    $buttons = @(
-        [pscustomobject]@{ Key = 'A'; Text = ' A  Atualizar ' },
-        [pscustomobject]@{ Key = 'D'; Text = ' D  Dispensar ' }
-    )
-    $gap = 4
-    $sel = 0
-    while ($true) {
-        Clear-Screen
-        $w = Get-UIWidth
-        $h = 24
-        try { $h = [Console]::WindowHeight } catch { }
-        $top = [Math]::Max(1, [int][Math]::Floor(($h - 4) / 2))
-        for ($i = 0; $i -lt $top; $i++) { Write-Host '' }
-        $pad = [Math]::Max(0, [int][Math]::Floor(($w - $message.Length) / 2))
-        Write-Host ((' ' * $pad) + $message) -ForegroundColor White
-        Write-Host ''
-
-        $total = $gap * ($buttons.Count - 1)
-        foreach ($b in $buttons) { $total += $b.Text.Length }
-        $x = [Math]::Max(0, [int][Math]::Floor(($w - $total) / 2))
-        $y = [int][Console]::CursorTop
-        $hits = @()
-        Write-Host (' ' * $x) -NoNewline
-        for ($i = 0; $i -lt $buttons.Count; $i++) {
-            $b = $buttons[$i]
-            if ($i -gt 0) {
-                Write-Host (' ' * $gap) -NoNewline
-                $x += $gap
-            }
-            if ($i -eq $sel) {
-                Write-Host $b.Text -NoNewline -ForegroundColor Black -BackgroundColor Cyan
-            } else {
-                Write-Host $b.Text -NoNewline -ForegroundColor Gray -BackgroundColor DarkGray
-            }
-            $hits += [pscustomobject]@{ Y = $y; X1 = $x; X2 = ($x + $b.Text.Length - 1); Key = $b.Key }
-            $x += $b.Text.Length
-        }
-        Write-Host ''
-        $script:FootHit = $hits
-
-        $key = Read-Key
-        switch ([string]$key.Key) {
-            'A'          { return $true }
-            'D'          { return $false }
-            'Escape'     { return $false }
-            'Enter'      { return ($sel -eq 0) }
-            'LeftArrow'  { $sel = 0 }
-            'RightArrow' { $sel = 1 }
-            'Tab'        { $sel = 1 - $sel }
-        }
-    }
+    $choice = Show-Choice -Title 'Atualização disponível' -Message 'Uma atualização do Llama Launcher está disponível. Deseja instalar agora?' -Options @('Atualizar agora', 'Mais tarde') -Default 0
+    return ($choice -eq 0)
 }
 
 # ---------------------------------------------------------------------------
@@ -6918,9 +6891,18 @@ Initialize-Fx
 if (Test-UpdateAvailable) {
     try { [Console]::CursorVisible = $false } catch { }
     if ((Show-UpdatePrompt) -and (Install-LauncherUpdate)) {
-        Disable-Mouse
-        try { [Console]::CursorVisible = $true } catch { }
-        exit $script:UpdateExitCode
+        if ([LlamaLauncherJob]::PrepareForUpdate()) {
+            Disable-Mouse
+            try { [Console]::CursorVisible = $true } catch { }
+            exit $script:UpdateExitCode
+        }
+        Remove-Item -LiteralPath $env:LLAMA_NEW -Force -ErrorAction SilentlyContinue
+        Clear-Screen
+        Write-Host ''
+        Write-Host '  Não foi possível preparar a troca segura do launcher.' -ForegroundColor Red
+        Write-Host ''
+        Write-Host '  O launcher continuará aberto.' -ForegroundColor Gray
+        [void](Read-Key)
     }
 }
 
@@ -6949,6 +6931,16 @@ try {
 
         if ($pick.Action -eq 'update') {
             if (Install-LauncherUpdate) {
+                if (-not [LlamaLauncherJob]::PrepareForUpdate()) {
+                    Remove-Item -LiteralPath $env:LLAMA_NEW -Force -ErrorAction SilentlyContinue
+                    Clear-Screen
+                    Write-Host ''
+                    Write-Host '  Não foi possível preparar a troca segura do launcher.' -ForegroundColor Red
+                    Write-Host ''
+                    Write-Host '  O launcher continuará aberto.' -ForegroundColor Gray
+                    [void](Read-Key)
+                    continue
+                }
                 $script:ExitCode = $script:UpdateExitCode
                 break
             }
