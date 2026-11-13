@@ -4,6 +4,7 @@ logs/
 llama_launcher.json
 llama_launcher_cache.json
 llama_presets.ini
+.llama_launcher_commit
 
 # Segredos e dados locais
 .webui_secret_key
@@ -16,7 +17,3 @@ PLANO.md
 # Binários do llama.cpp / CUDA / OpenMP (baixados separadamente)
 *.exe
 *.dll
-LICENSE-LLVM-OpenMP
-
-# SwarmUI
-launch-windows.bat
