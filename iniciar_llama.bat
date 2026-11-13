@@ -9,6 +9,8 @@ set "LLAMA_BAT=%~f0"
 
 set "LLAMA_PS1=%TEMP%\llama_launcher_%RANDOM%%RANDOM%.ps1"
 set "LLAMA_NEW=%TEMP%\llama_launcher_new_%RANDOM%%RANDOM%.bat"
+set "LLAMA_UPDATE_MARKER=%LLAMA_ROOT%.llama_launcher_commit"
+set "LLAMA_UPDATE_MARKER_TMP=%TEMP%\llama_launcher_commit_%RANDOM%%RANDOM%.tmp"
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$b=$env:LLAMA_BAT; $t=$env:LLAMA_PS1; try { $l=Get-Content -LiteralPath $b -Encoding UTF8; $i=[Array]::IndexOf($l,'#===PS1==='); if($i -lt 0){exit 2}; $l[($i+1)..($l.Count-1)] | Set-Content -LiteralPath $t -Encoding UTF8; exit 0 } catch { exit 3 }"
 if errorlevel 1 (
     echo [ERRO] Falha ao preparar o launcher.
@@ -23,8 +25,8 @@ powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "[Console]::C
 del /f /q "%LLAMA_PS1%" >nul 2>&1
 if "%LLAMA_RC%"=="10" (
     copy /y "%LLAMA_NEW%" "%LLAMA_BAT%" >nul 2>&1 && (
+        if exist "%LLAMA_UPDATE_MARKER_TMP%" move /y "%LLAMA_UPDATE_MARKER_TMP%" "%LLAMA_UPDATE_MARKER%" >nul 2>&1
         del /f /q "%LLAMA_NEW%" >nul 2>&1
-        set "LLAMA_UPDATED=1"
         call "%LLAMA_BAT%" %*
         exit /b
     )
@@ -216,7 +218,11 @@ $script:LastClick = [datetime]::MinValue
 $script:Bench = @{}
 $script:BenchRunning = $false
 $script:BenchText = ''
-$script:UpdateUrl = 'https://raw.githubusercontent.com/OFraNath/llama-launcher/HEAD/iniciar_llama.bat'
+$script:GitHubRepo = 'OFraNath/llama-launcher'
+$script:GitHubFile = 'iniciar_llama.bat'
+$script:RemoteCommitSha = ''
+$script:RemoteCommitMessage = ''
+$script:RemoteCommitUrl = ''
 $script:UpdateExitCode = 10
 $script:UpdateAvailable = $false
 $script:UpdateBytes = $null
@@ -4657,25 +4663,31 @@ function Get-ContentHash {
 function Get-RemoteLauncher {
     try {
         try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
-        $req = [System.Net.HttpWebRequest]::Create($script:UpdateUrl)
-        $req.Timeout = 6000
-        $req.ReadWriteTimeout = 6000
-        $req.UserAgent = 'llama-launcher-updater'
-        $req.CachePolicy = New-Object System.Net.Cache.RequestCachePolicy -ArgumentList ([System.Net.Cache.RequestCacheLevel]::NoCacheNoStore)
-        $resp = $req.GetResponse()
-        try {
-            $ms = New-Object System.IO.MemoryStream
-            $resp.GetResponseStream().CopyTo($ms)
-            $bytes = $ms.ToArray()
-        } finally {
-            $resp.Close()
+        $apiUrl = 'https://api.github.com/repos/' + $script:GitHubRepo + '/commits?path=' + [Uri]::EscapeDataString($script:GitHubFile) + '&per_page=1'
+        $headers = @{
+            'User-Agent' = 'llama-launcher-updater'
+            'Accept' = 'application/vnd.github+json'
+            'Cache-Control' = 'no-cache'
         }
-        $text = [System.Text.Encoding]::UTF8.GetString($bytes)
-        if ($text -notmatch '(?m)^#===PS1===\r?$') { return $null }
-        if ($text -notmatch '^\uFEFF?@echo off') { return $null }
-        if ($text -notmatch '(?m)^function Invoke-InitialSetup\s*\{') { return $null }
-        if ($text -notmatch '(?m)^function Install-LlamaServer\s*\{') { return $null }
-        return ,$bytes
+        $commitResponse = Invoke-RestMethod -Uri $apiUrl -Headers $headers -Method Get -TimeoutSec 15
+        $commit = @($commitResponse) | Select-Object -First 1
+        if ($null -eq $commit -or [string]::IsNullOrWhiteSpace([string]$commit.sha)) { return $null }
+        $sha = ([string]$commit.sha).ToLowerInvariant()
+        if ($sha -notmatch '^[0-9a-f]{40}$') { return $null }
+        $rawUrl = 'https://raw.githubusercontent.com/' + $script:GitHubRepo + '/' + $sha + '/' + $script:GitHubFile
+        $response = Invoke-WebRequest -Uri $rawUrl -Headers $headers -Method Get -TimeoutSec 25 -UseBasicParsing
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes([string]$response.Content)
+        $content = [System.Text.Encoding]::UTF8.GetString($bytes)
+        if ($content -notmatch '(?m)^#===PS1===\r?$') { return $null }
+        if ($content -notmatch '^\uFEFF?@echo off') { return $null }
+        if ($content -notmatch '(?m)^function Invoke-InitialSetup\s*\{') { return $null }
+        if ($content -notmatch '(?m)^function Install-LlamaServer\s*\{') { return $null }
+        return [pscustomobject]@{
+            Bytes = $bytes
+            Sha = $sha
+            Message = ([string]$commit.commit.message -split '\r?\n')[0]
+            Url = [string]$commit.html_url
+        }
     } catch {
         return $null
     }
@@ -4684,15 +4696,35 @@ function Get-RemoteLauncher {
 function Test-UpdateAvailable {
     $script:UpdateAvailable = $false
     $script:UpdateBytes = $null
+    $script:RemoteCommitSha = ''
+    $script:RemoteCommitMessage = ''
+    $script:RemoteCommitUrl = ''
     if ($env:LLAMA_UPDATED -eq '1') { return $false }
     $self = $env:LLAMA_BAT
     if ([string]::IsNullOrWhiteSpace($self) -or -not (Test-Path -LiteralPath $self)) { return $false }
     Write-Host '  Verificando atualizações...' -ForegroundColor DarkGray
     $remote = Get-RemoteLauncher
     if ($null -eq $remote) { return $false }
-    try { $local = [System.IO.File]::ReadAllBytes($self) } catch { return $false }
-    if ((Get-ContentHash $remote) -eq (Get-ContentHash $local)) { return $false }
-    $script:UpdateBytes = $remote
+    $script:RemoteCommitSha = $remote.Sha
+    $script:RemoteCommitMessage = $remote.Message
+    $script:RemoteCommitUrl = $remote.Url
+    $marker = $env:LLAMA_UPDATE_MARKER
+    $installedSha = ''
+    if (-not [string]::IsNullOrWhiteSpace($marker) -and (Test-Path -LiteralPath $marker)) {
+        try { $installedSha = (Get-Content -LiteralPath $marker -Raw -ErrorAction Stop).Trim().ToLowerInvariant() } catch { }
+    }
+    if ($installedSha -match '^[0-9a-f]{40}$') {
+        if ($installedSha -eq $remote.Sha) { return $false }
+    } else {
+        try { $local = [System.IO.File]::ReadAllBytes($self) } catch { return $false }
+        if ((Get-ContentHash $remote.Bytes) -eq (Get-ContentHash $local)) {
+            if (-not [string]::IsNullOrWhiteSpace($marker)) {
+                try { [System.IO.File]::WriteAllText($marker, $remote.Sha, [System.Text.Encoding]::ASCII) } catch { }
+            }
+            return $false
+        }
+    }
+    $script:UpdateBytes = $remote.Bytes
     $script:UpdateAvailable = $true
     return $true
 }
@@ -4707,6 +4739,9 @@ function Save-UpdateFile {
         if ($content -notmatch '(?m)^@echo off\r?$') { return $false }
         $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($content)
         [System.IO.File]::WriteAllBytes($target, $bytes)
+        if ($script:RemoteCommitSha -notmatch '^[0-9a-f]{40}$') { return $false }
+        if ([string]::IsNullOrWhiteSpace($env:LLAMA_UPDATE_MARKER_TMP)) { return $false }
+        [System.IO.File]::WriteAllText($env:LLAMA_UPDATE_MARKER_TMP, $script:RemoteCommitSha, [System.Text.Encoding]::ASCII)
         return $true
     } catch {
         return $false
@@ -4730,7 +4765,9 @@ function Install-LauncherUpdate {
 }
 
 function Show-UpdatePrompt {
-    $choice = Show-Choice -Title 'Atualização disponível' -Message 'Uma atualização do Llama Launcher está disponível. Deseja instalar agora?' -Options @('Atualizar agora', 'Mais tarde') -Default 0
+    $message = 'Commit ' + $script:RemoteCommitSha.Substring(0, 7)
+    if (-not [string]::IsNullOrWhiteSpace($script:RemoteCommitMessage)) { $message += ': ' + $script:RemoteCommitMessage }
+    $choice = Show-Choice -Title 'Atualização disponível' -Message $message -Options @('Atualizar agora', 'Mais tarde') -Default 0
     return ($choice -eq 0)
 }
 
