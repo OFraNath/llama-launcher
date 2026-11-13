@@ -223,7 +223,7 @@ $script:GitHubFile = 'iniciar_llama.bat'
 $script:RemoteCommitSha = ''
 $script:RemoteCommitMessage = ''
 $script:RemoteCommitUrl = ''
-$script:LauncherVersion = 'commit não identificado'
+$script:LauncherVersion = ''
 $script:UpdateExitCode = 10
 $script:UpdateAvailable = $false
 $script:UpdateBytes = $null
@@ -5584,7 +5584,11 @@ function Show-ModelPicker {
         }
 
         Clear-Screen
+        if ([string]::IsNullOrWhiteSpace($script:LauncherVersion)) {
+        Show-Header ''
+    } else {
         Show-Header $script:LauncherVersion
+    }
         Write-Host ''
 
         if ($rows.Count -eq 0) {
