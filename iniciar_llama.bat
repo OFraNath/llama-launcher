@@ -223,6 +223,7 @@ $script:GitHubFile = 'iniciar_llama.bat'
 $script:RemoteCommitSha = ''
 $script:RemoteCommitMessage = ''
 $script:RemoteCommitUrl = ''
+$script:LauncherVersion = 'commit não identificado'
 $script:UpdateExitCode = 10
 $script:UpdateAvailable = $false
 $script:UpdateBytes = $null
@@ -4693,6 +4694,23 @@ function Get-RemoteLauncher {
     }
 }
 
+function Get-CommitSubject {
+    param([string]$Sha)
+    if ($Sha -notmatch '^[0-9a-fA-F]{40}$') { return '' }
+    try {
+        $headers = @{
+            'User-Agent' = 'llama-launcher-updater'
+            'Accept' = 'application/vnd.github+json'
+            'Cache-Control' = 'no-cache'
+        }
+        $url = 'https://api.github.com/repos/' + $script:GitHubRepo + '/commits/' + $Sha
+        $result = Invoke-RestMethod -Uri $url -Headers $headers -Method Get -TimeoutSec 15
+        return ([string]$result.commit.message -split '\r?\n')[0].Trim()
+    } catch {
+        return ''
+    }
+}
+
 function Test-UpdateAvailable {
     $script:UpdateAvailable = $false
     $script:UpdateBytes = $null
@@ -4714,12 +4732,28 @@ function Test-UpdateAvailable {
         try { $installedSha = (Get-Content -LiteralPath $marker -Raw -ErrorAction Stop).Trim().ToLowerInvariant() } catch { }
     }
     if ($installedSha -match '^[0-9a-f]{40}$') {
+        $installedMessage = ''
+        $markerLines = @()
+        if (-not [string]::IsNullOrWhiteSpace($marker) -and (Test-Path -LiteralPath $marker)) {
+            try { $markerLines = @(Get-Content -LiteralPath $marker -ErrorAction Stop) } catch { }
+        }
+        if ($markerLines.Count -gt 1) { $installedMessage = ([string]$markerLines[1]).Trim() }
+        if ([string]::IsNullOrWhiteSpace($installedMessage)) {
+            $installedMessage = Get-CommitSubject -Sha $installedSha
+            if (-not [string]::IsNullOrWhiteSpace($installedMessage) -and -not [string]::IsNullOrWhiteSpace($marker)) {
+                try { [System.IO.File]::WriteAllText($marker, ($installedSha + [Environment]::NewLine + $installedMessage), [System.Text.Encoding]::UTF8) } catch { }
+            }
+        }
+        if (-not [string]::IsNullOrWhiteSpace($installedMessage)) { $script:LauncherVersion = $installedMessage }
+        else { $script:LauncherVersion = 'commit ' + $installedSha.Substring(0, 7) }
         if ($installedSha -eq $remote.Sha) { return $false }
     } else {
         try { $local = [System.IO.File]::ReadAllBytes($self) } catch { return $false }
         if ((Get-ContentHash $remote.Bytes) -eq (Get-ContentHash $local)) {
+            $script:LauncherVersion = $remote.Message
+            if ([string]::IsNullOrWhiteSpace($script:LauncherVersion)) { $script:LauncherVersion = 'commit ' + $remote.Sha.Substring(0, 7) }
             if (-not [string]::IsNullOrWhiteSpace($marker)) {
-                try { [System.IO.File]::WriteAllText($marker, $remote.Sha, [System.Text.Encoding]::ASCII) } catch { }
+                try { [System.IO.File]::WriteAllText($marker, ($remote.Sha + [Environment]::NewLine + $script:LauncherVersion), [System.Text.Encoding]::UTF8) } catch { }
             }
             return $false
         }
@@ -4741,7 +4775,7 @@ function Save-UpdateFile {
         [System.IO.File]::WriteAllBytes($target, $bytes)
         if ($script:RemoteCommitSha -notmatch '^[0-9a-f]{40}$') { return $false }
         if ([string]::IsNullOrWhiteSpace($env:LLAMA_UPDATE_MARKER_TMP)) { return $false }
-        [System.IO.File]::WriteAllText($env:LLAMA_UPDATE_MARKER_TMP, $script:RemoteCommitSha, [System.Text.Encoding]::ASCII)
+        [System.IO.File]::WriteAllText($env:LLAMA_UPDATE_MARKER_TMP, ($script:RemoteCommitSha + [Environment]::NewLine + $script:RemoteCommitMessage), [System.Text.Encoding]::UTF8)
         return $true
     } catch {
         return $false
@@ -5550,7 +5584,7 @@ function Show-ModelPicker {
         }
 
         Clear-Screen
-        Show-Header 'Escolha o modelo'
+        Show-Header $script:LauncherVersion
         Write-Host ''
 
         if ($rows.Count -eq 0) {
