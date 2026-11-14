@@ -5671,9 +5671,6 @@ function Show-ModelPicker {
                 $catOk = @($script:Models | Where-Object { ([string]$_.Category) -ieq $cat -or ([string]$_.Category).StartsWith($catPrefix, [System.StringComparison]::OrdinalIgnoreCase) }).Count -gt 0
                 if (-not $catOk) { $cat = ''; $script:ModelCategory = '' }
             }
-            if ($script:LastCfg -and -not $cat) {
-                $rows += [pscustomobject]@{ Kind = 'last'; Model = $script:LastCfg.Model }
-            }
             if ($cat) {
                 $rows += [pscustomobject]@{ Kind = 'up'; Cat = (Get-CategoryParent $cat) }
             }
@@ -5683,6 +5680,9 @@ function Show-ModelPicker {
             $inCat = @($script:Models | Where-Object { ([string]$_.Category) -ieq $cat })
             foreach ($m in @(Get-SortedModels $inCat)) {
                 $rows += [pscustomobject]@{ Kind = 'model'; Model = $m }
+            }
+            if ($script:LastCfg -and -not $cat) {
+                $rows += [pscustomobject]@{ Kind = 'last'; Model = $script:LastCfg.Model }
             }
 
             $sel = 0
@@ -5700,6 +5700,8 @@ function Show-ModelPicker {
                 for ($i = 0; $i -lt $rows.Count; $i++) {
                     if ($rows[$i].Kind -eq 'model' -and $rows[$i].Model.Path -eq $CurrentPath) { $sel = $i; break }
                 }
+            } elseif ($rows[$rows.Count - 1].Kind -eq 'last') {
+                $sel = $rows.Count - 1
             } elseif (-not $script:LastCfg) {
                 $sel = 0
                 for ($i = 0; $i -lt $rows.Count; $i++) {
@@ -5754,6 +5756,7 @@ function Show-ModelPicker {
                 $hdrDone = $true
                 $hdrHits = @(Write-ModelHeader $nameW $typeW)
             }
+            if ($row.Kind -eq 'last') { Write-Host '' }
             Register-Hit $i
 
             if ($row.Kind -eq 'last') {
@@ -5792,9 +5795,16 @@ function Show-ModelPicker {
         }
 
         Write-Host ''
-        $footer = '  ↑↓ navegar   Enter abrir   L última   E editar última   R recarregar   N nome   T tamanho   P tipo' + (Get-UpdateFooter) + '   Q sair'
-        Write-Footer $footer
-        $script:FootHit = @($script:FootHit) + @($hdrHits)
+        Write-Host ('  ' + ('-' * [Math]::Max(10, $w - 4))) -ForegroundColor DarkGray
+        Write-Host ''
+        Write-Footer '  Navegar   ↑↓ mover   Enter abrir   L última   E editar última'
+        $footHits = @($script:FootHit)
+        Write-Host ''
+        Write-Footer '  Ordenar   N nome   T tamanho   P tipo'
+        $footHits += @($script:FootHit)
+        Write-Host ''
+        Write-Footer ('  Sistema   R recarregar' + (Get-UpdateFooter) + '   Q sair')
+        $script:FootHit = $footHits + @($script:FootHit) + @($hdrHits)
 
         $key = Read-Key
         $kn = [string]$key.Key
