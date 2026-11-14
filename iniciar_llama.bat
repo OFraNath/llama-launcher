@@ -3769,6 +3769,11 @@ def tool_show_images(args):
 
 
 def tool_inspect_image(args):
+    if str(args.get("source") or "").strip().lower() != "generated":
+        return ("This tool cannot see images uploaded or attached by the user. "
+                "It only inspects pictures made by generate_image in this session. "
+                "Do not call it again for this. Look at the attached image yourself "
+                "and answer only from what you see in it.")
     with IMG_LOCK:
         order = list(IMG_ORDER)
         meta = dict(IMG_META)
@@ -3783,7 +3788,7 @@ def tool_inspect_image(args):
             n = -1
         if n < 1 or n > len(order):
             raise ValueError("There is no image %s. Image numbers go from 1 to %d, and there is no image 0. "
-                             "Call inspect_image again without image to inspect the latest picture. "
+                             "Call inspect_generated_image again without image to inspect the latest picture. "
                              "Use a number only when the user explicitly asked for that older picture." % (ref, len(order), len(order)))
         idx = n - 1
     name = order[idx]
@@ -3795,13 +3800,16 @@ def tool_inspect_image(args):
         question = (VISION_REVIEW % str((meta.get(name) or {}).get("prompt", "")))
     else:
         question = ("Look at the pixels and answer this question using only visible evidence: "
-                    + question + "\nAnswer in English. If unclear, say so. Keep it brief.")
+                    + question + "\nAnswer in English. Do not agree with anything the question suggests unless you clearly see it. "
+                    "If a detail is not clearly visible, answer 'not visible' instead of assuming it. If unclear, say so. Keep it brief.")
     seen, err = vision_ask(raw, IMG_MIME.get(name.rsplit(".", 1)[-1], "image/png"), question)
     if not seen:
         raise RuntimeError("could not look at the image: %s" % err)
     which = "the latest picture" if idx == len(order) - 1 else "an older picture"
-    return ("Inspection of image %d (%s; internal result): use only these findings when answering. "
-            "Do not add details or change left/right. If the inspection is unclear, say so.\n%s" % (idx + 1, which, seen))
+    return ("Inspection of GENERATED image %d (%s; prompt used: %s; internal result). This says nothing about any image the user attached. "
+            "If the user is asking about an attached image, ignore this result and describe the attached image yourself. "
+            "Use only these findings when answering. Do not add details or change left/right. If the inspection is unclear, say so.\n%s"
+            % (idx + 1, which, (meta.get(name) or {}).get("prompt", ""), seen))
 
 
 def tool_set_image_model(args):
@@ -4010,14 +4018,15 @@ TOOLS = [
 HANDLERS = {"list_models": tool_list_models, "list_params": tool_list_params, "generate_image": tool_generate_image, "show_images": tool_show_images, "set_image_model": tool_set_image_model}
 if VISION:
     TOOLS.append({
-        "name": "inspect_image",
-        "description": "Inspects the real pixels of a generated image. Omit image to inspect the latest picture. Set image only when the user explicitly asks about an older picture, using its number from show_images. Use it for a detail not covered by the existing inspection, or for a requested older picture.",
+        "name": "inspect_generated_image",
+        "description": "ONLY for pictures created by generate_image in this session. NEVER use it for an image the user attached or uploaded: you can see attached images yourself, so describe them directly. Inspects the real pixels of a generated picture. Omit image to inspect the latest generated picture. Set image only when the user explicitly asks about an older generated picture, using its number from show_images. Use it for a detail not covered by the existing inspection, or for a requested older picture.",
         "inputSchema": {"type": "object", "properties": {
-            "question": {"type": "string", "description": "Specific question in English. Omit for a full review."},
+            "source": {"type": "string", "enum": ["generated", "user_upload"], "description": "generated = made by generate_image in this session. user_upload = attached by the user in the chat."},
+            "question": {"type": "string", "description": "Neutral open question in English that does not suggest the answer, for example what is visible in a given area. Avoid yes or no questions. Omit for a full review."},
             "image": {"type": "integer", "description": "Omit to inspect the latest picture. Set only for an older picture explicitly requested by the user, using its show_images number. Numbers start at 1. Image 0 does not exist."},
-        }, "required": []},
+        }, "required": ["source"]},
     })
-    HANDLERS["inspect_image"] = tool_inspect_image
+    HANDLERS["inspect_generated_image"] = tool_inspect_image
 
 
 def rpc_error(rid, code, message):
@@ -4233,9 +4242,11 @@ function Write-UiConfig {
                 'The generate_image result includes an inspection of the actual pixels. Use it when the user asks what the picture looks like or whether it matches the request.',
                 'Use only details stated in the inspection. Never describe the picture from the prompt alone. If inspection failed, say so. If a detail is unclear or missing from the inspection, do not guess.',
                 'The inspection compares pixels with the English prompt sent to the image model. Also compare the result with the original user request. If the English prompt changed or omitted something, mention that difference.',
-                'For a detail or retry condition not covered by the inspection, call inspect_image with one specific question. Omit image to inspect the latest picture.',
+                'inspect_generated_image works only on pictures made by generate_image in this session. Never call it for an image the user attached or uploaded: you can already see attached images, so describe them yourself from what you see. Phrases like check again or look again about an uploaded image never justify calling it.',
+                'For a detail or retry condition not covered by the inspection of a generated picture, call inspect_generated_image with source generated and one specific question. Omit image to inspect the latest generated picture.',
+                'Write the question for inspect_generated_image as a neutral open question that does not suggest the answer, for example what is visible in a given area. Avoid yes or no questions.',
                 'Set image only when the user explicitly asks about an older picture. Use its number from show_images. Numbers start at 1; image 0 does not exist.',
-                'If the user reports a defect, inspect that detail before changing the picture. Then report what the pixels show. Keep left and right as stated in the inspection.',
+                'If the user reports a defect in a generated picture, inspect that detail before changing the picture. Then report what the pixels show. Keep left and right as stated in the inspection.',
                 'Do not describe or judge a picture unless the user asks.'
             ) -join ' '
             $parts += $imageSee
