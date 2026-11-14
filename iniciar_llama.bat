@@ -215,6 +215,7 @@ $script:FxBlank = [System.ConsoleColor]::Black
 $script:StatusRow = -1
 $script:HeaderSysRow = -1
 $script:HeaderSysCount = 0
+$script:HdrClock = [System.Diagnostics.Stopwatch]::StartNew()
 $script:MouseOk = $false
 $script:LastClick = [datetime]::MinValue
 $script:Bench = @{}
@@ -459,6 +460,7 @@ function Start-FxTransition {
 
 function Clear-Screen {
     if ($script:FrameOpen) { Complete-Frame }
+    $script:HeaderSysRow = -1
     $script:Hit = @{}
     $script:FootHit = @()
     try {
@@ -555,6 +557,40 @@ function Register-Hit {
     try { $script:Hit[[int][Console]::CursorTop] = $Id } catch { }
 }
 
+function Get-HeaderSysText {
+    $sys = 'GPU não detectada'
+    if ($script:Gpu -and $script:Gpu.Ok) {
+        $sys = ('{0}  |  {1:0.0} GB VRAM livre' -f $script:Gpu.Name, ($script:Gpu.FreeMB / 1024.0))
+    }
+    if ($script:Mem) {
+        $sys += ('  |  {0:0.0} GB RAM livre' -f ($script:Mem.FreeMB / 1024.0))
+    }
+    return $sys
+}
+
+function Update-HeaderMemory {
+    if ([int]$script:HeaderSysRow -lt 0) { return }
+    try {
+        $gpu = Get-GpuInfo
+        if ($gpu.Ok -or -not ($script:Gpu -and $script:Gpu.Ok)) { $script:Gpu = $gpu }
+        $mem = Get-MemInfo
+        if ($mem.TotalMB -gt 0) { $script:Mem = $mem }
+        $w = Get-UIWidth
+        $lines = @(Wrap-Text (Get-HeaderSysText) ($w - 3))
+        if ($lines.Count -ne [int]$script:HeaderSysCount) { return }
+        $l = [Console]::CursorLeft
+        $t = [Console]::CursorTop
+        $fg = [Console]::ForegroundColor
+        [Console]::ForegroundColor = [ConsoleColor]::DarkGray
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            [Console]::SetCursorPosition(0, [int]$script:HeaderSysRow + $i)
+            [Console]::Write(('  ' + $lines[$i]).PadRight($w))
+        }
+        [Console]::ForegroundColor = $fg
+        [Console]::SetCursorPosition($l, $t)
+    } catch { }
+}
+
 function Show-Header {
     param([string]$Title = '')
     $firstFrame = ($null -eq $script:LastTitle)
@@ -567,14 +603,7 @@ function Show-Header {
     Write-Host ('=' * $w) -ForegroundColor DarkCyan
     Write-Host '  LLAMA LAUNCHER' -NoNewline -ForegroundColor Cyan
     if ($Title) { Write-Host ('  |  ' + $Title) -ForegroundColor White } else { Write-Host '' }
-    $sys = 'GPU não detectada'
-    if ($script:Gpu -and $script:Gpu.Ok) {
-        $sys = ('{0}  |  {1:0.0} GB VRAM livre' -f $script:Gpu.Name, ($script:Gpu.FreeMB / 1024.0))
-    }
-    if ($script:Mem) {
-        $sys += ('  |  {0:0.0} GB RAM livre' -f ($script:Mem.FreeMB / 1024.0))
-    }
-    $sysLines = @(Wrap-Text $sys ($w - 3))
+    $sysLines = @(Wrap-Text (Get-HeaderSysText) ($w - 3))
     $script:HeaderSysRow = -1
     try { $script:HeaderSysRow = [int][Console]::CursorTop } catch { }
     $script:HeaderSysCount = $sysLines.Count
@@ -596,7 +625,7 @@ function Write-Row {
 }
 
 function Write-Footer {
-    param([string]$Text)
+    param([string]$Text, [int[]]$Pad = @())
     $map = @{ 'Enter' = 'Enter'; 'Esc' = 'Escape'; '←→' = 'RightArrow'; 'L' = 'L'; 'E' = 'E'; 'R' = 'R'; 'A' = 'A'; 'Q' = 'Q'; 'N' = 'N'; 'T' = 'T'; 'P' = 'P' }
     $w = Get-UIWidth
     $parts = @($Text -split '   ')
@@ -658,6 +687,13 @@ function Write-Footer {
             Write-Host $part -NoNewline -ForegroundColor DarkGray
             $x += $part.Length
         }
+        if ($i -lt ($parts.Count - 1) -and $i -lt $Pad.Count) {
+            $gap = $Pad[$i] - $rendered
+            if ($gap -gt 0 -and ($x + $gap) -le $w) {
+                Write-Host (' ' * $gap) -NoNewline -ForegroundColor DarkGray
+                $x += $gap
+            }
+        }
     }
     Write-Host ''
     $script:FootHit = $hits
@@ -693,6 +729,7 @@ public static class LlamaConsole {
     [DllImport("kernel32.dll", EntryPoint = "ReadConsoleInputW", SetLastError = true)]
     static extern bool ReadConsoleInput(IntPtr h, out INPUT_RECORD r, uint len, out uint read);
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetNumberOfConsoleInputEvents(IntPtr h, out uint n);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern uint WaitForSingleObject(IntPtr h, uint ms);
 
     static IntPtr hIn = GetStdHandle(-10);
     static uint origMode;
@@ -754,6 +791,19 @@ public static class LlamaConsole {
         }
         return null;
     }
+    public static LlamaEvt ReadTimeout(int ms) {
+        System.Diagnostics.Stopwatch sw = System.Diagnostics.Stopwatch.StartNew();
+        while (true) {
+            LlamaEvt e = TryRead();
+            if (e != null) return e;
+            long left = ms - sw.ElapsedMilliseconds;
+            if (left <= 0 || WaitForSingleObject(hIn, (uint)left) != 0) {
+                LlamaEvt t = new LlamaEvt();
+                t.Kind = 0;
+                return t;
+            }
+        }
+    }
 }
 '@
     try {
@@ -772,15 +822,32 @@ function New-KeyObj {
     return [pscustomobject]@{ Key = $Key; KeyChar = $Ch; Index = $Index }
 }
 
-function Read-Key {
+function Read-KeyCore {
+    param([int]$TimeoutMs = 0)
     Complete-Frame
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
     if (-not $script:MouseOk) {
+        if ($TimeoutMs -gt 0) {
+            while (-not [Console]::KeyAvailable) {
+                if ($clock.ElapsedMilliseconds -ge $TimeoutMs) { return $null }
+                Start-Sleep -Milliseconds 25
+            }
+        }
         $k = [Console]::ReadKey($true)
         return (New-KeyObj ([string]$k.Key) $k.KeyChar)
     }
     while ($true) {
         $e = $null
-        try { $e = [LlamaConsole]::Read() } catch { $e = $null }
+        try {
+            if ($TimeoutMs -gt 0) {
+                $left = [int]($TimeoutMs - $clock.ElapsedMilliseconds)
+                if ($left -le 0) { return $null }
+                $e = [LlamaConsole]::ReadTimeout($left)
+                if ($null -ne $e -and $e.Kind -eq 0) { return $null }
+            } else {
+                $e = [LlamaConsole]::Read()
+            }
+        } catch { $e = $null }
         if ($null -eq $e) {
             Disable-Mouse
             $script:MouseOk = $false
@@ -806,6 +873,18 @@ function Read-Key {
             if ($e.Kind -eq 2) { return (New-KeyObj 'MouseLeft' ([char]0) $idx) }
             return (New-KeyObj 'MouseRight' ([char]0) $idx)
         }
+    }
+}
+
+function Read-Key {
+    while ($true) {
+        if ([int]$script:HeaderSysRow -lt 0) { return (Read-KeyCore) }
+        if ($script:HdrClock.ElapsedMilliseconds -ge 1000) {
+            Update-HeaderMemory
+            $script:HdrClock.Restart()
+        }
+        $k = Read-KeyCore -TimeoutMs ([int][Math]::Max(1, 1000 - $script:HdrClock.ElapsedMilliseconds))
+        if ($null -ne $k) { return $k }
     }
 }
 
@@ -5656,6 +5735,8 @@ function Show-ModelPicker {
     $rows = @()
     $keepPath = ''
     $keepFolder = ''
+    $keepKind = ''
+    $keepIdx = -1
     $script:ModelCategory = ''
     if ($CurrentPath) {
         $cm = $script:Models | Where-Object { $_.Path -eq $CurrentPath } | Select-Object -First 1
@@ -5686,15 +5767,22 @@ function Show-ModelPicker {
             }
 
             $sel = 0
-            if ($keepFolder) {
+            if ($keepKind) {
+                for ($i = 0; $i -lt $rows.Count; $i++) {
+                    if ($rows[$i].Kind -eq $keepKind) { $sel = $i; break }
+                }
+                $keepKind = ''
+            } elseif ($keepFolder) {
                 for ($i = 0; $i -lt $rows.Count; $i++) {
                     if ($rows[$i].Kind -eq 'folder' -and $rows[$i].Cat -ieq $keepFolder) { $sel = $i; break }
                 }
                 $keepFolder = ''
             } elseif ($keepPath) {
+                $found = $false
                 for ($i = 0; $i -lt $rows.Count; $i++) {
-                    if ($rows[$i].Kind -eq 'model' -and $rows[$i].Model.Path -eq $keepPath) { $sel = $i; break }
+                    if ($rows[$i].Kind -eq 'model' -and $rows[$i].Model.Path -eq $keepPath) { $sel = $i; $found = $true; break }
                 }
+                if (-not $found -and $keepIdx -ge 0) { $sel = [Math]::Min($keepIdx, $rows.Count - 1) }
                 $keepPath = ''
             } elseif ($CurrentPath) {
                 for ($i = 0; $i -lt $rows.Count; $i++) {
@@ -5711,6 +5799,7 @@ function Show-ModelPicker {
                     }
                 }
             }
+            $keepIdx = -1
             $rebuild = $false
         }
 
@@ -5797,13 +5886,13 @@ function Show-ModelPicker {
         Write-Host ''
         Write-Host ('  ' + ('-' * [Math]::Max(10, $w - 4))) -ForegroundColor DarkGray
         Write-Host ''
-        Write-Footer '  Navegar   ↑↓ mover   Enter abrir   L última   E editar última'
+        Write-Footer '  Navegar   ↑↓ mover   Enter abrir   L última   E editar última' -Pad @(9, 14, 13, 10)
         $footHits = @($script:FootHit)
         Write-Host ''
-        Write-Footer '  Ordenar   N nome   T tamanho   P tipo'
+        Write-Footer '  Ordenar   N nome   T tamanho   P tipo' -Pad @(9, 14, 13, 10)
         $footHits += @($script:FootHit)
         Write-Host ''
-        Write-Footer ('  Sistema   R recarregar' + (Get-UpdateFooter) + '   Q sair')
+        Write-Footer ('  Sistema   R recarregar' + (Get-UpdateFooter) + '   Q sair') -Pad @(9, 14, 13, 10)
         $script:FootHit = $footHits + @($script:FootHit) + @($hdrHits)
 
         $key = Read-Key
@@ -5827,6 +5916,12 @@ function Show-ModelPicker {
             { $_ -in 'R', 'F5' } {
                 Update-Hardware
                 Refresh-Models
+                $keepIdx = $sel
+                $selRow = $rows[$sel]
+                if ($selRow.Kind -eq 'model') { $keepPath = [string]$selRow.Model.Path }
+                elseif ($selRow.Kind -eq 'folder') { $keepFolder = [string]$selRow.Cat }
+                else { $keepKind = [string]$selRow.Kind }
+                $script:HdrClock.Restart()
                 $rebuild = $true
             }
             'A' {
@@ -6849,7 +6944,7 @@ function Start-LoadProgress {
                     [Console]::ResetColor()
                     [Console]::SetCursorPosition($l, $t)
                 }
-                if ($HeaderRow -ge 0 -and $HeaderCount -gt 0 -and ($sw.ElapsedMilliseconds - $hwLast) -ge 1500) {
+                if ($HeaderRow -ge 0 -and $HeaderCount -gt 0 -and ($sw.ElapsedMilliseconds - $hwLast) -ge 1000) {
                     $hwLast = $sw.ElapsedMilliseconds
                     try {
                         $sys = 'GPU não detectada'
