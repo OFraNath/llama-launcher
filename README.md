@@ -15,10 +15,11 @@ Vou corrigir os bugs que aparecerem, mas **não prometo novos recursos nem atual
 
 ## Como usar
 
-1. Coloque o `iniciar_llama.bat` numa pasta própria e execute-o. Na primeira vez ele oferece instalar o que faltar (llama.cpp, CUDA, uv e Python) dentro da subpasta `runtime`, sem alterar o sistema.
-2. Crie `Modelos/<NomeDoModelo>/` (sem espaços; ex.: `Gemma-4`) e coloque o `.gguf` dentro.
-3. Para visão, coloque na mesma pasta o arquivo `mmproj*`.
-4. Abra o `iniciar_llama.bat` e escolha o modelo no menu. Pressione `Esc` duas vezes para encerrar o servidor e voltar ao menu.
+1. Coloque o `iniciar_llama.bat` em uma pasta própria e execute-o. Na primeira vez, ele oferece instalar o que faltar (llama.cpp, CUDA, uv e Python) na subpasta `runtime`, sem alterar o sistema.
+2. Crie a pasta `Modelos/<NomeDoModelo>/` (sem espaços; ex.: `Gemma-4`) e coloque o `.gguf` nela.
+3. Para organizar por categoria, crie uma pasta acima da do modelo: `Modelos/<Categoria>/<NomeDoModelo>/` (ex.: `Modelos/RPG/Gemma-4`). A categoria aparece no menu como uma pasta; os modelos de `Modelos/<NomeDoModelo>/` ficam na lista principal.
+4. Para usar visão, coloque o arquivo `mmproj*` na mesma pasta do modelo.
+5. Execute o `iniciar_llama.bat` e escolha o modelo no menu. Pressione `Esc` duas vezes para encerrar o servidor e voltar ao menu.
 
 ## Geração de imagem (opcional)
 

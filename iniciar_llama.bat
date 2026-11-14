@@ -218,6 +218,9 @@ $script:HeaderSysCount = 0
 $script:MouseOk = $false
 $script:LastClick = [datetime]::MinValue
 $script:Bench = @{}
+$script:ModelSortKey = 'nome'
+$script:ModelSortDesc = $false
+$script:ModelCategory = ''
 $script:BenchRunning = $false
 $script:BenchText = ''
 $script:GitHubRepo = 'OFraNath/llama-launcher'
@@ -594,7 +597,7 @@ function Write-Row {
 
 function Write-Footer {
     param([string]$Text)
-    $map = @{ 'Enter' = 'Enter'; 'Esc' = 'Escape'; '←→' = 'RightArrow'; 'L' = 'L'; 'E' = 'E'; 'R' = 'R'; 'A' = 'A'; 'Q' = 'Q' }
+    $map = @{ 'Enter' = 'Enter'; 'Esc' = 'Escape'; '←→' = 'RightArrow'; 'L' = 'L'; 'E' = 'E'; 'R' = 'R'; 'A' = 'A'; 'Q' = 'Q'; 'N' = 'N'; 'T' = 'T'; 'P' = 'P' }
     $w = Get-UIWidth
     $parts = @($Text -split '   ')
     $sum = 0
@@ -1285,11 +1288,19 @@ function Get-Models {
         $quant = Get-ModelQuant $f.Name
         if (-not $quant) { $quant = Get-ModelQuant $display }
 
+        $category = ''
+        $modelsRoot = ([string]$script:ModelsDir).TrimEnd('\')
+        $parentDir = Split-Path -Parent $f.DirectoryName
+        if ($parentDir -and $parentDir.StartsWith($modelsRoot + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+            $category = $parentDir.Substring($modelsRoot.Length + 1).Trim('\')
+        }
+
         [void]$models.Add([pscustomobject]@{
             Path      = $f.FullName
             Folder    = (Split-Path -Parent $f.FullName | Split-Path -Leaf)
             FileName  = $f.Name
             Display   = $display
+            Category  = $category
             Size      = [int64]$f.Length
             Quant     = $quant
             Meta      = $meta
@@ -5566,25 +5577,126 @@ function Invoke-InitialSetup {
 # ---------------------------------------------------------------------------
 # Model picker
 # ---------------------------------------------------------------------------
+function Get-SortedModels {
+    param($Models)
+    $desc = [bool]$script:ModelSortDesc
+    $byName = @{ Expression = { [string]$_.Display }; Descending = $false }
+    switch ($script:ModelSortKey) {
+        'tamanho' { return @($Models | Sort-Object @{ Expression = { [int64]$_.Size }; Descending = $desc }, $byName) }
+        'tipo'    { return @($Models | Sort-Object @{ Expression = { Get-ModelTypeLabel $_ }; Descending = $desc }, $byName) }
+        default   { return @($Models | Sort-Object @{ Expression = { [string]$_.Display }; Descending = $desc }, @{ Expression = { [string]$_.Path }; Descending = $desc }) }
+    }
+}
+
+function Write-ModelHeader {
+    param([int]$NameW, [int]$TypeW)
+    $arrow = [string][char]0x25B2
+    if ($script:ModelSortDesc) { $arrow = [string][char]0x25BC }
+    $cols = @(
+        [pscustomobject]@{ Key = 'N'; Sort = 'nome';    Label = 'Nome';    Width = $NameW; Right = $false; Gap = 1 },
+        [pscustomobject]@{ Key = 'T'; Sort = 'tamanho'; Label = 'Tamanho'; Width = 8;      Right = $true;  Gap = 2 },
+        [pscustomobject]@{ Key = 'P'; Sort = 'tipo';    Label = 'Tipo';    Width = $TypeW; Right = $false; Gap = 0 }
+    )
+    $y = [int][Console]::CursorTop
+    $x = 3
+    $hits = @()
+    Write-Host '   ' -NoNewline -ForegroundColor DarkGray
+    foreach ($c in $cols) {
+        $active = ($script:ModelSortKey -eq $c.Sort)
+        $text = [string]$c.Label
+        if ($active) { $text += $arrow }
+        if ($c.Right) { $cell = $text.PadLeft($c.Width) } else { $cell = Fit-Text $text $c.Width }
+        $color = 'DarkGray'
+        if ($active) { $color = 'White' }
+        Write-Host $cell -NoNewline -ForegroundColor $color
+        $hits += [pscustomobject]@{ Y = $y; X1 = $x; X2 = ($x + $c.Width - 1); Key = [string]$c.Key }
+        $x += $c.Width
+        if ($c.Gap -gt 0) {
+            Write-Host (' ' * $c.Gap) -NoNewline -ForegroundColor DarkGray
+            $x += $c.Gap
+        }
+    }
+    Write-Host ''
+    return $hits
+}
+
+function Get-CategoryFolders {
+    param([string]$Category)
+    $prefix = ''
+    if ($Category) { $prefix = $Category + '\' }
+    $map = @{}
+    foreach ($m in $script:Models) {
+        $mc = [string]$m.Category
+        if (-not $mc) { continue }
+        if ($prefix -and -not $mc.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+        $seg = ($mc.Substring($prefix.Length) -split '\\')[0]
+        if (-not $seg) { continue }
+        $k = $seg.ToLowerInvariant()
+        if (-not $map.ContainsKey($k)) {
+            $map[$k] = [pscustomobject]@{ Name = $seg; Cat = ($prefix + $seg); Count = 0; Size = [int64]0 }
+        }
+        $map[$k].Count = [int]$map[$k].Count + 1
+        $map[$k].Size = [int64]$map[$k].Size + [int64]$m.Size
+    }
+    return @($map.Values | Sort-Object Name)
+}
+
+function Get-CategoryParent {
+    param([string]$Category)
+    $i = $Category.LastIndexOf('\')
+    if ($i -lt 0) { return '' }
+    return $Category.Substring(0, $i)
+}
+
 function Show-ModelPicker {
     param([string]$CurrentPath = '')
 
     $sel = 0
     $rebuild = $true
     $rows = @()
+    $keepPath = ''
+    $keepFolder = ''
+    $script:ModelCategory = ''
+    if ($CurrentPath) {
+        $cm = $script:Models | Where-Object { $_.Path -eq $CurrentPath } | Select-Object -First 1
+        if ($cm) { $script:ModelCategory = [string]$cm.Category }
+    }
 
     while ($true) {
         if ($rebuild) {
             $rows = @()
-            if ($script:LastCfg) {
+            $cat = [string]$script:ModelCategory
+            if ($cat) {
+                $catPrefix = $cat + '\'
+                $catOk = @($script:Models | Where-Object { ([string]$_.Category) -ieq $cat -or ([string]$_.Category).StartsWith($catPrefix, [System.StringComparison]::OrdinalIgnoreCase) }).Count -gt 0
+                if (-not $catOk) { $cat = ''; $script:ModelCategory = '' }
+            }
+            if ($script:LastCfg -and -not $cat) {
                 $rows += [pscustomobject]@{ Kind = 'last'; Model = $script:LastCfg.Model }
             }
-            foreach ($m in $script:Models) {
+            if ($cat) {
+                $rows += [pscustomobject]@{ Kind = 'up'; Cat = (Get-CategoryParent $cat) }
+            }
+            foreach ($fo in @(Get-CategoryFolders $cat)) {
+                $rows += [pscustomobject]@{ Kind = 'folder'; Cat = [string]$fo.Cat; Name = [string]$fo.Name; Count = [int]$fo.Count; Size = [int64]$fo.Size }
+            }
+            $inCat = @($script:Models | Where-Object { ([string]$_.Category) -ieq $cat })
+            foreach ($m in @(Get-SortedModels $inCat)) {
                 $rows += [pscustomobject]@{ Kind = 'model'; Model = $m }
             }
 
             $sel = 0
-            if ($CurrentPath) {
+            if ($keepFolder) {
+                for ($i = 0; $i -lt $rows.Count; $i++) {
+                    if ($rows[$i].Kind -eq 'folder' -and $rows[$i].Cat -ieq $keepFolder) { $sel = $i; break }
+                }
+                $keepFolder = ''
+            } elseif ($keepPath) {
+                for ($i = 0; $i -lt $rows.Count; $i++) {
+                    if ($rows[$i].Kind -eq 'model' -and $rows[$i].Model.Path -eq $keepPath) { $sel = $i; break }
+                }
+                $keepPath = ''
+            } elseif ($CurrentPath) {
                 for ($i = 0; $i -lt $rows.Count; $i++) {
                     if ($rows[$i].Kind -eq 'model' -and $rows[$i].Model.Path -eq $CurrentPath) { $sel = $i; break }
                 }
@@ -5606,7 +5718,11 @@ function Show-ModelPicker {
     } else {
         Show-Header $script:LauncherVersion
     }
-        Write-Host ''
+        if ($script:ModelCategory) {
+            Write-Host ('  Modelos \ ' + $script:ModelCategory) -ForegroundColor DarkCyan
+        } else {
+            Write-Host ''
+        }
 
         if ($rows.Count -eq 0) {
             Write-Host '  Nenhum modelo .gguf encontrado.' -ForegroundColor Yellow
@@ -5627,11 +5743,17 @@ function Show-ModelPicker {
         $typeW = 13
         $statusW = 17
 
+        $hdrDone = $false
+        $hdrHits = @()
         for ($i = 0; $i -lt $rows.Count; $i++) {
             $row = $rows[$i]
             $isSel = ($i -eq $sel)
             $prefix = '   '
             if ($isSel) { $prefix = ' > ' }
+            if ($row.Kind -ne 'last' -and -not $hdrDone) {
+                $hdrDone = $true
+                $hdrHits = @(Write-ModelHeader $nameW $typeW)
+            }
             Register-Hit $i
 
             if ($row.Kind -eq 'last') {
@@ -5640,7 +5762,16 @@ function Show-ModelPicker {
                     $lc.Model.Display, (Format-Tokens $lc.Ctx), $lc.Ctk, $lc.Ctv, $lc.Port)
                 $txt = $prefix + '* ' + $label
                 Write-Row $txt $isSel 'Cyan'
-                Write-Host ''
+            } elseif ($row.Kind -eq 'up') {
+                Write-Row ($prefix + '[..] voltar') $isSel 'Cyan'
+            } elseif ($row.Kind -eq 'folder') {
+                $name = Fit-Text ('[+] ' + $row.Name) $nameW
+                $size = '{0,8}' -f (Format-GB $row.Size)
+                $typ = Fit-Text 'pasta' $typeW
+                $cnt = 'modelo'
+                if ([int]$row.Count -ne 1) { $cnt = 'modelos' }
+                $sta = Fit-Text ('{0} {1}' -f $row.Count, $cnt) $statusW
+                Write-Row ($prefix + $name + ' ' + $size + '  ' + $typ + ' ' + $sta) $isSel 'Cyan'
             } else {
                 $m = $row.Model
                 $type = Get-ModelTypeLabel $m
@@ -5661,14 +5792,17 @@ function Show-ModelPicker {
         }
 
         Write-Host ''
-        $footer = '  ↑↓ navegar   Enter abrir   L última   E editar última   R recarregar' + (Get-UpdateFooter) + '   Q sair'
+        $footer = '  ↑↓ navegar   Enter abrir   L última   E editar última   R recarregar   N nome   T tamanho   P tipo' + (Get-UpdateFooter) + '   Q sair'
         Write-Footer $footer
+        $script:FootHit = @($script:FootHit) + @($hdrHits)
 
         $key = Read-Key
         $kn = [string]$key.Key
         if ($kn -eq 'MouseLeft') {
             if ($key.Index -ge 0 -and $key.Index -lt $rows.Count) { $sel = $key.Index; $kn = 'Enter' } else { continue }
-        } elseif ($kn -eq 'MouseRight') { continue }
+        } elseif ($kn -eq 'MouseRight') {
+            if ($script:ModelCategory) { $kn = 'LeftArrow' } else { continue }
+        }
         switch ($kn) {
             'UpArrow' {
                 if ($sel -gt 0) { $sel-- }
@@ -5688,15 +5822,39 @@ function Show-ModelPicker {
             'A' {
                 if ($script:UpdateAvailable) { return [pscustomobject]@{ Action = 'update' } }
             }
+            { $_ -in 'N', 'T', 'P' } {
+                $want = 'nome'
+                if ($kn -eq 'T') { $want = 'tamanho' } elseif ($kn -eq 'P') { $want = 'tipo' }
+                if ($script:ModelSortKey -eq $want) {
+                    $script:ModelSortDesc = -not $script:ModelSortDesc
+                } else {
+                    $script:ModelSortKey = $want
+                    $script:ModelSortDesc = $false
+                }
+                if ($rows[$sel].Kind -eq 'model') { $keepPath = [string]$rows[$sel].Model.Path }
+                $rebuild = $true
+            }
             'L' {
                 if ($script:LastCfg) { return [pscustomobject]@{ Action = 'last' } }
             }
             'E' {
                 if ($script:LastCfg) { return [pscustomobject]@{ Action = 'editlast'; Model = $script:LastCfg.Model } }
             }
+            { $_ -in 'LeftArrow', 'Backspace', 'Escape' } {
+                if ($script:ModelCategory) {
+                    $keepFolder = [string]$script:ModelCategory
+                    $script:ModelCategory = Get-CategoryParent $script:ModelCategory
+                    $rebuild = $true
+                }
+            }
             'RightArrow' {
-                if ($rows[$sel].Kind -eq 'last') {
+                $row = $rows[$sel]
+                if ($row.Kind -eq 'last') {
                     return [pscustomobject]@{ Action = 'editlast'; Model = $script:LastCfg.Model }
+                }
+                if ($row.Kind -eq 'folder') {
+                    $script:ModelCategory = [string]$row.Cat
+                    $rebuild = $true
                 }
             }
             'Enter' {
@@ -5704,7 +5862,16 @@ function Show-ModelPicker {
                 if ($row.Kind -eq 'last') {
                     return [pscustomobject]@{ Action = 'last' }
                 }
-                return [pscustomobject]@{ Action = 'model'; Model = $row.Model }
+                if ($row.Kind -eq 'folder') {
+                    $script:ModelCategory = [string]$row.Cat
+                    $rebuild = $true
+                } elseif ($row.Kind -eq 'up') {
+                    $keepFolder = [string]$script:ModelCategory
+                    $script:ModelCategory = [string]$row.Cat
+                    $rebuild = $true
+                } else {
+                    return [pscustomobject]@{ Action = 'model'; Model = $row.Model }
+                }
             }
             'Q'      { return [pscustomobject]@{ Action = 'exit' } }
         }
