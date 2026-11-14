@@ -213,6 +213,8 @@ $script:FxOk = $false
 $script:FxRec = $false
 $script:FxBlank = [System.ConsoleColor]::Black
 $script:StatusRow = -1
+$script:HeaderSysRow = -1
+$script:HeaderSysCount = 0
 $script:MouseOk = $false
 $script:LastClick = [datetime]::MinValue
 $script:Bench = @{}
@@ -569,7 +571,11 @@ function Show-Header {
     if ($script:Mem) {
         $sys += ('  |  {0:0.0} GB RAM livre' -f ($script:Mem.FreeMB / 1024.0))
     }
-    foreach ($line in @(Wrap-Text $sys ($w - 3))) {
+    $sysLines = @(Wrap-Text $sys ($w - 3))
+    $script:HeaderSysRow = -1
+    try { $script:HeaderSysRow = [int][Console]::CursorTop } catch { }
+    $script:HeaderSysCount = $sysLines.Count
+    foreach ($line in $sysLines) {
         Write-Host ('  ' + $line) -ForegroundColor DarkGray
     }
     Write-Host ('=' * $w) -ForegroundColor DarkCyan
@@ -6602,16 +6608,26 @@ function Stop-EscWatcher {
 }
 
 function Start-LoadProgress {
-    param([int]$Port, [double]$TotalBytes, [int]$StatusRow = -1)
+    param([int]$Port, [double]$TotalBytes, [int]$StatusRow = -1, [int]$HeaderRow = -1, [int]$HeaderCount = 0)
     $state = [hashtable]::Synchronized(@{ Stop = $false })
+    $wrapDef = ${function:Wrap-Text}.ToString()
+    $uiWidth = Get-UIWidth
+    $culture = [Threading.Thread]::CurrentThread.CurrentCulture
+    $smi = Get-NvidiaSmiPath
+    $gpuOk = [bool]($script:Gpu -and $script:Gpu.Ok)
+    $gpuName = ''
+    if ($gpuOk) { $gpuName = [string]$script:Gpu.Name }
     $ps = $null
     $handle = $null
     try {
         $ps = [powershell]::Create()
         [void]$ps.AddScript({
-            param($State, $ServerPid, $Port, $Total, $StatusRow)
+            param($State, $ServerPid, $Port, $Total, $StatusRow, $HeaderRow, $HeaderCount, $WrapDef, $UiWidth, $Culture, $Smi, $GpuOk, $GpuName)
             if ($Total -le 0) { $Total = 1 }
+            [Threading.Thread]::CurrentThread.CurrentCulture = $Culture
+            Set-Item -Path function:Wrap-Text -Value ([scriptblock]::Create($WrapDef))
             $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            $hwLast = 0
             $childPid = 0
             $row = $StatusRow
             $loadedAt = -1.0
@@ -6656,9 +6672,40 @@ function Start-LoadProgress {
                     [Console]::ResetColor()
                     [Console]::SetCursorPosition($l, $t)
                 }
+                if ($HeaderRow -ge 0 -and $HeaderCount -gt 0 -and ($sw.ElapsedMilliseconds - $hwLast) -ge 1500) {
+                    $hwLast = $sw.ElapsedMilliseconds
+                    try {
+                        $sys = 'GPU não detectada'
+                        if ($GpuOk -and $Smi) {
+                            $o = & $Smi --query-gpu=memory.free --format=csv,noheader,nounits 2>$null
+                            if ($LASTEXITCODE -eq 0 -and $o) {
+                                $freeMb = [int]([double]::Parse((@($o)[0]).Trim(), [Globalization.CultureInfo]::InvariantCulture))
+                                $sys = ('{0}  |  {1:0.0} GB VRAM livre' -f $GpuName, ($freeMb / 1024.0))
+                            } else { $sys = $null }
+                        }
+                        if ($null -ne $sys) {
+                            $os = Get-CimInstance Win32_OperatingSystem
+                            $sys += ('  |  {0:0.0} GB RAM livre' -f ([int]($os.FreePhysicalMemory / 1024) / 1024.0))
+                            $wrapped = @(Wrap-Text $sys ($UiWidth - 3))
+                            $pw = [Math]::Min([int][Console]::BufferWidth, [int][Console]::WindowWidth) - 1
+                            $l = [Console]::CursorLeft
+                            $t = [Console]::CursorTop
+                            for ($i = 0; $i -lt $HeaderCount; $i++) {
+                                $txt = ''
+                                if ($i -lt $wrapped.Count) { $txt = '  ' + $wrapped[$i] }
+                                if ($txt.Length -gt $pw) { $txt = $txt.Substring(0, $pw) }
+                                [Console]::SetCursorPosition(0, $HeaderRow + $i)
+                                [Console]::ForegroundColor = 'DarkGray'
+                                [Console]::Write($txt.PadRight($pw))
+                                [Console]::ResetColor()
+                            }
+                            [Console]::SetCursorPosition($l, $t)
+                        }
+                    } catch { }
+                }
                 if ($loadedAt -ge 0) { Start-Sleep -Milliseconds 1000 } else { Start-Sleep -Milliseconds 500 }
             }
-        }).AddArgument($state).AddArgument($PID).AddArgument($Port).AddArgument($TotalBytes).AddArgument($StatusRow)
+        }).AddArgument($state).AddArgument($PID).AddArgument($Port).AddArgument($TotalBytes).AddArgument($StatusRow).AddArgument($HeaderRow).AddArgument($HeaderCount).AddArgument($wrapDef).AddArgument($uiWidth).AddArgument($culture).AddArgument($smi).AddArgument($gpuOk).AddArgument($gpuName)
         $handle = $ps.BeginInvoke()
     } catch { }
     return [pscustomobject]@{ Ps = $ps; Handle = $handle; State = $state }
@@ -6843,7 +6890,7 @@ function Start-LlamaServer {
 
         Disable-Mouse
         $esc = Start-EscWatcher
-        $progress = Start-LoadProgress ([int]$Cfg.Port) ([double]$Cfg.Model.Size) ([int]$script:StatusRow)
+        $progress = Start-LoadProgress ([int]$Cfg.Port) ([double]$Cfg.Model.Size) ([int]$script:StatusRow) ([int]$script:HeaderSysRow) ([int]$script:HeaderSysCount)
         $code = 0
         try {
             Push-Location $script:Root
