@@ -22,9 +22,7 @@ Vou corrigir os bugs que aparecerem, mas **não prometo novos recursos nem atual
 
 ## Geração de imagem (opcional)
 
-Funciona **somente com o [SwarmUI](https://github.com/mcmonkeyprojects/SwarmUI)**, que não é instalado pelo launcher. A versão recomendada é a **0.9.8.1**.
-
-Você pode conseguir essa versão pronta [aqui](https://github.com/OFraNath/SwarmUI_0.9.8.1_Backup) (o instalador requer o [Git](https://git-scm.com/)).
+Funciona **somente com o [SwarmUI](https://github.com/mcmonkeyprojects/SwarmUI)**, que não é instalado pelo launcher.
 
 Depois, na configuração do modelo, selecione **Geração de Imagem**, pressione `Enter` e escolha o `launch-windows.bat` da pasta onde o SwarmUI está instalado.
 
