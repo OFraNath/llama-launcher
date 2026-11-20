@@ -1354,7 +1354,7 @@ function Get-Models {
         $mmproj = $null
         if ($mm.Count -gt 0) { $mmproj = $mm[0] }
 
-        if (-not $meta.HasThinking -and ($meta.Arch -match '(?i)^qwen3' -or $f.Name -match '(?i)think|reason')) {
+        if (-not $meta.HasThinking -and ($meta.Arch -match '(?i)^(qwen3|gemma[-_]?4)' -or $f.Name -match '(?i)think|reason|gemma[-_ ]?4')) {
             $meta.HasThinking = $true
         }
 
