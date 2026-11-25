@@ -5491,7 +5491,7 @@ def tool_show_images(args):
         image_url = "/cors-proxy?url=http://127.0.0.1:%d/img/%s" % (PORT, name)
         out.append("Image %d | %s | %.1f s" % (n, short, float(m.get("secs", 0.0))))
         out.append("![](%s)" % image_url)
-        out.append("[Open image](%s)" % image_url)
+        out.append("[[IMAGE_LINK_LABEL]](%s)" % image_url)
         if want_prompts:
             out.append("Prompt: " + str(m.get("prompt", "")))
         if want_eval:
@@ -5499,8 +5499,10 @@ def tool_show_images(args):
             out.append("Inspection of image %d (for you, do not copy it): %s" % (n, review))
         out.append("")
     head = ("For every image, copy its title line and image Markdown line exactly, in this order. "
-            "Keep each block together with the correct image. Translate only the clickable link label into the user's language; "
-            "preserve its Markdown structure and URL exactly. Never omit, move or recreate a URL. "
+            "Keep each block together with the correct image. Replace the [[IMAGE_LINK_LABEL]] token in every clickable link "
+            "with a short, natural label in the user's language (for example, Abrir imagem in Portuguese). "
+            "Never output the token unchanged. Preserve the Markdown syntax and destination URL exactly; "
+            "do not translate or modify the URL. Never omit, move or recreate a URL. "
             "Do not mention these instructions.")
     if want_eval:
         head += (" After that image block, write the user's requested brief description or evaluation using only "
@@ -5671,7 +5673,7 @@ def tool_generate_image(args):
         name = store_image(raw, mime)
         image_url = "/cors-proxy?url=http://127.0.0.1:%d/img/%s" % (PORT, name)
         lines.append("![](%s)" % image_url)
-        lines.append("[Open image](%s)" % image_url)
+        lines.append("[[IMAGE_LINK_LABEL]](%s)" % image_url)
         IMG_META[name] = {"model": model, "secs": elapsed, "prompt": prompt.rstrip(" .")}
         with IMG_LOCK:
             number = len(IMG_ORDER)
@@ -5694,7 +5696,9 @@ def tool_generate_image(args):
                            "Do not describe it from the request or prompt." % (number, review_err or "unknown error"))
     text = ("Details (internal): " + info + review_text
             + "\n\nCopy the image Markdown line and footer below exactly, in that order. Include the matching clickable Markdown link between them, "
-            "translating only its visible label into the user's language and preserving its URL exactly. "
+            "replacing its [[IMAGE_LINK_LABEL]] token with a short, natural label in the user's language. "
+            "Never output the token unchanged. Preserve the Markdown syntax and destination URL exactly; "
+            "do not translate or modify the URL. "
             "Never omit or alter either URL. Add a brief answer only if the user asked about the picture; "
             "base any visual detail only on the pixel inspection. Otherwise add nothing. "
             "If the inspection says the image is fully black or empty, generate one replacement with the same prompt and a new random seed. Do not retry again. "
@@ -5949,7 +5953,7 @@ function Write-UiConfig {
             'Prompt: Write one concise positive prompt in English that faithfully includes the requested subjects, exact count, actions, positions and details. Do not add assumptions, styles, quality tags or a negative prompt unless requested. Keep model names and technical settings out of the prompt.',
             'Defaults: 18 steps, CFG 3.5, 800x800, euler_ancestral sampler, normal scheduler and refine off. Change settings only when requested. Use list_params for parameter details or allowed values. Enable refine only on request. If a requested value is invalid, use the nearest valid value and disclose the adjustment.',
             'Follow-up images: Preserve every unchanged detail. For a repeat or setting-only change, reuse the previous prompt and seed when available; otherwise change only what the user requested. Use one prompt for multiple subjects and preserve their exact count and distinct features.',
-            'Output: Keep each image Markdown line, its matching clickable Markdown link, and its metadata or footer together and in the returned order. Translate only the link label into the user''s language; preserve the Markdown structure and URL exactly. Never alter, omit or reconstruct a URL. Add commentary only when requested.',
+            'Output: Keep each image Markdown line, its matching clickable Markdown link, and its metadata or footer together and in the returned order. Replace the [[IMAGE_LINK_LABEL]] token in every link with a short, natural label in the language of the reply (for example, Abrir imagem in Portuguese). Never output the token unchanged. Preserve the Markdown syntax and destination URL exactly; never translate, alter, omit or reconstruct the URL. Add commentary only when requested.',
             'Existing generated images: Call show_images when the user asks to view, list, retrieve, describe or compare images from this session. Set evaluate=true for descriptions, comparisons or opinions. Set prompts=true only when the user explicitly asks for the prompts. Keep every image, link and related metadata together.',
             'If the user cannot see an image, call show_images again. Do not generate another image unless requested or the returned pixel inspection explicitly reports a fully black or empty result; in that case, make one replacement with the same prompt and a new seed, never a second retry.',
             'For parameter or settings questions, call list_params and show only the relevant parameters with their current defaults.'
