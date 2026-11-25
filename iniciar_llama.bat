@@ -1354,10 +1354,6 @@ function Get-Models {
         $mmproj = $null
         if ($mm.Count -gt 0) { $mmproj = $mm[0] }
 
-        if (-not $meta.HasThinking -and ($meta.Arch -match '(?i)^(qwen3|gemma[-_]?4)' -or $f.Name -match '(?i)think|reason|gemma[-_ ]?4')) {
-            $meta.HasThinking = $true
-        }
-
         $base = [System.IO.Path]::GetFileNameWithoutExtension($f.Name)
         $display = $base
         if ([int]$dirCounts[$f.DirectoryName] -le 1) {
@@ -1739,8 +1735,7 @@ function Normalize-Cfg {
     }
     if (@('off', 'gpu', 'cpu') -notcontains [string]$Cfg.Vision) { $Cfg.Vision = 'off' }
     if (-not $Cfg.Model.Mmproj) { $Cfg.Vision = 'off' }
-    if (@('auto', 'on', 'off') -notcontains [string]$Cfg.Reasoning) { $Cfg.Reasoning = 'auto' }
-    if (-not $Cfg.Model.Meta.HasThinking) { $Cfg.Reasoning = 'auto' }
+    if (@('auto', 'off') -notcontains [string]$Cfg.Reasoning) { $Cfg.Reasoning = 'auto' }
     if (@('auto', 'chatml') -notcontains [string]$Cfg.Template) { $Cfg.Template = 'auto' }
     $thrStr = ([string]$Cfg.Threads).Trim()
     if ($thrStr -match '^\d{1,3}$' -and [int]$thrStr -ge 1) {
@@ -2097,6 +2092,12 @@ function Get-VisionLabel {
     }
 }
 
+function Get-ReasoningLabel {
+    param([string]$Reasoning)
+    if ($Reasoning -eq 'off') { return 'desligado' }
+    return 'automático'
+}
+
 function Get-BrowserLabel {
     param([string]$Browser)
     switch ($Browser) {
@@ -2302,8 +2303,8 @@ function Build-ServerArgs {
         $a.Add('--mmproj'); $a.Add([string]$m.Mmproj.FullName)
         if ($Cfg.Vision -eq 'cpu') { $a.Add('--no-mmproj-offload') }
     }
-    if ($Cfg.Reasoning -ne 'auto' -and $m.Meta.HasThinking) {
-        $a.Add('--reasoning'); $a.Add([string]$Cfg.Reasoning)
+    if ($Cfg.Reasoning -eq 'off') {
+        $a.Add('--reasoning'); $a.Add('off')
     }
 
     $a.Add('--jinja')
@@ -7631,12 +7632,7 @@ function Get-SettingsRows {
     $researchColor = 'White'
     if ($Cfg.Research -eq 'on') { $researchColor = 'Cyan' }
     $rows += [pscustomobject]@{ Key = 'research'; Label = 'Pesquisa'; Value = (Get-ResearchLabel $Cfg.Research); Color = $researchColor }
-    if ($Cfg.Model.Meta.HasThinking) {
-        $reason = $Cfg.Reasoning
-        if ($reason -eq 'on') { $reason = 'ligado' }
-        elseif ($reason -eq 'off') { $reason = 'desligado' }
-        $rows += [pscustomobject]@{ Key = 'reasoning'; Label = 'Raciocínio'; Value = $reason; Color = 'White' }
-    }
+    $rows += [pscustomobject]@{ Key = 'reasoning'; Label = 'Raciocínio'; Value = (Get-ReasoningLabel $Cfg.Reasoning); Color = 'White' }
     $rows += [pscustomobject]@{ Key = 'template'; Label = 'Template'; Value = (Get-TemplateLabel $Cfg.Template); Color = 'White' }
     $portColor = 'White'
     if (-not (Test-PortFree ([int]$Cfg.Port))) { $portColor = 'Red' }
@@ -7683,7 +7679,7 @@ function Change-CfgSetting {
             $Cfg.Vision = [string](Cycle-List $opts $Cfg.Vision $Direction)
         }
         'reasoning' {
-            $opts = @('auto', 'on', 'off')
+            $opts = @('auto', 'off')
             $Cfg.Reasoning = [string](Cycle-List $opts $Cfg.Reasoning $Direction)
         }
         'threads' {
@@ -8398,7 +8394,7 @@ function Show-StartSummary {
 
     $feat = @()
     $feat += ('Visão ' + (Get-VisionLabel $Cfg))
-    $feat += ('Raciocínio ' + [string]$Cfg.Reasoning)
+    $feat += ('Raciocínio ' + (Get-ReasoningLabel $Cfg.Reasoning))
     $tpl = Get-TemplateLabel $Cfg.Template
     if ($tpl) { $feat += ('Template ' + $tpl) }
     if ([string]$Cfg.Agent -eq 'on' -and (Test-AgentSupported)) { $feat += 'Agente ligado' }
