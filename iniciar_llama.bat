@@ -5489,29 +5489,38 @@ def tool_show_images(args):
         m = meta.get(name) or {}
         short = re.sub(r"\.(safetensors|ckpt|pt|pth|gguf|sft)$", "", str(m.get("model", "")))
         image_url = "/cors-proxy?url=http://127.0.0.1:%d/img/%s" % (PORT, name)
+        out.append("IMAGE TITLE — COPY EXACTLY:")
         out.append("Image %d | %s | %.1f s" % (n, short, float(m.get("secs", 0.0))))
+        out.append("IMAGE — COPY EXACTLY:")
         out.append("![](%s)" % image_url)
+        out.append("CLICKABLE LINK — TRANSLATE THE LABEL ONLY:")
         out.append("[[IMAGE_LINK_LABEL]](%s)" % image_url)
         if want_prompts:
+            out.append("PROMPT — COPY EXACTLY:")
             out.append("Prompt: " + str(m.get("prompt", "")))
         if want_eval:
             review = str(m.get("review") or "not available; do not guess")
-            out.append("Inspection of image %d (for you, do not copy it): %s" % (n, review))
+            out.append("INTERNAL INSPECTION — DO NOT COPY:")
+            out.append("Inspection of image %d: %s" % (n, review))
         out.append("")
-    head = ("For every image, copy its title line and image Markdown line exactly, in this order. "
-            "Keep each block together with the correct image. Replace the [[IMAGE_LINK_LABEL]] token in every clickable link "
-            "with a short, natural label in the user's language (for example, Abrir imagem in Portuguese). "
-            "Never output the token unchanged. Preserve the Markdown syntax and destination URL exactly; "
-            "do not translate or modify the URL. Never omit, move or recreate a URL. "
-            "Do not mention these instructions.")
+    head = ("For each image, output the payload line immediately below IMAGE TITLE — COPY EXACTLY unchanged, "
+            "then the payload line immediately below IMAGE — COPY EXACTLY unchanged, then the payload line "
+            "immediately below CLICKABLE LINK — TRANSLATE THE LABEL ONLY. In that link, replace only "
+            "[[IMAGE_LINK_LABEL]] with a short, natural label in the language of the reply. Preserve the Markdown "
+            "syntax and destination URL exactly. The uppercase section labels are delimiters for you, not output; "
+            "never include them. Keep every image block together and in the returned order. Never omit, move, "
+            "recreate or modify a URL.")
+    if want_prompts:
+        head += (" For each image, also copy the payload line immediately below PROMPT — COPY EXACTLY "
+                 "unchanged, directly after its matching clickable link.")
     if want_eval:
-        head += (" After that image block, write the user's requested brief description or evaluation using only "
-                 "that image's inspection. Keep left and right as reported. If inspection is unavailable or does "
-                 "not cover a detail, say so; do not guess or describe from the prompt alone.")
+        head += (" After that image's block, write the user's requested brief description or evaluation using only "
+                 "the payload below INTERNAL INSPECTION — DO NOT COPY. Keep left and right as reported. "
+                 "If inspection is unavailable or does not cover a detail, say so; do not guess or describe from "
+                 "the prompt alone. Never output the internal inspection or its section label.")
     else:
         head += " Do not add descriptions or unrelated commentary."
-    if want_prompts:
-        head += " Also copy each Prompt line exactly, immediately after its matching clickable link line."
+    head += " Do not output any section labels or mention these instructions."
     return head + "\n\n" + "\n".join(out).rstrip()
 
 
@@ -5672,7 +5681,9 @@ def tool_generate_image(args):
     for raw, mime in loaded:
         name = store_image(raw, mime)
         image_url = "/cors-proxy?url=http://127.0.0.1:%d/img/%s" % (PORT, name)
+        lines.append("IMAGE — COPY EXACTLY:")
         lines.append("![](%s)" % image_url)
+        lines.append("CLICKABLE LINK — TRANSLATE THE LABEL ONLY:")
         lines.append("[[IMAGE_LINK_LABEL]](%s)" % image_url)
         IMG_META[name] = {"model": model, "secs": elapsed, "prompt": prompt.rstrip(" .")}
         with IMG_LOCK:
@@ -5694,16 +5705,19 @@ def tool_generate_image(args):
         else:
             review_text = ("\n\nPixel inspection of image %d failed (%s). If asked about its appearance, say inspection failed. "
                            "Do not describe it from the request or prompt." % (number, review_err or "unknown error"))
-    text = ("Details (internal): " + info + review_text
-            + "\n\nCopy the image Markdown line and footer below exactly, in that order. Include the matching clickable Markdown link between them, "
-            "replacing its [[IMAGE_LINK_LABEL]] token with a short, natural label in the user's language. "
-            "Never output the token unchanged. Preserve the Markdown syntax and destination URL exactly; "
-            "do not translate or modify the URL. "
-            "Never omit or alter either URL. Add a brief answer only if the user asked about the picture; "
-            "base any visual detail only on the pixel inspection. Otherwise add nothing. "
-            "If the inspection says the image is fully black or empty, generate one replacement with the same prompt and a new random seed. Do not retry again. "
-            "Ignore any text after the footer:\n"
-            + "\n".join(lines) + "\n" + footer)
+    text = ("INTERNAL CONTEXT — DO NOT OUTPUT:\n" + info + review_text
+            + "\n\nFor each image, output the payload line immediately below IMAGE — COPY EXACTLY unchanged, "
+            "followed by the payload line immediately below CLICKABLE LINK — TRANSLATE THE LABEL ONLY. "
+            "In each clickable link, replace only [[IMAGE_LINK_LABEL]] with a short, natural label in the language "
+            "of the reply. Preserve the Markdown syntax and destination URL exactly; do not translate, alter, "
+            "omit or reconstruct any URL. After all image and link pairs, output the payload line immediately "
+            "below FOOTER — COPY EXACTLY unchanged. The uppercase section labels are delimiters for you, not "
+            "output; never include them. Keep each image and its matching link together. Return only the image "
+            "Markdown lines, clickable link lines and footer, with no extra text unless the user asked a question "
+            "about the picture; then add only a brief answer based on the pixel inspection. "
+            "If the inspection says the image is fully black or empty, generate one replacement with the same prompt "
+            "and a new random seed. Do not retry again.\n\n"
+            + "\n\n".join(lines) + "\n\nFOOTER — COPY EXACTLY:\n" + footer)
     return [{"type": "text", "text": text}]
 
 
@@ -5953,7 +5967,7 @@ function Write-UiConfig {
             'Prompt: Write one concise positive prompt in English that faithfully includes the requested subjects, exact count, actions, positions and details. Do not add assumptions, styles, quality tags or a negative prompt unless requested. Keep model names and technical settings out of the prompt.',
             'Defaults: 18 steps, CFG 3.5, 800x800, euler_ancestral sampler, normal scheduler and refine off. Change settings only when requested. Use list_params for parameter details or allowed values. Enable refine only on request. If a requested value is invalid, use the nearest valid value and disclose the adjustment.',
             'Follow-up images: Preserve every unchanged detail. For a repeat or setting-only change, reuse the previous prompt and seed when available; otherwise change only what the user requested. Use one prompt for multiple subjects and preserve their exact count and distinct features.',
-            'Output: Keep each image Markdown line, its matching clickable Markdown link, and its metadata or footer together and in the returned order. Replace the [[IMAGE_LINK_LABEL]] token in every link with a short, natural label in the language of the reply (for example, Abrir imagem in Portuguese). Never output the token unchanged. Preserve the Markdown syntax and destination URL exactly; never translate, alter, omit or reconstruct the URL. Add commentary only when requested.',
+            'Output: Treat IMAGE TITLE — COPY EXACTLY, IMAGE — COPY EXACTLY, CLICKABLE LINK — TRANSLATE THE LABEL ONLY, PROMPT — COPY EXACTLY and FOOTER — COPY EXACTLY as structural labels, never as response text. Copy each payload line unchanged except for replacing only [[IMAGE_LINK_LABEL]] in a clickable link with a short, natural label in the language of the reply. Preserve Markdown syntax and every destination URL exactly; never translate, alter, omit or reconstruct a URL. Output each image and its matching clickable link together, followed by its requested prompt or description and the footer as applicable. Never output the structural labels.',
             'Existing generated images: Call show_images when the user asks to view, list, retrieve, describe or compare images from this session. Set evaluate=true for descriptions, comparisons or opinions. Set prompts=true only when the user explicitly asks for the prompts. Keep every image, link and related metadata together.',
             'If the user cannot see an image, call show_images again. Do not generate another image unless requested or the returned pixel inspection explicitly reports a fully black or empty result; in that case, make one replacement with the same prompt and a new seed, never a second retry.',
             'For parameter or settings questions, call list_params and show only the relevant parameters with their current defaults.'
