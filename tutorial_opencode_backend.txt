@@ -1,0 +1,51 @@
+CONECTAR O OPENCODE AO BACKEND DO PC
+
+NO PC | FAZER UMA VEZ
+
+1.  Inicie o llama-server.
+2.  Confirme que este endereço responde:
+    http://***.**.***.**:5001/v1/models
+3.  Deixe o PC ligado e conectado à Tailscale.
+
+EM CADA NOTEBOOK / MÁQUINA
+
+1.  Conecte a máquina à mesma rede Tailscale do PC.
+
+2.  Abra o terminal e instale o plugin: opencode plugin add opencode-models-discovery@latest
+
+3.  Abra a configuração global do OpenCode (opencode.json ou opencode.jsonc) e adicione este conteúdo:
+
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [
+    "opencode-models-discovery@latest"
+  ],
+  "providers": {
+    "llamacpp": {
+      "name": "Backend do PC",
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": {
+        "baseURL": "http://***.**.***.**:5001/v1",
+        "modelsDiscovery": {
+          "enabled": true,
+          "smartModelName": true
+        }
+      }
+    }
+  }
+}
+
+4.  Salve o arquivo e reinicie o OpenCode. Selecione um modelo do provedor “Backend do PC”.
+
+5.  Depois de trocar o GGUF no PC, atualize a lista no OpenCode:
+    /models-discovery-refresh
+
+LEMBRETES
+
+-   Repita a configuração em cada máquina que usará o backend.
+-   ***.**.***.** é o IP Tailscale do PC. Altere-o se mudar.
+-   Estas instruções são para OpenCode v2. Confira com: opencode
+    –version
+-   O plugin descobre a lista de modelos. Se o GGUF ativo mudar, talvez
+    seja necessário atualizar a lista e selecionar o modelo novamente.
+-   Não exponha a porta 5001 à internet. Restrinja o acesso à Tailscale.
